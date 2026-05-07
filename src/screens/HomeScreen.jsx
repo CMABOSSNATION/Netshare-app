@@ -6,8 +6,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, Animated,
-  Alert, Platform, ScrollView, Clipboard, StatusBar,
+  Alert, Platform, ScrollView, StatusBar,
 } from 'react-native';
+import Clipboard from '@react-native-clipboard/clipboard';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import LinearGradient from 'react-native-linear-gradient';
 import { useStore } from '../store';
