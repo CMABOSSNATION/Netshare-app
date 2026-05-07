@@ -47,20 +47,26 @@ jobs:
       - name: Copy JS source files
         run: |
           cp $GITHUB_WORKSPACE/App.jsx $BUILD_DIR/App.jsx
-          cp $GITHUB_WORKSPACE/package.json $BUILD_DIR/package.json
+          # Use scaffold's package.json but merge key deps to avoid broken native linking
           mkdir -p $BUILD_DIR/src/screens $BUILD_DIR/src/services $BUILD_DIR/src/store
           cp $GITHUB_WORKSPACE/src/screens/HomeScreen.jsx $BUILD_DIR/src/screens/
           cp $GITHUB_WORKSPACE/src/services/VpnService.js  $BUILD_DIR/src/services/
           cp $GITHUB_WORKSPACE/src/store/index.js          $BUILD_DIR/src/store/
 
       # ── Copy & fix AndroidManifest ───────────────────────────
+      # BUG FIX: Use env vars instead of shell vars inside Python heredoc.
+      # Single-quoted heredocs ('PYEOF') prevent shell variable expansion,
+      # so $GITHUB_WORKSPACE was passed as a literal string → FileNotFoundError.
       - name: Copy and fix AndroidManifest
+        env:
+          MANIFEST_SRC: ${{ github.workspace }}/android/app/src/main/AndroidManifest.xml
+          MANIFEST_DEST: /home/runner/NetShareBuild/android/app/src/main/AndroidManifest.xml
         run: |
           python3 - << 'PYEOF'
-          import re
+          import re, os
 
-          src  = "$GITHUB_WORKSPACE/android/app/src/main/AndroidManifest.xml"
-          dest = "$BUILD_DIR/android/app/src/main/AndroidManifest.xml"
+          src  = os.environ["MANIFEST_SRC"]
+          dest = os.environ["MANIFEST_DEST"]
 
           with open(src, "r") as f:
               content = f.read()
@@ -75,13 +81,20 @@ jobs:
           # Fix any other com.netshare references (but not com.netsharebuild)
           content = re.sub(r'(?<!\.)com\.netshare(?!build)', 'com.netsharebuild', content)
 
+          # BUG FIX: Add required permission for foregroundServiceType="connectedDevice"
+          # on Android 14+ (API 34). Missing this causes a crash at runtime.
+          if 'FOREGROUND_SERVICE_CONNECTED_DEVICE' not in content:
+              content = content.replace(
+                  '<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />',
+                  '<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />'
+              )
+
           with open(dest, "w") as f:
               f.write(content)
 
           print("AndroidManifest fixed")
-          # Print package line to verify
           for line in content.splitlines():
-              if "package" in line or "NetShare" in line:
+              if "package" in line or "NetShare" in line or "FOREGROUND" in line:
                   print(line.strip())
           PYEOF
 
@@ -191,8 +204,6 @@ jobs:
           JAVAEOF
 
           # ── NetShareVpnService.java ──────────────────────────
-          # KEY FIX: uses SSLSocketFactory.protect() instead of the
-          # non-existent wsClient.createSocket() API call
           cat > $DEST/NetShareVpnService.java << 'JAVAEOF'
           package com.netsharebuild.netshare;
           import android.app.Notification;
@@ -351,12 +362,10 @@ jobs:
               content = f.read()
 
           if "VpnPackage" not in content:
-              # Add import after package line
               content = content.replace(
                   "package com.netsharebuild\n",
                   "package com.netsharebuild\n\nimport com.netsharebuild.netshare.VpnPackage\n"
               )
-              # Add to packages list
               content = content.replace(
                   "PackageList(this).packages",
                   "PackageList(this).packages.also { it.add(VpnPackage()) }"
@@ -383,17 +392,13 @@ jobs:
           with open("$GRADLE", "r") as f:
               content = f.read()
 
-          # Fix compileSdk
           content = re.sub(r'compileSdkVersion\s+\d+', 'compileSdkVersion 34', content)
           content = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 34', content)
           content = re.sub(r'compileSdk\s+\d+', 'compileSdk 34', content)
-
-          # Fix targetSdk
           content = re.sub(r'targetSdkVersion\s+\d+', 'targetSdkVersion 34', content)
           content = re.sub(r'targetSdk\s*=\s*\d+', 'targetSdk = 34', content)
           content = re.sub(r'targetSdk\s+\d+', 'targetSdk 34', content)
 
-          # Add java-websocket if not present
           if "java-websocket" not in content:
               content = content.replace(
                   "dependencies {",
