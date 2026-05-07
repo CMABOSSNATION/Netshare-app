@@ -51,40 +51,56 @@ jobs:
           mkdir -p $BUILD_DIR/src/screens $BUILD_DIR/src/services $BUILD_DIR/src/store
           cp $GITHUB_WORKSPACE/src/screens/HomeScreen.jsx $BUILD_DIR/src/screens/
           cp $GITHUB_WORKSPACE/src/services/VpnService.js  $BUILD_DIR/src/services/
-          cp $GITHUB_WORKSPACE/src/store/index.js           $BUILD_DIR/src/store/
+          cp $GITHUB_WORKSPACE/src/store/index.js          $BUILD_DIR/src/store/
 
-      # ── Copy AndroidManifest ─────────────────────────────────
-      - name: Copy AndroidManifest
+      # ── Copy & fix AndroidManifest ───────────────────────────
+      - name: Copy and fix AndroidManifest
         run: |
-          cp $GITHUB_WORKSPACE/android/app/src/main/AndroidManifest.xml \
-             $BUILD_DIR/android/app/src/main/AndroidManifest.xml
-          # Fix package name to match RN scaffold (com.netsharebuild)
-          sed -i 's/package="com\.netshare"/package="com.netsharebuild"/g' \
-             $BUILD_DIR/android/app/src/main/AndroidManifest.xml
-          # Fix service reference
-          sed -i 's/android:name="\.NetShareVpnService"/android:name="com.netsharebuild.netshare.NetShareVpnService"/g' \
-             $BUILD_DIR/android/app/src/main/AndroidManifest.xml
-          echo "=== Manifest package ===" && grep "package=" $BUILD_DIR/android/app/src/main/AndroidManifest.xml | head -2
+          python3 - << 'PYEOF'
+          import re
 
-      # ── Write fixed Java files directly ─────────────────────
-      # (These are pre-fixed versions — no fragile sed replacements)
-      - name: Write fixed Java native files
+          src  = "$GITHUB_WORKSPACE/android/app/src/main/AndroidManifest.xml"
+          dest = "$BUILD_DIR/android/app/src/main/AndroidManifest.xml"
+
+          with open(src, "r") as f:
+              content = f.read()
+
+          # Fix package name
+          content = content.replace('package="com.netshare"', 'package="com.netsharebuild"')
+          # Fix service reference (relative .NetShareVpnService -> full class)
+          content = content.replace(
+              'android:name=".NetShareVpnService"',
+              'android:name="com.netsharebuild.netshare.NetShareVpnService"'
+          )
+          # Fix any other com.netshare references (but not com.netsharebuild)
+          content = re.sub(r'(?<!\.)com\.netshare(?!build)', 'com.netsharebuild', content)
+
+          with open(dest, "w") as f:
+              f.write(content)
+
+          print("AndroidManifest fixed")
+          # Print package line to verify
+          for line in content.splitlines():
+              if "package" in line or "NetShare" in line:
+                  print(line.strip())
+          PYEOF
+
+      # ── Write Java native files (pre-fixed, no sed) ──────────
+      - name: Write Java native files
         run: |
-          mkdir -p $BUILD_DIR/android/app/src/main/java/com/netsharebuild/netshare
+          DEST=$BUILD_DIR/android/app/src/main/java/com/netsharebuild/netshare
+          mkdir -p $DEST
 
           # ── VpnPackage.java ──────────────────────────────────
-          cat > $BUILD_DIR/android/app/src/main/java/com/netsharebuild/netshare/VpnPackage.java << 'EOF'
+          cat > $DEST/VpnPackage.java << 'JAVAEOF'
           package com.netsharebuild.netshare;
-
           import com.facebook.react.ReactPackage;
           import com.facebook.react.bridge.NativeModule;
           import com.facebook.react.bridge.ReactApplicationContext;
           import com.facebook.react.uimanager.ViewManager;
-
           import java.util.ArrayList;
           import java.util.Collections;
           import java.util.List;
-
           public class VpnPackage implements ReactPackage {
               @Override
               public List<NativeModule> createNativeModules(ReactApplicationContext reactContext) {
@@ -97,12 +113,11 @@ jobs:
                   return Collections.emptyList();
               }
           }
-          EOF
+          JAVAEOF
 
           # ── VpnModule.java ───────────────────────────────────
-          cat > $BUILD_DIR/android/app/src/main/java/com/netsharebuild/netshare/VpnModule.java << 'EOF'
+          cat > $DEST/VpnModule.java << 'JAVAEOF'
           package com.netsharebuild.netshare;
-
           import android.app.Activity;
           import android.content.Intent;
           import android.net.VpnService;
@@ -114,66 +129,56 @@ jobs:
           import com.facebook.react.bridge.ReactContextBaseJavaModule;
           import com.facebook.react.bridge.ReactMethod;
           import com.facebook.react.modules.core.DeviceEventManagerModule;
-
           public class VpnModule extends ReactContextBaseJavaModule implements ActivityEventListener {
               private static final int VPN_REQUEST_CODE = 0x0F;
               private Promise vpnPermissionPromise;
               private static ReactApplicationContext reactContext;
-
               public VpnModule(ReactApplicationContext context) {
                   super(context);
                   reactContext = context;
                   context.addActivityEventListener(this);
               }
-
-              @NonNull
-              @Override
+              @NonNull @Override
               public String getName() { return "VpnModule"; }
-
               @ReactMethod
               public void prepare(Promise promise) {
                   try {
                       Activity activity = getCurrentActivity();
-                      if (activity == null) { promise.reject("NO_ACTIVITY", "No current activity"); return; }
+                      if (activity == null) { promise.reject("NO_ACTIVITY", "No activity"); return; }
                       Intent intent = VpnService.prepare(activity);
                       if (intent != null) { vpnPermissionPromise = promise; activity.startActivityForResult(intent, VPN_REQUEST_CODE); }
                       else { promise.resolve(true); }
                   } catch (Exception e) { promise.reject("VPN_PREPARE_ERROR", e.getMessage()); }
               }
-
               @ReactMethod
               public void startVpn(String relayUrl, String sessionCode, String role, Promise promise) {
                   try {
                       Activity activity = getCurrentActivity();
-                      if (activity == null) { promise.reject("NO_ACTIVITY", "No current activity"); return; }
-                      Intent serviceIntent = new Intent(activity, NetShareVpnService.class);
-                      serviceIntent.putExtra("RELAY_URL", relayUrl);
-                      serviceIntent.putExtra("SESSION_CODE", sessionCode);
-                      serviceIntent.putExtra("ROLE", role);
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) { activity.startForegroundService(serviceIntent); }
-                      else { activity.startService(serviceIntent); }
+                      if (activity == null) { promise.reject("NO_ACTIVITY", "No activity"); return; }
+                      Intent i = new Intent(activity, NetShareVpnService.class);
+                      i.putExtra("RELAY_URL", relayUrl);
+                      i.putExtra("SESSION_CODE", sessionCode);
+                      i.putExtra("ROLE", role);
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) activity.startForegroundService(i);
+                      else activity.startService(i);
                       promise.resolve(true);
                   } catch (Exception e) { promise.reject("VPN_START_ERROR", e.getMessage()); }
               }
-
               @ReactMethod
               public void stopVpn(Promise promise) {
                   try {
                       Activity activity = getCurrentActivity();
-                      if (activity == null) { promise.reject("NO_ACTIVITY", "No current activity"); return; }
-                      Intent serviceIntent = new Intent(activity, NetShareVpnService.class);
-                      serviceIntent.setAction("STOP_VPN");
-                      activity.startService(serviceIntent);
+                      if (activity == null) { promise.reject("NO_ACTIVITY", "No activity"); return; }
+                      Intent i = new Intent(activity, NetShareVpnService.class);
+                      i.setAction("STOP_VPN");
+                      activity.startService(i);
                       promise.resolve(true);
                   } catch (Exception e) { promise.reject("VPN_STOP_ERROR", e.getMessage()); }
               }
-
               public static void emitEvent(String eventName, String data) {
-                  if (reactContext != null) {
+                  if (reactContext != null)
                       reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit(eventName, data);
-                  }
               }
-
               @Override
               public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
                   if (requestCode == VPN_REQUEST_CODE && vpnPermissionPromise != null) {
@@ -181,18 +186,15 @@ jobs:
                       vpnPermissionPromise = null;
                   }
               }
-
-              @Override
-              public void onNewIntent(Intent intent) {}
+              @Override public void onNewIntent(Intent intent) {}
           }
-          EOF
+          JAVAEOF
 
           # ── NetShareVpnService.java ──────────────────────────
-          # KEY FIX: replaced invalid wsClient.createSocket() with proper
-          # SSLSocketFactory that calls protect() on each socket before connecting
-          cat > $BUILD_DIR/android/app/src/main/java/com/netsharebuild/netshare/NetShareVpnService.java << 'EOF'
+          # KEY FIX: uses SSLSocketFactory.protect() instead of the
+          # non-existent wsClient.createSocket() API call
+          cat > $DEST/NetShareVpnService.java << 'JAVAEOF'
           package com.netsharebuild.netshare;
-
           import android.app.Notification;
           import android.app.NotificationChannel;
           import android.app.NotificationManager;
@@ -214,22 +216,16 @@ jobs:
           import java.nio.ByteBuffer;
           import java.util.concurrent.ExecutorService;
           import java.util.concurrent.Executors;
-          import javax.net.ssl.SSLSocket;
           import javax.net.ssl.SSLSocketFactory;
-
           public class NetShareVpnService extends VpnService {
               private static final String TAG = "NetShareVPN";
               private static final String CHANNEL_ID = "netshare_vpn";
               private static final int NOTIFICATION_ID = 1;
-
               private ParcelFileDescriptor vpnInterface;
               private WebSocketClient wsClient;
               private ExecutorService executor;
               private volatile boolean isRunning = false;
-              private String relayUrl;
-              private String sessionCode;
-              private String role;
-
+              private String relayUrl, sessionCode, role;
               @Override
               public int onStartCommand(Intent intent, int flags, int startId) {
                   if (intent != null && "STOP_VPN".equals(intent.getAction())) {
@@ -243,79 +239,57 @@ jobs:
                   executor.execute(this::startVpnTunnel);
                   return START_STICKY;
               }
-
               private void startVpnTunnel() {
                   try {
-                      Builder builder = new Builder();
-                      builder.setSession("NetShare")
-                             .addAddress("10.8.0.2", 24)
-                             .addRoute("0.0.0.0", 0)
-                             .addDnsServer("8.8.8.8")
-                             .addDnsServer("8.8.4.4")
-                             .setMtu(1500);
-                      builder.addDisallowedApplication(getPackageName());
-                      vpnInterface = builder.establish();
-                      if (vpnInterface == null) {
-                          VpnModule.emitEvent("vpnError", "Failed to establish VPN interface"); return;
-                      }
+                      vpnInterface = new Builder()
+                          .setSession("NetShare")
+                          .addAddress("10.8.0.2", 24)
+                          .addRoute("0.0.0.0", 0)
+                          .addDnsServer("8.8.8.8")
+                          .addDnsServer("8.8.4.4")
+                          .setMtu(1500)
+                          .addDisallowedApplication(getPackageName())
+                          .establish();
+                      if (vpnInterface == null) { VpnModule.emitEvent("vpnError", "Failed to establish VPN"); return; }
                       isRunning = true;
                       VpnModule.emitEvent("vpnConnected", sessionCode);
                       connectToRelay();
-                  } catch (Exception e) {
-                      Log.e(TAG, "VPN start error: " + e.getMessage());
-                      VpnModule.emitEvent("vpnError", e.getMessage());
-                  }
+                  } catch (Exception e) { VpnModule.emitEvent("vpnError", e.getMessage()); }
               }
-
               private void connectToRelay() throws Exception {
                   URI uri = new URI(relayUrl);
                   final NetShareVpnService self = this;
-
                   wsClient = new WebSocketClient(uri) {
                       @Override public void onOpen(ServerHandshake h) {
                           if ("host".equals(role)) send("{\"type\":\"HOST_REGISTER\",\"netType\":\"WiFi\"}");
                           else send("{\"type\":\"CLIENT_JOIN\",\"code\":\"" + sessionCode + "\"}");
                       }
-                      @Override public void onMessage(String message) { handleRelayMessage(message); }
+                      @Override public void onMessage(String msg) { handleRelayMessage(msg); }
                       @Override public void onMessage(ByteBuffer bytes) {
                           if (vpnInterface != null && isRunning) {
-                              try {
-                                  new FileOutputStream(vpnInterface.getFileDescriptor())
-                                      .write(bytes.array(), bytes.position(), bytes.remaining());
-                              } catch (Exception e) { Log.e(TAG, "TUN write: " + e.getMessage()); }
+                              try { new FileOutputStream(vpnInterface.getFileDescriptor()).write(bytes.array(), bytes.position(), bytes.remaining()); }
+                              catch (Exception e) { Log.e(TAG, "TUN write: " + e.getMessage()); }
                           }
                       }
                       @Override public void onClose(int code, String reason, boolean remote) {
                           VpnModule.emitEvent("vpnDisconnected", reason); isRunning = false;
                       }
-                      @Override public void onError(Exception ex) {
-                          VpnModule.emitEvent("vpnError", ex.getMessage());
-                      }
+                      @Override public void onError(Exception ex) { VpnModule.emitEvent("vpnError", ex.getMessage()); }
                   };
-
-                  // Protect the WebSocket socket so it bypasses the VPN tunnel (avoids loop)
                   wsClient.setSocketFactory(new SSLSocketFactory() {
                       private final SSLSocketFactory d = (SSLSocketFactory) SSLSocketFactory.getDefault();
-                      @Override public Socket createSocket() throws IOException {
-                          Socket s = new Socket(); self.protect(s); return s; }
-                      @Override public Socket createSocket(String h, int p) throws IOException {
-                          Socket s = d.createSocket(h, p); self.protect(s); return s; }
-                      @Override public Socket createSocket(String h, int p, InetAddress la, int lp) throws IOException {
-                          Socket s = d.createSocket(h, p, la, lp); self.protect(s); return s; }
-                      @Override public Socket createSocket(InetAddress h, int p) throws IOException {
-                          Socket s = d.createSocket(h, p); self.protect(s); return s; }
-                      @Override public Socket createSocket(InetAddress a, int p, InetAddress la, int lp) throws IOException {
-                          Socket s = d.createSocket(a, p, la, lp); self.protect(s); return s; }
-                      @Override public Socket createSocket(Socket s, String h, int p, boolean ac) throws IOException {
-                          Socket ns = d.createSocket(s, h, p, ac); self.protect(ns); return ns; }
+                      @Override public Socket createSocket() throws IOException { Socket s = new Socket(); self.protect(s); return s; }
+                      @Override public Socket createSocket(String h, int p) throws IOException { Socket s = d.createSocket(h, p); self.protect(s); return s; }
+                      @Override public Socket createSocket(String h, int p, InetAddress la, int lp) throws IOException { Socket s = d.createSocket(h, p, la, lp); self.protect(s); return s; }
+                      @Override public Socket createSocket(InetAddress h, int p) throws IOException { Socket s = d.createSocket(h, p); self.protect(s); return s; }
+                      @Override public Socket createSocket(InetAddress a, int p, InetAddress la, int lp) throws IOException { Socket s = d.createSocket(a, p, la, lp); self.protect(s); return s; }
+                      @Override public Socket createSocket(Socket s, String h, int p, boolean ac) throws IOException { Socket ns = d.createSocket(s, h, p, ac); self.protect(ns); return ns; }
                       @Override public String[] getDefaultCipherSuites() { return d.getDefaultCipherSuites(); }
                       @Override public String[] getSupportedCipherSuites() { return d.getSupportedCipherSuites(); }
                   });
-
                   wsClient.connectBlocking();
                   if ("client".equals(role)) startPacketReadLoop();
               }
-
               private void startPacketReadLoop() {
                   executor.execute(() -> {
                       byte[] packet = new byte[32767];
@@ -328,7 +302,6 @@ jobs:
                       } catch (Exception e) { if (isRunning) Log.e(TAG, "Packet read: " + e.getMessage()); }
                   });
               }
-
               private void handleRelayMessage(String msg) {
                   try {
                       if (msg.contains("\"SESSION_CREATED\"")) VpnModule.emitEvent("sessionCreated", msg.split("\"code\":\"")[1].split("\"")[0]);
@@ -340,85 +313,141 @@ jobs:
                       else if (msg.contains("\"PING\"") && wsClient != null && wsClient.isOpen()) wsClient.send("{\"type\":\"PONG\"}");
                   } catch (Exception e) { Log.e(TAG, "Parse: " + e.getMessage()); }
               }
-
               private void stopVpnTunnel() {
                   isRunning = false;
-                  try { if (wsClient != null) { wsClient.send("host".equals(role) ? "{\"type\":\"HOST_LEAVE\"}" : "{\"type\":\"CLIENT_LEAVE\"}"); wsClient.close(); } } catch (Exception e) {}
-                  try { if (vpnInterface != null) { vpnInterface.close(); vpnInterface = null; } } catch (Exception e) {}
+                  try { if (wsClient != null) { wsClient.send("host".equals(role) ? "{\"type\":\"HOST_LEAVE\"}" : "{\"type\":\"CLIENT_LEAVE\"}"); wsClient.close(); } } catch (Exception ignored) {}
+                  try { if (vpnInterface != null) { vpnInterface.close(); vpnInterface = null; } } catch (Exception ignored) {}
                   if (executor != null) executor.shutdownNow();
                   VpnModule.emitEvent("vpnDisconnected", "User stopped sharing");
                   stopForeground(true);
                   stopSelf();
               }
-
               private void startForegroundNotification() {
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                       getSystemService(NotificationManager.class).createNotificationChannel(
                           new NotificationChannel(CHANNEL_ID, "NetShare VPN", NotificationManager.IMPORTANCE_LOW));
-                  }
                   PendingIntent stop = PendingIntent.getService(this, 0,
-                      new Intent(this, NetShareVpnService.class).setAction("STOP_VPN"),
-                      PendingIntent.FLAG_IMMUTABLE);
+                      new Intent(this, NetShareVpnService.class).setAction("STOP_VPN"), PendingIntent.FLAG_IMMUTABLE);
                   startForeground(NOTIFICATION_ID, new NotificationCompat.Builder(this, CHANNEL_ID)
                       .setContentTitle("NetShare Active").setContentText("Sharing internet via relay...")
                       .setSmallIcon(android.R.drawable.ic_menu_share)
                       .addAction(android.R.drawable.ic_delete, "Stop", stop)
                       .setOngoing(true).build());
               }
-
               @Override public void onDestroy() { stopVpnTunnel(); super.onDestroy(); }
           }
-          EOF
+          JAVAEOF
 
-          echo "All Java files written successfully"
-          ls -la $BUILD_DIR/android/app/src/main/java/com/netsharebuild/netshare/
+          echo "=== Java files written ==="
+          ls -la $DEST/
 
-      # ── Patch MainApplication.kt to register VpnPackage ─────
+      # ── Patch MainApplication.kt ─────────────────────────────
       - name: Patch MainApplication.kt
         run: |
           FILE=$(find $BUILD_DIR/android -name "MainApplication.kt" | head -1)
           echo "Found: $FILE"
-          # Add import (only if not already present)
-          if ! grep -q "VpnPackage" "$FILE"; then
-            sed -i '/^package /a\\nimport com.netsharebuild.netshare.VpnPackage' "$FILE"
-            sed -i 's/PackageList(this).packages/PackageList(this).packages.also { it.add(VpnPackage()) }/' "$FILE"
-          fi
-          echo "=== MainApplication.kt (first 25 lines) ===" && head -25 "$FILE"
+          python3 - << PYEOF
+          with open("$FILE", "r") as f:
+              content = f.read()
 
-      # ── Add java-websocket + fix SDK versions in build.gradle ─
+          if "VpnPackage" not in content:
+              # Add import after package line
+              content = content.replace(
+                  "package com.netsharebuild\n",
+                  "package com.netsharebuild\n\nimport com.netsharebuild.netshare.VpnPackage\n"
+              )
+              # Add to packages list
+              content = content.replace(
+                  "PackageList(this).packages",
+                  "PackageList(this).packages.also { it.add(VpnPackage()) }"
+              )
+
+          with open("$FILE", "w") as f:
+              f.write(content)
+
+          print("MainApplication.kt patched")
+          for i, line in enumerate(content.splitlines()[:25], 1):
+              print(f"{i}: {line}")
+          PYEOF
+
+      # ── Patch app/build.gradle safely with Python ────────────
       - name: Patch app build.gradle
         run: |
           GRADLE=$BUILD_DIR/android/app/build.gradle
+          echo "=== ORIGINAL build.gradle ==="
+          cat "$GRADLE"
 
-          # Force compileSdk and targetSdk to 34
-          sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 34/g' "$GRADLE"
-          sed -i 's/compileSdk = [0-9]*/compileSdk = 34/g' "$GRADLE"
-          sed -i 's/compileSdk [0-9]*/compileSdk 34/g' "$GRADLE"
-          sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/g' "$GRADLE"
-          sed -i 's/targetSdk = [0-9]*/targetSdk = 34/g' "$GRADLE"
-          sed -i 's/targetSdk [0-9]*/targetSdk 34/g' "$GRADLE"
+          python3 - << PYEOF
+          import re
 
-          # Add WebSocket dependency if not already present
-          if ! grep -q "java-websocket" "$GRADLE"; then
-            sed -i '/^dependencies {/a\    implementation "org.java-websocket:Java-WebSocket:1.5.4"' "$GRADLE"
-          fi
+          with open("$GRADLE", "r") as f:
+              content = f.read()
 
-          echo "=== build.gradle sdk check ===" && grep -E "compileSdk|targetSdk|java-websocket" "$GRADLE"
+          # Fix compileSdk
+          content = re.sub(r'compileSdkVersion\s+\d+', 'compileSdkVersion 34', content)
+          content = re.sub(r'compileSdk\s*=\s*\d+', 'compileSdk = 34', content)
+          content = re.sub(r'compileSdk\s+\d+', 'compileSdk 34', content)
 
-      # ── Fix gradle.properties for memory + AndroidX ──────────
+          # Fix targetSdk
+          content = re.sub(r'targetSdkVersion\s+\d+', 'targetSdkVersion 34', content)
+          content = re.sub(r'targetSdk\s*=\s*\d+', 'targetSdk = 34', content)
+          content = re.sub(r'targetSdk\s+\d+', 'targetSdk 34', content)
+
+          # Add java-websocket if not present
+          if "java-websocket" not in content:
+              content = content.replace(
+                  "dependencies {",
+                  'dependencies {\n    implementation "org.java-websocket:Java-WebSocket:1.5.4"',
+                  1
+              )
+
+          with open("$GRADLE", "w") as f:
+              f.write(content)
+
+          print("build.gradle patched")
+          for line in content.splitlines():
+              if any(k in line for k in ["compileSdk", "targetSdk", "java-websocket"]):
+                  print("  >>", line.strip())
+          PYEOF
+
+      # ── Fix gradle.properties ────────────────────────────────
       - name: Fix gradle.properties
         run: |
           PROPS=$BUILD_DIR/android/gradle.properties
-          # Memory
-          if grep -q "org.gradle.jvmargs" "$PROPS"; then
-            sed -i 's/org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m/' "$PROPS"
-          else
-            echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m" >> "$PROPS"
-          fi
-          # AndroidX
-          grep -q "android.useAndroidX" "$PROPS" || echo "android.useAndroidX=true" >> "$PROPS"
-          grep -q "android.enableJetifier" "$PROPS" || echo "android.enableJetifier=true" >> "$PROPS"
-          cat "$PROPS"
+          python3 - << PYEOF
+          with open("$PROPS", "r") as f:
+              lines = f.readlines()
+
+          result = []
+          found_jvm = False
+          found_androidx = False
+          found_jetifier = False
+
+          for line in lines:
+              if line.startswith("org.gradle.jvmargs"):
+                  result.append("org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m\n")
+                  found_jvm = True
+              elif line.startswith("android.useAndroidX"):
+                  result.append("android.useAndroidX=true\n")
+                  found_androidx = True
+              elif line.startswith("android.enableJetifier"):
+                  result.append("android.enableJetifier=true\n")
+                  found_jetifier = True
+              else:
+                  result.append(line)
+
+          if not found_jvm:
+              result.append("org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m\n")
+          if not found_androidx:
+              result.append("android.useAndroidX=true\n")
+          if not found_jetifier:
+              result.append("android.enableJetifier=true\n")
+
+          with open("$PROPS", "w") as f:
+              f.writelines(result)
+
+          print("gradle.properties fixed")
+          PYEOF
 
       # ── Install Node dependencies ────────────────────────────
       - name: Install Node dependencies
@@ -447,12 +476,12 @@ jobs:
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
           JAVA_HOME: ${{ env.JAVA_HOME }}
 
-      # ── Verify APK exists ────────────────────────────────────
+      # ── Verify APK ───────────────────────────────────────────
       - name: Verify APK
         run: |
           APK=$BUILD_DIR/android/app/build/outputs/apk/debug/app-debug.apk
           if [ ! -f "$APK" ]; then
-            echo "APK not found! Searching..."
+            echo "APK not found!"
             find $BUILD_DIR/android/app/build -name "*.apk" 2>/dev/null || echo "No APK anywhere"
             exit 1
           fi
