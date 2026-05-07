@@ -1,0 +1,155 @@
+name: Build NetShare APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# ✅ FIX #2: Grant write permission so GitHub Release (403) is resolved
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    env:
+      BUILD_DIR: /home/runner/NetShareBuild
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # ── Initialize React Native project ──────────────────────
+      - name: Initialize React Native project
+        run: |
+          cd /home/runner
+          npx --yes react-native@0.73.4 init NetShareBuild --version 0.73.4 --skip-install
+        env:
+          CI: false
+
+      # ── Copy JS source files ─────────────────────────────────
+      - name: Copy JS source files
+        run: |
+          cp $GITHUB_WORKSPACE/App.jsx $BUILD_DIR/App.jsx
+          cp $GITHUB_WORKSPACE/package.json $BUILD_DIR/package.json
+          mkdir -p $BUILD_DIR/src/screens $BUILD_DIR/src/services $BUILD_DIR/src/store
+          cp $GITHUB_WORKSPACE/src/screens/HomeScreen.jsx $BUILD_DIR/src/screens/
+          cp $GITHUB_WORKSPACE/src/services/VpnService.js  $BUILD_DIR/src/services/
+          cp $GITHUB_WORKSPACE/src/store/index.js           $BUILD_DIR/src/store/
+
+      # ── Copy native Android files ────────────────────────────
+      - name: Copy Android native files
+        run: |
+          SRC=$GITHUB_WORKSPACE/android/app/src/main
+          DEST=$BUILD_DIR/android/app/src/main
+          cp $SRC/AndroidManifest.xml $DEST/AndroidManifest.xml
+          mkdir -p $DEST/java/com/netsharebuild/netshare
+          cp $SRC/java/com/netshare/VpnModule.java          $DEST/java/com/netsharebuild/netshare/
+          cp $SRC/java/com/netshare/VpnPackage.java         $DEST/java/com/netsharebuild/netshare/
+          cp $SRC/java/com/netshare/NetShareVpnService.java $DEST/java/com/netsharebuild/netshare/
+          sed -i 's/^package com.netshare;/package com.netsharebuild.netshare;/' $DEST/java/com/netsharebuild/netshare/VpnModule.java
+          sed -i 's/^package com.netshare;/package com.netsharebuild.netshare;/' $DEST/java/com/netsharebuild/netshare/VpnPackage.java
+          sed -i 's/^package com.netshare;/package com.netsharebuild.netshare;/' $DEST/java/com/netsharebuild/netshare/NetShareVpnService.java
+
+      # ── Patch MainApplication.kt ─────────────────────────────
+      - name: Patch MainApplication.kt
+        run: |
+          FILE=$(find $BUILD_DIR/android -name "MainApplication.kt" | head -1)
+          echo "Patching: $FILE"
+          sed -i '/^package /a import com.netsharebuild.netshare.VpnPackage' "$FILE"
+          sed -i 's/PackageList(this).packages/PackageList(this).packages.also { it.add(VpnPackage()) }/' "$FILE"
+          cat "$FILE"
+
+      # ── Fix AndroidManifest ───────────────────────────────────
+      - name: Fix AndroidManifest
+        run: |
+          MANIFEST=$BUILD_DIR/android/app/src/main/AndroidManifest.xml
+          sed -i 's/com.netshare/com.netsharebuild/g' "$MANIFEST"
+
+      # ── Add java-websocket to build.gradle ───────────────────
+      - name: Add java-websocket dependency
+        run: |
+          GRADLE=$BUILD_DIR/android/app/build.gradle
+          sed -i '/^dependencies {/a\    implementation "org.java-websocket:Java-WebSocket:1.5.4"' "$GRADLE"
+
+      # ── Install Node dependencies ────────────────────────────
+      - name: Install Node dependencies
+        run: npm install
+        working-directory: /home/runner/NetShareBuild
+
+      # ── Cache Gradle ─────────────────────────────────────────
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/android/**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ── Build APK ────────────────────────────────────────────
+      - name: Build Debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          # Run gradle and preserve exit code (no pipe that swallows failures)
+          ./gradlew assembleDebug --no-daemon --stacktrace
+        working-directory: /home/runner/NetShareBuild
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          JAVA_HOME: ${{ env.JAVA_HOME }}
+
+      # ── Verify APK exists ────────────────────────────────────
+      - name: Verify APK was built
+        run: |
+          APK=/home/runner/NetShareBuild/android/app/build/outputs/apk/debug/app-debug.apk
+          if [ ! -f "$APK" ]; then
+            echo "❌ APK not found! Build failed silently."
+            find /home/runner/NetShareBuild/android/app/build -name "*.apk" 2>/dev/null || echo "No APKs found anywhere"
+            exit 1
+          fi
+          echo "✅ APK found: $(du -h $APK)"
+
+      # ── Upload APK ───────────────────────────────────────────
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetShare-debug-apk
+          path: /home/runner/NetShareBuild/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      # ── Create GitHub Release ────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: v${{ github.run_number }}
+          name: NetShare v${{ github.run_number }}
+          body: |
+            ## NetShare APK
+            1. Download app-debug.apk below
+            2. Open on your Android phone
+            3. Tap Install (allow unknown sources if asked)
+          files: /home/runner/NetShareBuild/android/app/build/outputs/apk/debug/app-debug.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
