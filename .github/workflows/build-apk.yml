@@ -1,0 +1,72 @@
+name: Build NetShare APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # ✅ Checkout repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ✅ Setup Java (React Native requires 17)
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ✅ Setup Node
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ✅ Setup Android SDK
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # ✅ Install dependencies
+      - name: Install dependencies
+        run: npm install
+
+      # ✅ Give gradlew permission
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      # ✅ Build APK (DEBUG first - more stable)
+      - name: Build Debug APK
+        run: |
+          cd android
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      # ✅ Locate APK
+      - name: Find APK
+        run: |
+          APK=$(find android/app/build/outputs/apk/debug -name "*.apk" | head -1)
+          echo "APK_PATH=$APK" >> $GITHUB_ENV
+          echo "Found APK: $APK"
+
+      # ✅ Upload APK
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetShare-debug-apk
+          path: ${{ env.APK_PATH }}
+
+      # ✅ Optional: Release APK
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: v${{ github.run_number }}
+          name: NetShare v${{ github.run_number }}
+          files: ${{ env.APK_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
