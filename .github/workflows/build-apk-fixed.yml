@@ -470,12 +470,27 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # ── Build Debug APK ──────────────────────────────────────
-      - name: Build Debug APK
+      # ── Bundle JS into assets ────────────────────────────────
+      # FIX: Debug APKs fetch JS from Metro at localhost:8081 at runtime.
+      # Pre-bundling bakes the JS into the APK so it works on any device
+      # without a dev machine or USB cable.
+      - name: Bundle JS for Android
+        run: |
+          mkdir -p android/app/src/main/assets
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output android/app/src/main/assets/index.android.bundle \
+            --assets-dest android/app/src/main/res
+        working-directory: /home/runner/NetShareBuild
+
+      # ── Build Release APK ────────────────────────────────────
+      - name: Build Release APK
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleRelease --no-daemon --stacktrace
         working-directory: /home/runner/NetShareBuild
         env:
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
@@ -484,20 +499,21 @@ jobs:
       # ── Verify APK ───────────────────────────────────────────
       - name: Verify APK
         run: |
-          APK=$BUILD_DIR/android/app/build/outputs/apk/debug/app-debug.apk
-          if [ ! -f "$APK" ]; then
+          APK=$(find $BUILD_DIR/android/app/build/outputs/apk -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then
             echo "APK not found!"
             find $BUILD_DIR/android/app/build -name "*.apk" 2>/dev/null || echo "No APK anywhere"
             exit 1
           fi
           echo "SUCCESS: $(du -h $APK)"
+          echo "APK_PATH=$APK" >> $GITHUB_ENV
 
       # ── Upload APK artifact ──────────────────────────────────
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: NetShare-debug-apk
-          path: /home/runner/NetShareBuild/android/app/build/outputs/apk/debug/app-debug.apk
+          name: NetShare-release-apk
+          path: ${{ env.APK_PATH }}
           retention-days: 30
 
       # ── Create GitHub Release ────────────────────────────────
@@ -509,10 +525,10 @@ jobs:
           name: NetShare v${{ github.run_number }}
           body: |
             ## NetShare APK - Build #${{ github.run_number }}
-            1. Download **app-debug.apk** below
+            1. Download **app-release-unsigned.apk** below
             2. Transfer to your Android phone
             3. Tap Install (enable Unknown sources if asked)
-          files: /home/runner/NetShareBuild/android/app/build/outputs/apk/debug/app-debug.apk
+          files: ${{ env.APK_PATH }}
           draft: false
           prerelease: false
         env:
