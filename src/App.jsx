@@ -17,7 +17,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
    4. On iOS: wrap in Capacitor + NEPacketTunnelProvider
    ============================================================ */
 
-const WS_URL = "wss://your-relay-server.com"; // Replace after backend deploy
+const WS_URL = "wss://netshare-backend.onrender.com/relay";// Replace after backend deploy
 
 // ── Design tokens ────────────────────────────────────────────
 const T = {
