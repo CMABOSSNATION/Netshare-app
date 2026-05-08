@@ -1,0 +1,180 @@
+workflows:
+  netshare-android-debug:
+    name: NetShare Android Debug APK
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+
+    environment:
+      java: 17
+      node: 20
+      vars:
+        PACKAGE_NAME: "com.netshare"
+        RN_VERSION: "0.74.1"
+
+    scripts:
+
+      - name: Install Node dependencies
+        script: |
+          # Remove react and react-native from package.json deps before install
+          # to avoid conflicting with the versions already in node_modules
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            delete pkg.dependencies['react'];
+            delete pkg.dependencies['react-native'];
+            pkg.dependencies['react-native-reanimated'] = '3.6.1';
+            pkg.devDependencies['@react-native/babel-preset'] = '0.74.1';
+            pkg.devDependencies['@react-native/metro-config'] = '0.74.1';
+            pkg.devDependencies['@react-native/eslint-config'] = '0.74.1';
+            pkg.devDependencies['@react-native/typescript-config'] = '0.74.1';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+            console.log('package.json cleaned');
+          "
+          npm install
+
+      - name: Add java-websocket dependency to build.gradle
+        script: |
+          python3 << 'PYEOF'
+          import re
+
+          p = "android/app/build.gradle"
+          content = open(p).read()
+
+          # Add java-websocket (required by NetShareVpnService.java)
+          websocket_dep = "    implementation 'org.java-websocket:Java-WebSocket:1.5.4'"
+          if 'java-websocket' not in content:
+              content = re.sub(
+                  r'(dependencies \{)',
+                  r'\1\n' + websocket_dep,
+                  content
+              )
+
+          # Force androidx.core to 1.15.0 for AGP 8.2.1 compatibility
+          force_block = (
+              "\nconfigurations.all {\n"
+              "    resolutionStrategy {\n"
+              "        force 'androidx.core:core:1.15.0'\n"
+              "        force 'androidx.core:core-ktx:1.15.0'\n"
+              "    }\n"
+              "}\n"
+          )
+          if 'resolutionStrategy' not in content:
+              content = content + force_block
+
+          open(p, "w").write(content)
+          print("build.gradle patched — websocket + androidx.core fix applied")
+          PYEOF
+
+      - name: Fix gradle.properties
+        script: |
+          python3 << 'PYEOF'
+          p = "android/gradle.properties"
+          lines = open(p).readlines()
+          result, seen = [], set()
+          for line in lines:
+              key = line.split("=")[0].strip() if "=" in line else ""
+              if key and key in seen:
+                  continue
+              if key:
+                  seen.add(key)
+              result.append(line)
+          required = [
+              "org.gradle.jvmargs=-Xmx4096m\n",
+              "android.useAndroidX=true\n",
+              "android.enableJetifier=true\n",
+              "android.suppressUnsupportedCompileSdk=35\n",
+          ]
+          for req in required:
+              key = req.split("=")[0].strip()
+              if not any(key in line for line in result):
+                  result.append(req)
+          open(p, "w").writelines(result)
+          print("gradle.properties fixed")
+          PYEOF
+
+      - name: Patch MainApplication.kt to register VpnPackage
+        script: |
+          python3 << 'PYEOF'
+          import re, glob
+
+          matches = glob.glob("android/**/MainApplication.kt", recursive=True)
+          if not matches:
+              print("ERROR: MainApplication.kt not found!")
+              exit(1)
+          f = matches[0]
+          print("Patching: " + f)
+          content = open(f).read()
+
+          if "VpnPackage" not in content:
+              # Add import
+              content = re.sub(
+                  r'(import com\.facebook\.react\.ReactApplication)',
+                  'import com.netshare.VpnPackage\n\\1',
+                  content
+              )
+              # Inject into PackageList apply block (RN 0.74 default)
+              content = re.sub(
+                  r'(PackageList\(this\)\.packages\.apply\s*\{)',
+                  r'\1\n              add(VpnPackage())',
+                  content
+              )
+              # Fallback: mutableListOf style
+              if "VpnPackage()" not in content:
+                  content = re.sub(
+                      r'(return\s+mutableListOf\s*\()',
+                      'return mutableListOf(\n              VpnPackage(),',
+                      content
+                  )
+              open(f, "w").write(content)
+              print("VpnPackage registered successfully")
+          else:
+              print("VpnPackage already present")
+
+          # Verify
+          for line in open(f):
+              if "VpnPackage" in line:
+                  print("  Verified:", line.strip())
+          PYEOF
+
+      - name: Copy vector icon fonts
+        script: |
+          FONTS_SRC="node_modules/react-native-vector-icons/Fonts"
+          FONTS_DEST="android/app/src/main/assets/fonts"
+          mkdir -p "$FONTS_DEST"
+          if [ -d "$FONTS_SRC" ]; then
+            cp "$FONTS_SRC"/*.ttf "$FONTS_DEST/"
+            echo "Fonts copied"
+          else
+            echo "No fonts dir, skipping"
+          fi
+
+      - name: Bundle JS into Android assets
+        script: |
+          mkdir -p android/app/src/main/assets
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output android/app/src/main/assets/index.android.bundle \
+            --reset-cache
+        environment:
+          CI: "false"
+          NODE_ENV: production
+
+      - name: Build Debug APK
+        script: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+    artifacts:
+      - android/app/build/outputs/apk/debug/app-debug.apk
+      - android/app/build/outputs/**/*.apk
+
+    publishing:
+      email:
+        recipients:
+          - your-email@example.com   # ← replace with your email
+        notify:
+          success: true
+          failure: true
