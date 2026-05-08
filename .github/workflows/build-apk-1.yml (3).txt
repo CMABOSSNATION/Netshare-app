@@ -1,0 +1,591 @@
+name: Build NetShare APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    env:
+      BUILD_DIR: /home/runner/NetShareBuild
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # ── Initialize React Native scaffold ─────────────────────
+      - name: Initialize React Native project
+        run: |
+          cd /home/runner
+          npx --yes react-native@0.73.4 init NetShareBuild --version 0.73.4 --skip-install
+        env:
+          CI: false
+
+      # ── Copy JS source files ──────────────────────────────────
+      - name: Copy JS source files
+        run: |
+          # Core files
+          cp "$GITHUB_WORKSPACE/App.jsx"                    "$BUILD_DIR/App.jsx"
+          cp "$GITHUB_WORKSPACE/index.js"                   "$BUILD_DIR/index.js"
+          cp "$GITHUB_WORKSPACE/package.json"               "$BUILD_DIR/package.json"
+
+          # Source folders
+          mkdir -p "$BUILD_DIR/src/screens" "$BUILD_DIR/src/services" "$BUILD_DIR/src/store"
+          cp "$GITHUB_WORKSPACE/src/screens/HomeScreen.jsx" "$BUILD_DIR/src/screens/"
+          cp "$GITHUB_WORKSPACE/src/services/VpnService.js" "$BUILD_DIR/src/services/"
+          cp "$GITHUB_WORKSPACE/src/store/index.js"         "$BUILD_DIR/src/store/"
+
+          echo "=== JS files copied ==="
+          ls "$BUILD_DIR/"
+
+      # ── Write AndroidManifest ─────────────────────────────────
+      # FIX: Use python3 to write file instead of heredoc (heredoc << inside run: breaks YAML on line 68)
+      - name: Write AndroidManifest
+        run: |
+          python3 - << 'PYEOF'
+import os
+manifest = """<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">
+
+    <uses-permission android:name=\"android.permission.INTERNET\" />
+    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE\" />
+    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE\" />
+    <uses-permission android:name=\"android.permission.RECEIVE_BOOT_COMPLETED\" />
+    <uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\" />
+    <uses-permission android:name=\"android.permission.ACCESS_WIFI_STATE\" />
+    <uses-permission android:name=\"android.permission.CHANGE_WIFI_STATE\" />
+    <uses-permission android:name=\"android.permission.CHANGE_NETWORK_STATE\" />
+
+    <application
+        android:name=\".MainApplication\"
+        android:label=\"@string/app_name\"
+        android:icon=\"@mipmap/ic_launcher\"
+        android:roundIcon=\"@mipmap/ic_launcher_round\"
+        android:allowBackup=\"false\"
+        android:theme=\"@style/AppTheme\"
+        android:usesCleartextTraffic=\"true\">
+
+        <activity
+            android:name=\".MainActivity\"
+            android:label=\"@string/app_name\"
+            android:configChanges=\"keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode\"
+            android:launchMode=\"singleTask\"
+            android:windowSoftInputMode=\"adjustResize\"
+            android:exported=\"true\">
+            <intent-filter>
+                <action android:name=\"android.intent.action.MAIN\" />
+                <category android:name=\"android.intent.category.LAUNCHER\" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=\"com.netsharebuild.netshare.NetShareVpnService\"
+            android:permission=\"android.permission.BIND_VPN_SERVICE\"
+            android:exported=\"false\"
+            android:foregroundServiceType=\"connectedDevice\">
+            <intent-filter>
+                <action android:name=\"android.net.VpnService\" />
+            </intent-filter>
+        </service>
+
+    </application>
+</manifest>"""
+dest = os.path.join(os.environ["BUILD_DIR"], "android/app/src/main/AndroidManifest.xml")
+os.makedirs(os.path.dirname(dest), exist_ok=True)
+with open(dest, "w") as f:
+    f.write(manifest)
+print("Manifest OK")
+PYEOF
+
+      # ── Write Java native files ───────────────────────────────
+      - name: Write Java native files
+        run: |
+          DEST="$BUILD_DIR/android/app/src/main/java/com/netsharebuild/netshare"
+          mkdir -p "$DEST"
+
+          # FIX: Write Java files via python3 to avoid heredoc YAML conflicts
+          python3 - << 'PYEOF'
+import os
+
+dest = os.environ["BUILD_DIR"] + "/android/app/src/main/java/com/netsharebuild/netshare"
+os.makedirs(dest, exist_ok=True)
+
+# ── VpnPackage.java ──────────────────────────────────────────────────────────
+vpn_package = """\
+package com.netsharebuild.netshare;
+import com.facebook.react.ReactPackage;
+import com.facebook.react.bridge.NativeModule;
+import com.facebook.react.bridge.ReactApplicationContext;
+import com.facebook.react.uimanager.ViewManager;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+public class VpnPackage implements ReactPackage {
+    @Override
+    public List<NativeModule> createNativeModules(ReactApplicationContext reactContext) {
+        List<NativeModule> modules = new ArrayList<>();
+        modules.add(new VpnModule(reactContext));
+        return modules;
+    }
+    @Override
+    public List<ViewManager> createViewManagers(ReactApplicationContext reactContext) {
+        return Collections.emptyList();
+    }
+}
+"""
+
+# ── VpnModule.java ───────────────────────────────────────────────────────────
+vpn_module = """\
+package com.netsharebuild.netshare;
+import android.app.Activity;
+import android.content.Intent;
+import android.net.VpnService;
+import android.os.Build;
+import androidx.annotation.NonNull;
+import com.facebook.react.bridge.ActivityEventListener;
+import com.facebook.react.bridge.Promise;
+import com.facebook.react.bridge.ReactApplicationContext;
+import com.facebook.react.bridge.ReactContextBaseJavaModule;
+import com.facebook.react.bridge.ReactMethod;
+import com.facebook.react.modules.core.DeviceEventManagerModule;
+public class VpnModule extends ReactContextBaseJavaModule implements ActivityEventListener {
+    private static final int VPN_REQUEST_CODE = 0x0F;
+    private Promise vpnPermissionPromise;
+    private static ReactApplicationContext reactContext;
+    public VpnModule(ReactApplicationContext context) {
+        super(context);
+        reactContext = context;
+        context.addActivityEventListener(this);
+    }
+    @NonNull @Override
+    public String getName() { return "VpnModule"; }
+    @ReactMethod
+    public void prepare(Promise promise) {
+        try {
+            Activity activity = getCurrentActivity();
+            if (activity == null) { promise.reject("NO_ACTIVITY", "No activity"); return; }
+            Intent intent = VpnService.prepare(activity);
+            if (intent != null) { vpnPermissionPromise = promise; activity.startActivityForResult(intent, VPN_REQUEST_CODE); }
+            else { promise.resolve(true); }
+        } catch (Exception e) { promise.reject("VPN_PREPARE_ERROR", e.getMessage()); }
+    }
+    @ReactMethod
+    public void startVpn(String relayUrl, String sessionCode, String role, Promise promise) {
+        try {
+            Activity activity = getCurrentActivity();
+            if (activity == null) { promise.reject("NO_ACTIVITY", "No activity"); return; }
+            Intent i = new Intent(activity, NetShareVpnService.class);
+            i.putExtra("RELAY_URL", relayUrl);
+            i.putExtra("SESSION_CODE", sessionCode);
+            i.putExtra("ROLE", role);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) activity.startForegroundService(i);
+            else activity.startService(i);
+            promise.resolve(true);
+        } catch (Exception e) { promise.reject("VPN_START_ERROR", e.getMessage()); }
+    }
+    @ReactMethod
+    public void stopVpn(Promise promise) {
+        try {
+            Activity activity = getCurrentActivity();
+            if (activity == null) { promise.reject("NO_ACTIVITY", "No activity"); return; }
+            Intent i = new Intent(activity, NetShareVpnService.class);
+            i.setAction("STOP_VPN");
+            activity.startService(i);
+            promise.resolve(true);
+        } catch (Exception e) { promise.reject("VPN_STOP_ERROR", e.getMessage()); }
+    }
+    public static void emitEvent(String eventName, String data) {
+        if (reactContext != null)
+            reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit(eventName, data);
+    }
+    @Override
+    public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
+        if (requestCode == VPN_REQUEST_CODE && vpnPermissionPromise != null) {
+            vpnPermissionPromise.resolve(resultCode == Activity.RESULT_OK);
+            vpnPermissionPromise = null;
+        }
+    }
+    @Override public void onNewIntent(Intent intent) {}
+}
+"""
+
+# ── NetShareVpnService.java ──────────────────────────────────────────────────
+vpn_service = """\
+package com.netsharebuild.netshare;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Intent;
+import android.net.VpnService;
+import android.os.Build;
+import android.os.ParcelFileDescriptor;
+import android.util.Log;
+import androidx.core.app.NotificationCompat;
+import org.java_websocket.client.WebSocketClient;
+import org.java_websocket.handshake.ServerHandshake;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.net.URI;
+import java.nio.ByteBuffer;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import javax.net.ssl.SSLSocketFactory;
+public class NetShareVpnService extends VpnService {
+    private static final String TAG = "NetShareVPN";
+    private static final String CHANNEL_ID = "netshare_vpn";
+    private static final int NOTIFICATION_ID = 1;
+    private ParcelFileDescriptor vpnInterface;
+    private WebSocketClient wsClient;
+    private ExecutorService executor;
+    private volatile boolean isRunning = false;
+    private String relayUrl, sessionCode, role;
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && "STOP_VPN".equals(intent.getAction())) {
+            stopVpnTunnel(); return START_NOT_STICKY;
+        }
+        relayUrl    = intent.getStringExtra("RELAY_URL");
+        sessionCode = intent.getStringExtra("SESSION_CODE");
+        role        = intent.getStringExtra("ROLE");
+        startForegroundNotification();
+        executor = Executors.newFixedThreadPool(3);
+        executor.execute(this::startVpnTunnel);
+        return START_STICKY;
+    }
+    private void startVpnTunnel() {
+        try {
+            vpnInterface = new Builder()
+                .setSession("NetShare")
+                .addAddress("10.8.0.2", 24)
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer("8.8.8.8")
+                .addDnsServer("8.8.4.4")
+                .setMtu(1500)
+                .addDisallowedApplication(getPackageName())
+                .establish();
+            if (vpnInterface == null) { VpnModule.emitEvent("vpnError", "Failed to establish VPN"); return; }
+            isRunning = true;
+            VpnModule.emitEvent("vpnConnected", sessionCode);
+            connectToRelay();
+        } catch (Exception e) {
+            Log.e(TAG, "startVpnTunnel: " + e.getMessage());
+            VpnModule.emitEvent("vpnError", e.getMessage());
+        }
+    }
+    private void connectToRelay() throws Exception {
+        URI uri = new URI(relayUrl);
+        final NetShareVpnService self = this;
+        wsClient = new WebSocketClient(uri) {
+            @Override public void onOpen(ServerHandshake h) {
+                if ("host".equals(role)) send("{\\\"type\\\":\\\"HOST_REGISTER\\\",\\\"netType\\\":\\\"WiFi\\\"}");
+                else send("{\\\"type\\\":\\\"CLIENT_JOIN\\\",\\\"code\\\":\\\"" + sessionCode + "\\\"}");
+            }
+            @Override public void onMessage(String msg) { handleRelayMessage(msg); }
+            @Override public void onMessage(ByteBuffer bytes) {
+                if (vpnInterface != null && isRunning) {
+                    try { new FileOutputStream(vpnInterface.getFileDescriptor())
+                              .write(bytes.array(), bytes.position(), bytes.remaining()); }
+                    catch (Exception e) { Log.e(TAG, "TUN write: " + e.getMessage()); }
+                }
+            }
+            @Override public void onClose(int code, String reason, boolean remote) {
+                VpnModule.emitEvent("vpnDisconnected", reason != null ? reason : "closed");
+                isRunning = false;
+            }
+            @Override public void onError(Exception ex) {
+                VpnModule.emitEvent("vpnError", ex != null ? ex.getMessage() : "unknown error");
+            }
+        };
+        wsClient.setSocketFactory(new SSLSocketFactory() {
+            private final SSLSocketFactory d = (SSLSocketFactory) SSLSocketFactory.getDefault();
+            @Override public Socket createSocket() throws IOException {
+                Socket s = new Socket(); self.protect(s); return s; }
+            @Override public Socket createSocket(String h, int p) throws IOException {
+                Socket s = d.createSocket(h, p); self.protect(s); return s; }
+            @Override public Socket createSocket(String h, int p, InetAddress la, int lp) throws IOException {
+                Socket s = d.createSocket(h, p, la, lp); self.protect(s); return s; }
+            @Override public Socket createSocket(InetAddress h, int p) throws IOException {
+                Socket s = d.createSocket(h, p); self.protect(s); return s; }
+            @Override public Socket createSocket(InetAddress a, int p, InetAddress la, int lp) throws IOException {
+                Socket s = d.createSocket(a, p, la, lp); self.protect(s); return s; }
+            @Override public Socket createSocket(Socket s, String h, int p, boolean ac) throws IOException {
+                Socket ns = d.createSocket(s, h, p, ac); self.protect(ns); return ns; }
+            @Override public String[] getDefaultCipherSuites() { return d.getDefaultCipherSuites(); }
+            @Override public String[] getSupportedCipherSuites() { return d.getSupportedCipherSuites(); }
+        });
+        wsClient.connectBlocking();
+        if ("client".equals(role)) startPacketReadLoop();
+    }
+    private void startPacketReadLoop() {
+        executor.execute(() -> {
+            byte[] packet = new byte[32767];
+            try (FileInputStream in = new FileInputStream(vpnInterface.getFileDescriptor())) {
+                while (isRunning) {
+                    int len = in.read(packet);
+                    if (len > 0 && wsClient != null && wsClient.isOpen())
+                        wsClient.send(ByteBuffer.wrap(packet, 0, len));
+                }
+            } catch (Exception e) { if (isRunning) Log.e(TAG, "Read: " + e.getMessage()); }
+        });
+    }
+    private void handleRelayMessage(String msg) {
+        try {
+            if (msg.contains("SESSION_CREATED"))
+                VpnModule.emitEvent("sessionCreated", msg.split("\\"code\\":\\"")[1].split("\\"")[0]);
+            else if (msg.contains("JOIN_SUCCESS")) VpnModule.emitEvent("joinSuccess", sessionCode);
+            else if (msg.contains("JOIN_ERROR"))
+                VpnModule.emitEvent("joinError", msg.split("\\"reason\\":\\"")[1].split("\\"")[0]);
+            else if (msg.contains("CLIENT_CONNECTED"))
+                VpnModule.emitEvent("clientConnected", msg.split("\\"clientId\\":\\"")[1].split("\\"")[0]);
+            else if (msg.contains("CLIENT_DISCONNECTED")) VpnModule.emitEvent("clientDisconnected", "");
+            else if (msg.contains("HOST_LEFT")) VpnModule.emitEvent("hostLeft", "Host ended the session");
+            else if (msg.contains("PING") && wsClient != null && wsClient.isOpen())
+                wsClient.send("{\\"type\\":\\"PONG\\"}");
+        } catch (Exception e) { Log.e(TAG, "handleRelayMessage: " + e.getMessage()); }
+    }
+    private void stopVpnTunnel() {
+        isRunning = false;
+        try {
+            if (wsClient != null) {
+                wsClient.send("host".equals(role) ? "{\\"type\\":\\"HOST_LEAVE\\"}" : "{\\"type\\":\\"CLIENT_LEAVE\\"}");
+                wsClient.close();
+            }
+        } catch (Exception ignored) {}
+        try { if (vpnInterface != null) { vpnInterface.close(); vpnInterface = null; } } catch (Exception ignored) {}
+        if (executor != null) executor.shutdownNow();
+        VpnModule.emitEvent("vpnDisconnected", "User stopped sharing");
+        stopForeground(true);
+        stopSelf();
+    }
+    private void startForegroundNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            getSystemService(NotificationManager.class).createNotificationChannel(
+                new NotificationChannel(CHANNEL_ID, "NetShare VPN", NotificationManager.IMPORTANCE_LOW));
+        PendingIntent stop = PendingIntent.getService(this, 0,
+            new Intent(this, NetShareVpnService.class).setAction("STOP_VPN"),
+            PendingIntent.FLAG_IMMUTABLE);
+        startForeground(NOTIFICATION_ID, new NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("NetShare Active")
+            .setContentText("Sharing internet via relay...")
+            .setSmallIcon(android.R.drawable.ic_menu_share)
+            .addAction(android.R.drawable.ic_delete, "Stop", stop)
+            .setOngoing(true).build());
+    }
+    @Override public void onDestroy() { stopVpnTunnel(); super.onDestroy(); }
+}
+"""
+
+with open(dest + "/VpnPackage.java", "w") as f: f.write(vpn_package)
+with open(dest + "/VpnModule.java",  "w") as f: f.write(vpn_module)
+with open(dest + "/NetShareVpnService.java", "w") as f: f.write(vpn_service)
+print("=== Java files written ===")
+for name in ["VpnPackage.java","VpnModule.java","NetShareVpnService.java"]:
+    with open(dest+"/"+name) as f: print(f.readline().strip(), "->", name)
+PYEOF
+
+      # ── Patch MainApplication.kt ──────────────────────────────
+      - name: Patch MainApplication.kt
+        run: |
+          FILE=$(find "$BUILD_DIR/android" -name "MainApplication.kt" | head -1)
+          echo "Patching: $FILE"
+          if ! grep -q "VpnPackage" "$FILE"; then
+            sed -i '/^package com\.netsharebuild$/a import com.netsharebuild.netshare.VpnPackage' "$FILE"
+            sed -i 's/PackageList(this)\.packages/PackageList(this).packages.also { it.add(VpnPackage()) }/' "$FILE"
+          fi
+          head -20 "$FILE"
+
+      # ── Patch build.gradle ────────────────────────────────────
+      - name: Patch app build.gradle
+        run: |
+          GRADLE="$BUILD_DIR/android/app/build.gradle"
+          python3 - << 'PYEOF'
+import re, os
+
+gradle_path = os.environ["BUILD_DIR"] + "/android/app/build.gradle"
+with open(gradle_path) as f:
+    c = f.read()
+
+# Ensure namespace (required by AGP 8.x)
+if 'namespace' not in c:
+    c = c.replace('android {', 'android {\n    namespace "com.netsharebuild"', 1)
+
+# Fix SDK versions to 34
+c = re.sub(r'compileSdkVersion\s+\d+', 'compileSdkVersion 34', c)
+c = re.sub(r'compileSdk\s*=\s*\d+',    'compileSdk = 34', c)
+c = re.sub(r'compileSdk\s+\d+',         'compileSdk 34', c)
+c = re.sub(r'targetSdkVersion\s+\d+',   'targetSdkVersion 34', c)
+c = re.sub(r'targetSdk\s*=\s*\d+',      'targetSdk = 34', c)
+c = re.sub(r'targetSdk\s+\d+',          'targetSdk 34', c)
+
+# Add java-websocket
+if 'java-websocket' not in c:
+    c = c.replace('dependencies {',
+        'dependencies {\n    implementation "org.java-websocket:Java-WebSocket:1.5.4"', 1)
+
+# Embed JS bundle in debug APK (fixes "Could not connect to dev server")
+if 'bundleInDebug' not in c:
+    if 'project.ext.react = [' in c:
+        c = c.replace('project.ext.react = [',
+            'project.ext.react = [\n        bundleInDebug: true,', 1)
+    else:
+        c = 'project.ext.react = [\n    bundleInDebug: true\n]\n\n' + c
+
+with open(gradle_path, 'w') as f:
+    f.write(c)
+
+print("build.gradle patched OK")
+for line in c.splitlines():
+    if any(k in line for k in ['compileSdk','targetSdk','java-websocket','bundle','namespace']):
+        print(" >>", line.strip())
+PYEOF
+
+      # ── Fix gradle.properties ─────────────────────────────────
+      - name: Fix gradle.properties
+        run: |
+          python3 - << 'PYEOF'
+import os
+
+props_path = os.environ["BUILD_DIR"] + "/android/gradle.properties"
+with open(props_path) as f:
+    lines = f.readlines()
+
+result, seen = [], set()
+for line in lines:
+    key = line.split('=')[0].strip()
+    if key == 'org.gradle.jvmargs':
+        result.append('org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m\n')
+    elif key == 'android.useAndroidX':
+        result.append('android.useAndroidX=true\n')
+    elif key == 'android.enableJetifier':
+        result.append('android.enableJetifier=true\n')
+    else:
+        result.append(line)
+    seen.add(key)
+
+if 'org.gradle.jvmargs'     not in seen: result.append('org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m\n')
+if 'android.useAndroidX'    not in seen: result.append('android.useAndroidX=true\n')
+if 'android.enableJetifier' not in seen: result.append('android.enableJetifier=true\n')
+
+with open(props_path, 'w') as f:
+    f.writelines(result)
+print("gradle.properties OK")
+PYEOF
+
+      # ── Install Node dependencies ─────────────────────────────
+      - name: Install Node dependencies
+        run: npm install
+        working-directory: /home/runner/NetShareBuild
+
+      # ── Copy vector icon fonts (required by react-native-vector-icons) ──
+      - name: Copy vector icon fonts
+        run: |
+          FONTS_SRC="$BUILD_DIR/node_modules/react-native-vector-icons/Fonts"
+          FONTS_DEST="$BUILD_DIR/android/app/src/main/assets/fonts"
+          mkdir -p "$FONTS_DEST"
+          if [ -d "$FONTS_SRC" ]; then
+            cp "$FONTS_SRC"/*.ttf "$FONTS_DEST/"
+            echo "Fonts copied: $(ls $FONTS_DEST | wc -l) files"
+          else
+            echo "No fonts dir found, skipping"
+          fi
+
+      # ── Bundle JS into Android assets ─────────────────────────
+      - name: Bundle JS into Android assets
+        run: |
+          mkdir -p android/app/src/main/assets
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output android/app/src/main/assets/index.android.bundle \
+            --assets-dest android/app/src/main/res \
+            --reset-cache
+        working-directory: /home/runner/NetShareBuild
+        env:
+          CI: false
+          NODE_ENV: production
+
+      # ── Cache Gradle ──────────────────────────────────────────
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/android/**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ── Build Debug APK ───────────────────────────────────────
+      - name: Build Debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+        working-directory: /home/runner/NetShareBuild
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          JAVA_HOME: ${{ env.JAVA_HOME }}
+
+      # ── Verify APK ────────────────────────────────────────────
+      - name: Verify APK
+        run: |
+          APK="$BUILD_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "APK not found!"
+            find "$BUILD_DIR/android/app/build" -name "*.apk" 2>/dev/null || echo "No APK anywhere"
+            exit 1
+          fi
+          echo "SUCCESS: $(du -h $APK)"
+
+      # ── Upload APK artifact ───────────────────────────────────
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetShare-debug-apk
+          path: /home/runner/NetShareBuild/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      # ── Create GitHub Release ─────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: v${{ github.run_number }}
+          name: NetShare v${{ github.run_number }}
+          body: |
+            ## NetShare APK - Build #${{ github.run_number }}
+            1. Download **app-debug.apk** below
+            2. Transfer to your Android phone
+            3. Tap Install (enable "Unknown sources" if asked)
+            4. Works standalone — no development server needed
+          files: /home/runner/NetShareBuild/android/app/build/outputs/apk/debug/app-debug.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
