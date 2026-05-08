@@ -183,14 +183,18 @@ jobs:
 
           # Inject resolutionStrategy.force BEFORE the android {} block so it
           # applies to all configurations (including AGP-internal ones).
-          resolution_block = """
-configurations.all {
-    resolutionStrategy {
-        force 'androidx.core:core:1.15.0'
-        force 'androidx.core:core-ktx:1.15.0'
-    }
-}
-"""
+          # NOTE: use \n-joined list (not triple-quotes) to avoid unindented
+          # braces that would break YAML parsing of this workflow file.
+          resolution_lines = [
+              "configurations.all {",
+              "    resolutionStrategy {",
+              "        force 'androidx.core:core:1.15.0'",
+              "        force 'androidx.core:core-ktx:1.15.0'",
+              "    }",
+              "}",
+              "",
+          ]
+          resolution_block = "\n".join(resolution_lines)
           if 'resolutionStrategy' not in content:
               # Insert before the android { block
               content = re.sub(
