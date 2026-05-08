@@ -78,7 +78,22 @@ jobs:
 
       - name: Merge package.json
         run: |
-          python3 - << 'PYEOF'
+          - name: Merge package.json
+        run: |
+          python3 -c "
+import json, os
+wp = os.environ['GITHUB_WORKSPACE']
+bd = os.environ['BUILD_DIR']
+repo = json.load(open(wp+'/package.json'))
+scaf = json.load(open(bd+'/package.json'))
+merged = scaf.copy()
+for k in ('dependencies','devDependencies'):
+    if k in repo: merged.setdefault(k,{}).update(repo[k])
+for k in ('name','version','scripts'):
+    if k in repo: merged[k]=repo[k]
+json.dump(merged,open(bd+'/package.json','w'),indent=2)
+print('package.json merged OK')
+"
 import json, os
 
 workspace = os.environ["GITHUB_WORKSPACE"]
