@@ -17,11 +17,15 @@ import org.java_websocket.handshake.ServerHandshake;
 
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.net.InetSocketAddress;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.Socket;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import javax.net.ssl.SSLSocketFactory;
 
 /**
  * NetShare VPN Service
@@ -39,8 +43,7 @@ import java.util.concurrent.Executors;
  * HOST mode:
  *   1. Connects to relay as HOST_REGISTER
  *   2. Receives DATA packets from clients via WebSocket
- *   3. Forwards them using a local HTTP/SOCKS proxy or raw socket
- *   4. Sends responses back via DATA messages on WebSocket
+ *   3. Forwards them to internet and sends responses back
  */
 public class NetShareVpnService extends VpnService {
 
@@ -64,9 +67,9 @@ public class NetShareVpnService extends VpnService {
             return START_NOT_STICKY;
         }
 
-        relayUrl  = intent.getStringExtra("RELAY_URL");
+        relayUrl    = intent.getStringExtra("RELAY_URL");
         sessionCode = intent.getStringExtra("SESSION_CODE");
-        role      = intent.getStringExtra("ROLE");
+        role        = intent.getStringExtra("ROLE");
 
         startForegroundNotification();
         executor = Executors.newFixedThreadPool(3);
@@ -80,8 +83,8 @@ public class NetShareVpnService extends VpnService {
             // ── 1. Build the TUN interface ────────────────────────────
             Builder builder = new Builder();
             builder.setSession("NetShare")
-                   .addAddress("10.8.0.2", 24)          // Virtual IP for this device
-                   .addRoute("0.0.0.0", 0)               // Route ALL traffic through VPN
+                   .addAddress("10.8.0.2", 24)
+                   .addRoute("0.0.0.0", 0)
                    .addDnsServer("8.8.8.8")
                    .addDnsServer("8.8.4.4")
                    .setMtu(1500);
@@ -112,13 +115,12 @@ public class NetShareVpnService extends VpnService {
 
     private void connectToRelay() throws Exception {
         URI uri = new URI(relayUrl);
+        final NetShareVpnService self = this;
 
         wsClient = new WebSocketClient(uri) {
             @Override
             public void onOpen(ServerHandshake handshake) {
                 Log.i(TAG, "WebSocket connected to relay");
-
-                // Register with relay server
                 if ("host".equals(role)) {
                     send("{\"type\":\"HOST_REGISTER\",\"netType\":\"WiFi\"}");
                 } else {
@@ -147,21 +149,81 @@ public class NetShareVpnService extends VpnService {
             @Override
             public void onClose(int code, String reason, boolean remote) {
                 Log.i(TAG, "WebSocket closed: " + reason);
-                VpnModule.emitEvent("vpnDisconnected", reason);
+                VpnModule.emitEvent("vpnDisconnected", reason != null ? reason : "closed");
                 isRunning = false;
             }
 
             @Override
             public void onError(Exception ex) {
-                Log.e(TAG, "WebSocket error: " + ex.getMessage());
-                VpnModule.emitEvent("vpnError", ex.getMessage());
+                Log.e(TAG, "WebSocket error: " + (ex != null ? ex.getMessage() : "unknown"));
+                VpnModule.emitEvent("vpnError", ex != null ? ex.getMessage() : "unknown error");
             }
         };
 
-        // Add VPN bypass so WebSocket doesn't route through itself
-        wsClient.setSocket(VpnService.protect(wsClient.createSocket(
-            new InetSocketAddress(uri.getHost(), uri.getPort() == -1 ? 443 : uri.getPort())
-        )));
+        // FIX: Use SSLSocketFactory to protect() each socket from routing through VPN itself.
+        // The old wsClient.setSocket(VpnService.protect(...)) was wrong:
+        //   - VpnService.protect() is NOT a static method
+        //   - WebSocketClient has no setSocket(Socket) method
+        // The correct approach is a custom SSLSocketFactory that calls self.protect() on every socket.
+        wsClient.setSocketFactory(new SSLSocketFactory() {
+            private final SSLSocketFactory delegate =
+                (SSLSocketFactory) SSLSocketFactory.getDefault();
+
+            @Override
+            public Socket createSocket() throws IOException {
+                Socket s = new Socket();
+                self.protect(s);
+                return s;
+            }
+
+            @Override
+            public Socket createSocket(String host, int port) throws IOException {
+                Socket s = delegate.createSocket(host, port);
+                self.protect(s);
+                return s;
+            }
+
+            @Override
+            public Socket createSocket(String host, int port,
+                                       InetAddress localAddr, int localPort) throws IOException {
+                Socket s = delegate.createSocket(host, port, localAddr, localPort);
+                self.protect(s);
+                return s;
+            }
+
+            @Override
+            public Socket createSocket(InetAddress host, int port) throws IOException {
+                Socket s = delegate.createSocket(host, port);
+                self.protect(s);
+                return s;
+            }
+
+            @Override
+            public Socket createSocket(InetAddress address, int port,
+                                       InetAddress localAddress, int localPort) throws IOException {
+                Socket s = delegate.createSocket(address, port, localAddress, localPort);
+                self.protect(s);
+                return s;
+            }
+
+            @Override
+            public Socket createSocket(Socket plain, String host,
+                                       int port, boolean autoClose) throws IOException {
+                Socket s = delegate.createSocket(plain, host, port, autoClose);
+                self.protect(s);
+                return s;
+            }
+
+            @Override
+            public String[] getDefaultCipherSuites() {
+                return delegate.getDefaultCipherSuites();
+            }
+
+            @Override
+            public String[] getSupportedCipherSuites() {
+                return delegate.getSupportedCipherSuites();
+            }
+        });
 
         wsClient.connectBlocking();
 
@@ -174,28 +236,23 @@ public class NetShareVpnService extends VpnService {
     private void startPacketReadLoop() {
         executor.execute(() -> {
             byte[] packet = new byte[32767];
-            FileInputStream in = new FileInputStream(vpnInterface.getFileDescriptor());
-
-            while (isRunning) {
-                try {
+            // FIX: use try-with-resources to ensure FileInputStream is always closed
+            try (FileInputStream in = new FileInputStream(vpnInterface.getFileDescriptor())) {
+                while (isRunning) {
                     int length = in.read(packet);
                     if (length > 0 && wsClient != null && wsClient.isOpen()) {
-                        // Send raw IP packet as binary to relay
                         wsClient.send(ByteBuffer.wrap(packet, 0, length));
                     }
-                } catch (Exception e) {
-                    if (isRunning) Log.e(TAG, "Packet read error: " + e.getMessage());
-                    break;
                 }
+            } catch (Exception e) {
+                if (isRunning) Log.e(TAG, "Packet read error: " + e.getMessage());
             }
         });
     }
 
     private void handleRelayMessage(String message) {
         try {
-            // Parse type field from JSON manually (no JSON lib dependency here)
             if (message.contains("\"SESSION_CREATED\"")) {
-                // Extract code from JSON
                 String code = message.split("\"code\":\"")[1].split("\"")[0];
                 VpnModule.emitEvent("sessionCreated", code);
             } else if (message.contains("\"JOIN_SUCCESS\"")) {
@@ -211,7 +268,6 @@ public class NetShareVpnService extends VpnService {
             } else if (message.contains("\"HOST_LEFT\"")) {
                 VpnModule.emitEvent("hostLeft", "Host ended the session");
             } else if (message.contains("\"PING\"")) {
-                // Heartbeat from server — respond with PONG
                 if (wsClient != null && wsClient.isOpen()) {
                     wsClient.send("{\"type\":\"PONG\"}");
                 }
@@ -226,11 +282,9 @@ public class NetShareVpnService extends VpnService {
 
         try {
             if (wsClient != null) {
-                if ("host".equals(role)) {
-                    wsClient.send("{\"type\":\"HOST_LEAVE\"}");
-                } else {
-                    wsClient.send("{\"type\":\"CLIENT_LEAVE\"}");
-                }
+                wsClient.send("host".equals(role)
+                    ? "{\"type\":\"HOST_LEAVE\"}"
+                    : "{\"type\":\"CLIENT_LEAVE\"}");
                 wsClient.close();
             }
         } catch (Exception e) {
