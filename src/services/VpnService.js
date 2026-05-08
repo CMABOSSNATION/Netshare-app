@@ -34,14 +34,17 @@ class VpnService {
 
   /**
    * Start as HOST — shares this device's internet with clients.
-   * The relay server will generate a session code.
+   * The relay server will generate a session code and emit 'sessionCreated'.
+   *
+   * FIX: Was passing 'HOST' as sessionCode — the native side expects a real
+   * or empty string. Now passes empty string; relay assigns the code.
    */
   async startAsHost() {
     const granted = await this.prepare();
     if (!granted) throw new Error('VPN permission denied by user');
 
-    // Host uses a random code — relay will assign real one
-    await VpnModule.startVpn(RELAY_URL, 'HOST', 'host');
+    // Pass empty string for sessionCode — relay will assign and return via sessionCreated event
+    await VpnModule.startVpn(RELAY_URL, '', 'host');
   }
 
   /**
