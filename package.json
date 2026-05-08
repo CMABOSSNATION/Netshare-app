@@ -9,8 +9,6 @@
     "build:android": "cd android && ./gradlew assembleRelease"
   },
   "dependencies": {
-    "react": "18.2.0",
-    "react-native": "0.74.1",
     "@react-navigation/native": "^6.1.9",
     "@react-navigation/bottom-tabs": "^6.5.11",
     "react-native-screens": "^3.29.0",
@@ -18,7 +16,7 @@
     "react-native-vector-icons": "^10.0.3",
     "react-native-linear-gradient": "^2.8.3",
     "react-native-svg": "^14.1.0",
-    "react-native-reanimated": "^3.6.2",
+    "react-native-reanimated": "3.6.1",
     "react-native-gesture-handler": "^2.14.1",
     "zustand": "^4.5.0",
     "@react-native-async-storage/async-storage": "^1.21.0",
@@ -29,10 +27,10 @@
     "@babel/core": "^7.20.0",
     "@babel/preset-env": "^7.20.0",
     "@babel/runtime": "^7.20.0",
-    "@react-native/babel-preset": "0.73.21",
-    "@react-native/eslint-config": "0.73.2",
-    "@react-native/metro-config": "0.73.3",
-    "@react-native/typescript-config": "0.73.1",
+    "@react-native/babel-preset": "0.74.1",
+    "@react-native/eslint-config": "0.74.1",
+    "@react-native/metro-config": "0.74.1",
+    "@react-native/typescript-config": "0.74.1",
     "typescript": "5.0.4"
   }
 }
