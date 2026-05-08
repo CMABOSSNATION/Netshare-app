@@ -1,0 +1,303 @@
+name: Build NetShare APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    env:
+      BUILD_DIR: /home/runner/NetShareBuild
+      RN_VERSION: '0.74.1'
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-netshare-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-netshare-
+            ${{ runner.os }}-gradle-
+
+      - name: Initialize React Native project
+        run: |
+          cd /home/runner
+          npx --yes react-native@${{ env.RN_VERSION }} init NetShareBuild \
+            --version ${{ env.RN_VERSION }} \
+            --skip-install
+        env:
+          CI: false
+
+      - name: Copy JS source files
+        run: |
+          rm -f "$BUILD_DIR/App.tsx"
+          cp "$GITHUB_WORKSPACE/App.jsx"                    "$BUILD_DIR/App.jsx"
+          cp "$GITHUB_WORKSPACE/index.js"                   "$BUILD_DIR/index.js"
+          mkdir -p "$BUILD_DIR/src/screens" "$BUILD_DIR/src/services" "$BUILD_DIR/src/store"
+          cp "$GITHUB_WORKSPACE/src/screens/HomeScreen.jsx" "$BUILD_DIR/src/screens/"
+          cp "$GITHUB_WORKSPACE/src/services/VpnService.js" "$BUILD_DIR/src/services/"
+          cp "$GITHUB_WORKSPACE/src/store/index.js"         "$BUILD_DIR/src/store/"
+          echo "=== JS files copied ==="
+
+      - name: Merge package.json (with compatible dependency pins)
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          wp = os.environ["GITHUB_WORKSPACE"]
+          bd = os.environ["BUILD_DIR"]
+          repo     = json.load(open(wp + "/package.json"))
+          scaffold = json.load(open(bd + "/package.json"))
+          # Only merge deps — do NOT copy react/react-native from repo
+          # as the scaffold already has the correct versions
+          repo_deps = repo.get("dependencies", {})
+          repo_deps.pop("react", None)
+          repo_deps.pop("react-native", None)
+          scaffold["dependencies"].update(repo_deps)
+          scaffold["devDependencies"].update(repo.get("devDependencies", {}))
+          # Pin reanimated to last version supporting RN 0.74
+          scaffold["dependencies"]["react-native-reanimated"] = "3.6.1"
+          scaffold["dependencies"]["react-native-gesture-handler"] = "^2.14.1"
+          json.dump(scaffold, open(bd + "/package.json", "w"), indent=2)
+          print("Merged package.json — reanimated pinned to 3.6.1, react/react-native kept from scaffold")
+          PYEOF
+
+      - name: Copy AndroidManifest
+        run: |
+          cp "$GITHUB_WORKSPACE/android/app/src/main/AndroidManifest.xml" \
+             "$BUILD_DIR/android/app/src/main/AndroidManifest.xml"
+          echo "=== AndroidManifest copied ==="
+
+      - name: Copy native Java source files
+        run: |
+          JAVA_DEST="$BUILD_DIR/android/app/src/main/java/com/netsharebuild"
+          mkdir -p "$JAVA_DEST"
+          for FILE in VpnModule.java VpnPackage.java NetShareVpnService.java; do
+            SRC="$GITHUB_WORKSPACE/android/app/src/main/java/com/netshare/$FILE"
+            sed 's/^package com\.netshare;/package com.netsharebuild;/' "$SRC" > "$JAVA_DEST/$FILE"
+            sed -i 's/com\.netshare\./com.netsharebuild./g' "$JAVA_DEST/$FILE"
+            echo "Copied: $FILE"
+          done
+          ls -la "$JAVA_DEST/"
+
+      - name: Patch MainApplication.kt to register VpnPackage
+        run: |
+          FILE=$(find "$BUILD_DIR/android" -name "MainApplication.kt" | head -1)
+          echo "=== Patching: $FILE ==="
+          if ! grep -q "VpnPackage" "$FILE"; then
+            python3 << 'PYEOF'
+          import re, os, glob
+
+          # Find MainApplication.kt
+          build_dir = os.environ["BUILD_DIR"]
+          matches = glob.glob(build_dir + "/android/**/MainApplication.kt", recursive=True)
+          if not matches:
+              print("ERROR: MainApplication.kt not found!")
+              exit(1)
+          f = matches[0]
+          print("Found: " + f)
+          content = open(f).read()
+
+          # 1. Add import after ReactApplication import
+          if "import com.netsharebuild.VpnPackage" not in content:
+              content = re.sub(
+                  r'(import com\.facebook\.react\.ReactApplication)',
+                  'import com.netsharebuild.VpnPackage\n\\1',
+                  content
+              )
+
+          # 2. RN 0.74 scaffold uses PackageList(this).packages.apply { ... }
+          #    Inject add(VpnPackage()) inside that block
+          if "VpnPackage()" not in content:
+              # Pattern A: apply block style (RN 0.74 default)
+              content = re.sub(
+                  r'(PackageList\(this\)\.packages\.apply\s*\{)',
+                  r'\1\n              add(VpnPackage())',
+                  content
+              )
+
+          # Pattern B: fallback — getPackages() returning mutableListOf
+          if "VpnPackage()" not in content:
+              content = re.sub(
+                  r'(return\s+mutableListOf\s*\()',
+                  r'return mutableListOf(\n              VpnPackage(),',
+                  content
+              )
+
+          open(f, "w").write(content)
+          print("VpnPackage successfully registered")
+          PYEOF
+          else
+            echo "VpnPackage already present, skipping"
+          fi
+          echo "=== Verification ==="
+          grep -n "VpnPackage\|PackageList\|getPackages" "$FILE" || true
+
+      - name: Patch app build.gradle
+        run: |
+          python3 << 'PYEOF'
+          import re, os
+          p = os.environ["BUILD_DIR"] + "/android/app/build.gradle"
+          content = open(p).read()
+
+          # Fix applicationId
+          content = re.sub(r'applicationId\s+"[^"]+"', 'applicationId "com.netsharebuild"', content)
+
+          # FIX: AGP 8.2.1 (locked by RN 0.74's gradle plugin — cannot be overridden via
+          # classpath because RN 0.74 uses pluginManagement with no version in classpath string).
+          # androidx.core:core:1.16.0 requires AGP >= 8.6.0 but we can't upgrade AGP easily.
+          # SOLUTION: Force androidx.core and androidx.core-ktx down to 1.15.0, the last
+          # version compatible with AGP 8.2.1. This is done via resolutionStrategy.force
+          # which overrides any transitive dependency that tries to pull in 1.16.0.
+          # FIX: bump compileSdk to 35 so androidx.core:1.15.0+ AAR metadata check passes
+          # (androidx.core 1.15.0 requires compileSdk >= 35; AGP 8.2.1 supports compileSdk 35)
+          content = re.sub(r'compileSdk\s*=?\s*\d+', 'compileSdk = 35', content)
+          content = re.sub(r'compileSdkVersion\s*\d+', 'compileSdkVersion 35', content)
+
+          # Add java-websocket dependency required by NetShareVpnService.java
+          websocket_dep = "    implementation 'org.java-websocket:Java-WebSocket:1.5.4'"
+          if 'java-websocket' not in content:
+              content = re.sub(
+                  r'(dependencies \{)',
+                  r'\1\n' + websocket_dep,
+                  content
+              )
+
+          open(p, "w").write(content)
+          print("app/build.gradle patched")
+          print("  applicationId = com.netsharebuild")
+          print("  compileSdk bumped to 35")
+          print("  java-websocket:1.5.4 added")
+          PYEOF
+
+      - name: Fix gradle.properties
+        run: |
+          python3 << 'PYEOF'
+          import os
+          p = os.environ["BUILD_DIR"] + "/android/gradle.properties"
+          lines = open(p).readlines()
+          result, seen = [], set()
+          for line in lines:
+              key = line.split("=")[0].strip() if "=" in line else ""
+              if key and key in seen:
+                  continue
+              if key:
+                  seen.add(key)
+              result.append(line)
+          required = [
+              "org.gradle.jvmargs=-Xmx2048m\n",
+              "android.useAndroidX=true\n",
+              "android.enableJetifier=true\n",
+              # Suppress the compileSdk 34 vs 35 warning that doesn't block build
+              # but keep it clean in logs
+              "android.suppressUnsupportedCompileSdk=35\n",
+          ]
+          for req in required:
+              key = req.split("=")[0].strip()
+              if not any(key in line for line in result):
+                  result.append(req)
+          open(p, "w").writelines(result)
+          print("gradle.properties fixed")
+          PYEOF
+
+      - name: Install Node dependencies
+        run: npm install
+        working-directory: /home/runner/NetShareBuild
+
+      - name: Copy vector icon fonts
+        run: |
+          FONTS_SRC="$BUILD_DIR/node_modules/react-native-vector-icons/Fonts"
+          FONTS_DEST="$BUILD_DIR/android/app/src/main/assets/fonts"
+          mkdir -p "$FONTS_DEST"
+          if [ -d "$FONTS_SRC" ]; then
+            cp "$FONTS_SRC"/*.ttf "$FONTS_DEST/"
+            echo "Fonts copied"
+          else
+            echo "No fonts dir, skipping"
+          fi
+
+      - name: Bundle JS into Android assets
+        run: |
+          mkdir -p "$BUILD_DIR/android/app/src/main/assets"
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --entry-file index.js \
+            --bundle-output "$BUILD_DIR/android/app/src/main/assets/index.android.bundle" \
+            --reset-cache
+        working-directory: /home/runner/NetShareBuild
+        env:
+          CI: false
+          NODE_ENV: production
+
+      - name: Build Debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+        working-directory: /home/runner/NetShareBuild
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          JAVA_HOME: ${{ env.JAVA_HOME }}
+
+      - name: Verify APK
+        run: |
+          APK="$BUILD_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "APK not found!"
+            find "$BUILD_DIR/android/app/build" -name "*.apk" 2>/dev/null || echo "No APK anywhere"
+            exit 1
+          fi
+          echo "SUCCESS: $(du -h $APK)"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetShare-debug-apk
+          path: /home/runner/NetShareBuild/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: v${{ github.run_number }}
+          name: NetShare v${{ github.run_number }}
+          body: |
+            ## NetShare APK - Build #${{ github.run_number }}
+            1. Download **app-debug.apk** below
+            2. Transfer to your Android phone
+            3. Tap Install (enable Unknown sources if asked)
+            4. Works standalone - no development server needed
+          files: /home/runner/NetShareBuild/android/app/build/outputs/apk/debug/app-debug.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
