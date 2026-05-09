@@ -16,8 +16,8 @@ const { VpnModule } = NativeModules;
 const vpnEmitter = VpnModule ? new NativeEventEmitter(VpnModule) : null;
 
 // ── Server URL — replace with your deployed backend ──────────────────
-export const RELAY_URL = 'wss://your-netshare-backend.onrender.com/relay';
-export const API_URL   = 'https://your-netshare-backend.onrender.com';
+export const RELAY_URL = 'wss://netshare-app-backend.onrender.com/relay';
+export const API_URL   = 'https://netshare-app-backend.onrender.com';
 
 class VpnService {
   constructor() {
