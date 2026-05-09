@@ -74,7 +74,7 @@ class VpnService {
     this.role = 'host';
 
     // The native layer connects to relay; once connected we send HOST_REGISTER
-    await VpnModule.startVpn(RELAY_URL, '', 'host');
+    await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, netType);
 
     // Listen for native VPN tunnel up, then register with relay
     this._once('vpnConnected', () => {
@@ -101,7 +101,7 @@ class VpnService {
     this.accessCode = accessCode.toUpperCase();
     this.currentCode = sessionCode;
 
-    await VpnModule.startVpn(RELAY_URL, sessionCode || '', 'client');
+    await VpnModule.startVpn(RELAY_URL, accessCode.toUpperCase(), 'client', '', '');
 
     // After VPN tunnel up, join session via relay
     this._once('vpnConnected', () => {
