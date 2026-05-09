@@ -97,7 +97,19 @@ public class NetShareVpnService extends VpnService {
 
     private void startVpnTunnel() {
         try {
-            // ── 1. Build the TUN interface ────────────────────────────
+            if ("host".equals(role)) {
+                // ── HOST MODE: no TUN interface needed ───────────────
+                // Host just connects to relay via WebSocket and forwards
+                // client packets to the internet. Host's own internet
+                // continues working normally — no VPN tunnel on host.
+                isRunning = true;
+                Log.i(TAG, "Host mode started — connecting to relay");
+                VpnModule.emitEvent("vpnConnected", "host");
+                connectToRelay();
+                return;
+            }
+
+            // ── CLIENT MODE: create TUN interface ────────────────────
             Builder builder = new Builder();
             builder.setSession("NetShare")
                    .addAddress("10.8.0.2", 24)
@@ -121,12 +133,32 @@ public class NetShareVpnService extends VpnService {
             Log.i(TAG, "VPN tunnel established");
             VpnModule.emitEvent("vpnConnected", sessionCode);
 
-            // ── 2. Connect to relay WebSocket ────────────────────────
+            // ── Connect to relay WebSocket ────────────────────────────
             connectToRelay();
+
+            // ── Read packets from TUN and send to relay ───────────────
+            executor.execute(this::readTunAndForwardToRelay);
 
         } catch (Exception e) {
             Log.e(TAG, "VPN start error: " + e.getMessage());
             VpnModule.emitEvent("vpnError", e.getMessage());
+        }
+    }
+
+    // ── CLIENT: read IP packets from TUN and forward to relay ────────────
+    private void readTunAndForwardToRelay() {
+        FileInputStream tunIn = new FileInputStream(vpnInterface.getFileDescriptor());
+        byte[] packet = new byte[32767];
+        while (isRunning) {
+            try {
+                int len = tunIn.read(packet);
+                if (len > 0 && wsClient != null && wsClient.isOpen()) {
+                    wsClient.send(ByteBuffer.wrap(packet, 0, len));
+                }
+            } catch (Exception e) {
+                if (isRunning) Log.w(TAG, "TUN read error: " + e.getMessage());
+                break;
+            }
         }
     }
 
