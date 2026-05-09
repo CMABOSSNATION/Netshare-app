@@ -18,10 +18,16 @@ import org.java_websocket.handshake.ServerHandshake;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.net.URI;
 import java.nio.ByteBuffer;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -63,6 +69,10 @@ public class NetShareVpnService extends VpnService {
     private String hostId;
     private String netType;
 
+    // Host mode: track open TCP connections per flow key "srcIP:srcPort-dstIP:dstPort"
+    private final Map<String, Socket> tcpConnections = new ConcurrentHashMap<>();
+    private final Map<String, DatagramSocket> udpSockets = new ConcurrentHashMap<>();
+
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && "STOP_VPN".equals(intent.getAction())) {
@@ -78,7 +88,7 @@ public class NetShareVpnService extends VpnService {
         if (netType == null || netType.isEmpty()) netType = "WiFi";
 
         startForegroundNotification();
-        executor = Executors.newFixedThreadPool(3);
+        executor = Executors.newFixedThreadPool("host".equals(role) ? 20 : 3);
         VpnModule.activeService = this;
         executor.execute(this::startVpnTunnel);
 
@@ -142,13 +152,23 @@ public class NetShareVpnService extends VpnService {
 
             @Override
             public void onMessage(ByteBuffer bytes) {
-                // Binary packet received from relay — write to TUN interface
-                if (vpnInterface != null && isRunning) {
-                    try {
-                        FileOutputStream out = new FileOutputStream(vpnInterface.getFileDescriptor());
-                        out.write(bytes.array(), bytes.position(), bytes.remaining());
-                    } catch (Exception e) {
-                        Log.e(TAG, "TUN write error: " + e.getMessage());
+                if (!isRunning) return;
+                if ("host".equals(role)) {
+                    // HOST: forward received client packet to internet
+                    byte[] packet = new byte[bytes.remaining()];
+                    bytes.get(packet);
+                    executor.execute(() -> forwardPacketToInternet(packet));
+                } else {
+                    // CLIENT: inject received internet response into TUN
+                    if (vpnInterface != null) {
+                        try {
+                            FileOutputStream out = new FileOutputStream(vpnInterface.getFileDescriptor());
+                            byte[] data = new byte[bytes.remaining()];
+                            bytes.get(data);
+                            out.write(data);
+                        } catch (Exception e) {
+                            Log.e(TAG, "TUN write error: " + e.getMessage());
+                        }
                     }
                 }
             }
@@ -292,6 +312,127 @@ public class NetShareVpnService extends VpnService {
         }
     }
 
+    // ── Host: parse IP packet and forward to internet ─────────────────
+    private void forwardPacketToInternet(byte[] packet) {
+        if (packet.length < 20) return;
+        try {
+            int version = (packet[0] >> 4) & 0xF;
+            if (version != 4) return; // IPv4 only
+
+            int protocol = packet[9] & 0xFF;
+            int ihl = (packet[0] & 0xF) * 4;
+
+            // Destination IP
+            byte[] dstIpBytes = new byte[]{packet[16], packet[17], packet[18], packet[19]};
+            InetAddress dstAddr = InetAddress.getByAddress(dstIpBytes);
+
+            // Source IP (client's virtual IP — used as flow key)
+            byte[] srcIpBytes = new byte[]{packet[12], packet[13], packet[14], packet[15]};
+            String srcIp = InetAddress.getByAddress(srcIpBytes).getHostAddress();
+
+            if (protocol == 6) {
+                // TCP
+                int srcPort = ((packet[ihl] & 0xFF) << 8) | (packet[ihl + 1] & 0xFF);
+                int dstPort = ((packet[ihl + 2] & 0xFF) << 8) | (packet[ihl + 3] & 0xFF);
+                int tcpFlags = packet[ihl + 13] & 0xFF;
+                boolean isSyn = (tcpFlags & 0x02) != 0;
+                boolean isFin = (tcpFlags & 0x01) != 0 || (tcpFlags & 0x04) != 0;
+                int dataOffset = ((packet[ihl + 12] >> 4) & 0xF) * 4;
+                int payloadStart = ihl + dataOffset;
+                int payloadLen = packet.length - payloadStart;
+
+                String flowKey = srcIp + ":" + srcPort + "-" + dstAddr.getHostAddress() + ":" + dstPort;
+
+                if (isSyn || !tcpConnections.containsKey(flowKey)) {
+                    // New TCP connection
+                    Socket sock = new Socket();
+                    protect(sock);
+                    sock.connect(new java.net.InetSocketAddress(dstAddr, dstPort), 5000);
+                    sock.setSoTimeout(30000);
+                    tcpConnections.put(flowKey, sock);
+                    // Start response reader for this connection
+                    final String fk = flowKey;
+                    executor.execute(() -> readTcpResponses(sock, fk));
+                }
+
+                Socket sock = tcpConnections.get(flowKey);
+                if (sock != null && !sock.isClosed() && payloadLen > 0) {
+                    OutputStream out = sock.getOutputStream();
+                    out.write(packet, payloadStart, payloadLen);
+                    out.flush();
+                }
+
+                if (isFin) {
+                    Socket s = tcpConnections.remove(flowKey);
+                    if (s != null) try { s.close(); } catch (Exception ignored) {}
+                }
+
+            } else if (protocol == 17) {
+                // UDP
+                int srcPort = ((packet[ihl] & 0xFF) << 8) | (packet[ihl + 1] & 0xFF);
+                int dstPort = ((packet[ihl + 2] & 0xFF) << 8) | (packet[ihl + 3] & 0xFF);
+                int payloadStart = ihl + 8;
+                int payloadLen = packet.length - payloadStart;
+                if (payloadLen <= 0) return;
+
+                String flowKey = srcIp + ":" + srcPort + "-" + dstAddr.getHostAddress() + ":" + dstPort;
+
+                if (!udpSockets.containsKey(flowKey)) {
+                    DatagramSocket udpSock = new DatagramSocket();
+                    protect(udpSock);
+                    udpSockets.put(flowKey, udpSock);
+                    final String fk = flowKey;
+                    executor.execute(() -> readUdpResponses(udpSock, fk));
+                }
+
+                DatagramSocket udpSock = udpSockets.get(flowKey);
+                if (udpSock != null && !udpSock.isClosed()) {
+                    DatagramPacket dp = new DatagramPacket(packet, payloadStart, payloadLen, dstAddr, dstPort);
+                    udpSock.send(dp);
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "forwardPacket error: " + e.getMessage());
+        }
+    }
+
+    private void readTcpResponses(Socket sock, String flowKey) {
+        try {
+            InputStream in = sock.getInputStream();
+            byte[] buf = new byte[32767];
+            int len;
+            while (isRunning && !sock.isClosed() && (len = in.read(buf)) > 0) {
+                if (wsClient != null && wsClient.isOpen()) {
+                    wsClient.send(ByteBuffer.wrap(buf, 0, len));
+                }
+            }
+        } catch (Exception e) {
+            if (isRunning) Log.w(TAG, "TCP read error [" + flowKey + "]: " + e.getMessage());
+        } finally {
+            tcpConnections.remove(flowKey);
+            try { sock.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void readUdpResponses(DatagramSocket udpSock, String flowKey) {
+        try {
+            byte[] buf = new byte[32767];
+            DatagramPacket dp = new DatagramPacket(buf, buf.length);
+            udpSock.setSoTimeout(30000);
+            while (isRunning && !udpSock.isClosed()) {
+                udpSock.receive(dp);
+                if (wsClient != null && wsClient.isOpen()) {
+                    wsClient.send(ByteBuffer.wrap(dp.getData(), 0, dp.getLength()));
+                }
+            }
+        } catch (Exception e) {
+            if (isRunning) Log.w(TAG, "UDP read error [" + flowKey + "]: " + e.getMessage());
+        } finally {
+            udpSockets.remove(flowKey);
+            try { udpSock.close(); } catch (Exception ignored) {}
+        }
+    }
+
     private void stopVpnTunnel() {
         isRunning = false;
 
@@ -316,6 +457,12 @@ public class NetShareVpnService extends VpnService {
         }
 
         if (executor != null) executor.shutdownNow();
+
+        // Close all host forwarding connections
+        for (Socket s : tcpConnections.values()) try { s.close(); } catch (Exception ignored) {}
+        for (DatagramSocket s : udpSockets.values()) try { s.close(); } catch (Exception ignored) {}
+        tcpConnections.clear();
+        udpSockets.clear();
 
         VpnModule.emitEvent("vpnDisconnected", "User stopped sharing");
         stopForeground(true);
