@@ -1,20 +1,23 @@
 /**
- * HomeScreen.jsx
- * Main screen — matches your existing NetShare UI but now hooks into real VPN.
+ * HomeScreen.jsx — NetShare Business Edition
+ *
+ * Changes:
+ *  - Clients enter admin-generated ACCESS CODE (not session code)
+ *  - Hosts see earnings estimate & uptime tracker
+ *  - Auto-failover notification ("Reconnecting to new host...")
+ *  - Role-appropriate UI: HOST = share mode, CLIENT = access mode
  */
 
 import React, { useEffect, useRef, useState } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, Animated,
-  Alert, Platform, ScrollView, StatusBar,
+  Alert, Platform, ScrollView, StatusBar, TextInput,
 } from 'react-native';
-import Clipboard from '@react-native-clipboard/clipboard';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import LinearGradient from 'react-native-linear-gradient';
 import { useStore } from '../store';
 import VpnService from '../services/VpnService';
 
-// ── Helpers ──────────────────────────────────────────────────────
 const formatBytes = (bytes) => {
   if (bytes < 1024) return `${bytes.toFixed(0)} B`;
   if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -24,12 +27,19 @@ const formatBytes = (bytes) => {
 const formatDuration = (start) => {
   if (!start) return '00:00';
   const secs = Math.floor((Date.now() - start) / 1000);
-  const m = String(Math.floor(secs / 60)).padStart(2, '0');
+  const h = Math.floor(secs / 3600);
+  const m = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
   const s = String(secs % 60).padStart(2, '0');
-  return `${m}:${s}`;
+  return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
 };
 
-// ── Colors ───────────────────────────────────────────────────────
+// Estimated host earnings — $1/hr as host (50% of $2/hr plan)
+const estimateHostEarnings = (startMs) => {
+  if (!startMs) return '0.00';
+  const hrs = (Date.now() - startMs) / 3_600_000;
+  return (hrs * 1.0).toFixed(2);
+};
+
 const T = {
   bg: '#0A0E1A',
   card: '#111827',
@@ -38,25 +48,31 @@ const T = {
   accent2: '#7B61FF',
   green: '#00FF88',
   red: '#FF4466',
+  amber: '#FFB400',
   text: '#E2E8F0',
   muted: '#4A5568',
 };
 
 export default function HomeScreen() {
-  const { role, status, sessionCode, connectedClients,
-          networkType, errorMessage, bytesUp, bytesDown,
-          connectionTime, setRole, setNetworkType,
-          setConnecting, setConnected, setError, setIdle,
-          addClient, removeClient, tickBandwidth } = useStore();
+  const {
+    role, status, sessionCode, connectedClients,
+    networkType, errorMessage, bytesUp, bytesDown,
+    connectionTime, setRole, setNetworkType,
+    setConnecting, setConnected, setError, setIdle,
+    addClient, removeClient, tickBandwidth,
+  } = useStore();
 
-  const [clientCode, setClientCode] = useState('');
+  const [accessCode, setAccessCode] = useState('');
   const [log, setLog] = useState([]);
   const [duration, setDuration] = useState('00:00');
+  const [failoverMsg, setFailoverMsg] = useState('');
+  const [validating, setValidating] = useState(false);
+
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const bandwidthTimer = useRef(null);
   const durationTimer = useRef(null);
 
-  // ── Pulse animation when connected ──────────────────────────
+  // ── Pulse on connected ──────────────────────────────────────────
   useEffect(() => {
     if (status === 'connected') {
       Animated.loop(
@@ -65,11 +81,8 @@ export default function HomeScreen() {
           Animated.timing(pulseAnim, { toValue: 1, duration: 800, useNativeDriver: true }),
         ])
       ).start();
-
       bandwidthTimer.current = setInterval(tickBandwidth, 500);
-      durationTimer.current = setInterval(
-        () => setDuration(formatDuration(connectionTime)), 1000
-      );
+      durationTimer.current = setInterval(() => setDuration(formatDuration(connectionTime)), 1000);
     } else {
       pulseAnim.stopAnimation();
       pulseAnim.setValue(1);
@@ -82,36 +95,42 @@ export default function HomeScreen() {
     };
   }, [status]);
 
-  // ── VPN event listeners ──────────────────────────────────────
+  // ── VPN Events ──────────────────────────────────────────────────
   useEffect(() => {
     const unsubs = [
       VpnService.on('sessionCreated', (code) => {
-        addLog(`Session created: ${code}`);
+        addLog(`✓ Session ${code} active — clients can connect`);
         setConnected(code);
       }),
-      VpnService.on('vpnConnected', (code) => {
+      VpnService.on('vpnConnected', () => {
         addLog('VPN tunnel established');
-        if (role === 'client') setConnected(code);
+        if (role === 'client') setConnected(accessCode);
       }),
-      VpnService.on('joinSuccess', (code) => {
-        addLog(`Joined session ${code} — routing traffic through host`);
+      VpnService.on('joinSuccess', ({ code, netType }) => {
+        addLog(`✓ Connected via ${netType || 'WiFi'} network`);
         setConnected(code);
+        setFailoverMsg('');
       }),
       VpnService.on('joinError', (reason) => {
-        addLog(`Join failed: ${reason}`);
+        addLog(`✕ ${reason}`);
         setError(reason);
       }),
-      VpnService.on('clientConnected', (id) => {
-        addLog(`Client connected: ${id}`);
+      VpnService.on('clientConnected', ({ totalClients }) => {
+        addLog(`Client connected (${totalClients} total)`);
         addClient();
       }),
-      VpnService.on('clientDisconnected', () => {
-        addLog('A client disconnected');
+      VpnService.on('clientDisconnected', ({ totalClients }) => {
+        addLog(`Client left (${totalClients} remain)`);
         removeClient();
       }),
-      VpnService.on('hostLeft', (msg) => {
+      VpnService.on('hostLeft', () => {
         addLog('Host ended the session');
         setIdle();
+      }),
+      VpnService.on('hostFailover', (newCode) => {
+        addLog('⟳ Reconnected to new host automatically');
+        setFailoverMsg('Switched to a faster host ⚡');
+        setTimeout(() => setFailoverMsg(''), 4000);
       }),
       VpnService.on('vpnDisconnected', (reason) => {
         addLog(`Disconnected: ${reason}`);
@@ -130,85 +149,82 @@ export default function HomeScreen() {
     setLog(prev => [`[${time}] ${msg}`, ...prev].slice(0, 30));
   };
 
-  // ── Start HOST ───────────────────────────────────────────────
+  // ── Start HOST ──────────────────────────────────────────────────
   const handleStartHost = async () => {
     try {
       setConnecting();
-      addLog('Requesting VPN permission...');
-      await VpnService.startAsHost();
-      addLog('Connecting to relay server...');
+      addLog('Starting host mode...');
+      await VpnService.startAsHost(networkType);
     } catch (e) {
       setError(e.message);
-      addLog(`Error: ${e.message}`);
+      addLog(`✕ ${e.message}`);
       Alert.alert('Error', e.message);
     }
   };
 
-  // ── Start CLIENT ─────────────────────────────────────────────
+  // ── Start CLIENT ────────────────────────────────────────────────
   const handleStartClient = async () => {
-    if (clientCode.length !== 6) {
-      Alert.alert('Invalid Code', 'Enter the 6-character session code from the host.');
+    const code = accessCode.trim().toUpperCase();
+    if (code.length < 8) {
+      Alert.alert('Invalid Code', 'Enter the access code from the platform owner (format: XXXX-XXXX)');
       return;
     }
     try {
+      setValidating(true);
+      addLog(`Validating access code...`);
       setConnecting();
-      addLog(`Joining session ${clientCode}...`);
-      await VpnService.startAsClient(clientCode);
-      addLog('Connecting to relay server...');
+      await VpnService.startAsClient(code);
+      addLog('Connecting to best available host...');
     } catch (e) {
       setError(e.message);
-      addLog(`Error: ${e.message}`);
-      Alert.alert('Error', e.message);
+      addLog(`✕ ${e.message}`);
+      Alert.alert('Access Denied', e.message);
+    } finally {
+      setValidating(false);
     }
   };
 
-  // ── Stop ─────────────────────────────────────────────────────
   const handleStop = async () => {
     await VpnService.stop();
     setIdle();
-    addLog('Stopped sharing');
+    addLog('Stopped');
   };
 
-  const copyCode = () => {
-    if (sessionCode) {
-      Clipboard.setString(sessionCode);
-      Alert.alert('Copied!', 'Session code copied to clipboard');
-    }
-  };
-
-  const isConnected = status === 'connected';
+  const isConnected  = status === 'connected';
   const isConnecting = status === 'connecting';
 
   return (
     <SafeAreaView style={s.safe}>
-      <StatusBar barStyle="light-content" backgroundColor={T.bg} />
+      <StatusBar barStyle="light-content" backgroundColor={T.bg}/>
       <ScrollView style={s.scroll} contentContainerStyle={s.content}>
 
-        {/* ── Header ── */}
+        {/* Header */}
         <View style={s.header}>
           <Text style={s.title}>NETSHARE</Text>
-          <Text style={s.subtitle}>REAL-TIME RELAY PROTOCOL</Text>
+          <Text style={s.subtitle}>PREMIUM NETWORK SHARING</Text>
           <View style={s.badge}>
-            <Text style={s.badgeText}>v2.0.0 · NATIVE VPN</Text>
+            <Text style={s.badgeText}>BUSINESS EDITION · v2.0</Text>
           </View>
         </View>
 
-        {/* ── Role Tabs ── */}
+        {/* Role Tabs */}
         <View style={s.tabs}>
-          {['host', 'client'].map(r => (
+          {[
+            { id: 'host',   label: 'HOST', sub: 'Share & Earn' },
+            { id: 'client', label: 'CLIENT', sub: 'Access Network' },
+          ].map(r => (
             <TouchableOpacity
-              key={r}
-              style={[s.tab, role === r && s.tabActive]}
-              onPress={() => { if (!isConnected && !isConnecting) setRole(r); }}
+              key={r.id}
+              style={[s.tab, role === r.id && s.tabActive]}
+              onPress={() => { if (!isConnected && !isConnecting) setRole(r.id); }}
               disabled={isConnected || isConnecting}>
-              <Text style={[s.tabText, role === r && s.tabTextActive]}>
-                {r === 'host' ? 'HOST · Share WiFi' : 'CLIENT · Join Network'}
-              </Text>
+              <Text style={[s.tabText, role === r.id && s.tabTextActive]}>{r.label}</Text>
+              <Text style={[s.tabSub, role === r.id && { color: T.accent }]}>{r.sub}</Text>
             </TouchableOpacity>
           ))}
         </View>
 
-        {/* ── Network Type (host only) ── */}
+        {/* Network Type (host only) */}
         {role === 'host' && (
           <View style={s.networkRow}>
             {['WiFi', '4G LTE', '5G'].map(n => (
@@ -223,33 +239,77 @@ export default function HomeScreen() {
           </View>
         )}
 
-        {/* ── Main Card ── */}
+        {/* Failover Banner */}
+        {failoverMsg ? (
+          <View style={s.failoverBanner}>
+            <Text style={s.failoverText}>⚡ {failoverMsg}</Text>
+          </View>
+        ) : null}
+
+        {/* Main Card */}
         <View style={s.card}>
 
-          {/* Status indicator */}
+          {/* Status */}
           <View style={s.statusRow}>
             <Animated.View style={[
               s.statusDot,
               { backgroundColor: isConnected ? T.green : isConnecting ? T.accent : T.muted },
-              isConnected && { transform: [{ scale: pulseAnim }] }
-            ]} />
+              isConnected && { transform: [{ scale: pulseAnim }] },
+            ]}/>
             <Text style={[s.statusText, {
               color: isConnected ? T.green : isConnecting ? T.accent : T.muted
             }]}>
-              {isConnected ? 'CONNECTED' : isConnecting ? 'CONNECTING...' : 'OFFLINE'}
+              {isConnected ? 'CONNECTED' : isConnecting ? (validating ? 'VALIDATING...' : 'CONNECTING...') : 'OFFLINE'}
             </Text>
           </View>
 
-          {/* Session code display */}
-          {isConnected && sessionCode && (
-            <TouchableOpacity style={s.codeBox} onPress={copyCode}>
-              <Text style={s.codeLabel}>SESSION CODE</Text>
-              <Text style={s.codeText}>{sessionCode}</Text>
-              <Text style={s.codeTap}>Tap to copy</Text>
-            </TouchableOpacity>
+          {/* Host: session code + earnings */}
+          {isConnected && role === 'host' && sessionCode && (
+            <>
+              <View style={s.codeBox}>
+                <Text style={s.codeLabel}>YOUR SESSION CODE</Text>
+                <Text style={s.codeText}>{sessionCode}</Text>
+                <Text style={s.codeSub}>Clients connect automatically via access codes</Text>
+              </View>
+              <View style={s.earningsBox}>
+                <Text style={s.earningsLabel}>ESTIMATED THIS SESSION</Text>
+                <Text style={s.earningsValue}>
+                  ${estimateHostEarnings(connectionTime?.getTime?.() || Date.now())}
+                </Text>
+                <Text style={s.earningsSub}>Paid weekly by platform owner · 50% revenue share</Text>
+              </View>
+            </>
           )}
 
-          {/* Stats when connected */}
+          {/* Client: access code input */}
+          {role === 'client' && !isConnected && !isConnecting && (
+            <View style={s.accessCodeSection}>
+              <Text style={s.inputLabel}>ACCESS CODE</Text>
+              <Text style={s.inputHint}>Enter the code provided by the platform owner</Text>
+              <TextInput
+                style={s.accessInput}
+                value={accessCode}
+                onChangeText={setAccessCode}
+                placeholder="XXXX-XXXX"
+                placeholderTextColor={T.muted}
+                autoCapitalize="characters"
+                maxLength={9}
+              />
+            </View>
+          )}
+
+          {/* Client: connected info */}
+          {isConnected && role === 'client' && (
+            <View style={s.codeBox}>
+              <Text style={s.codeLabel}>NETWORK STATUS</Text>
+              <Text style={[s.codeText, { color: T.green, fontSize: 22, letterSpacing: 2 }]}>
+                SECURED ✓
+              </Text>
+              <Text style={s.codeSub}>Traffic routed through host network</Text>
+            </View>
+          )}
+
+          {/* Stats */}
           {isConnected && (
             <View style={s.statsRow}>
               <View style={s.stat}>
@@ -273,61 +333,56 @@ export default function HomeScreen() {
             </View>
           )}
 
-          {/* Client code input */}
-          {role === 'client' && !isConnected && !isConnecting && (
-            <View style={s.codeInput}>
-              <Text style={s.inputLabel}>ENTER HOST CODE</Text>
-              <View style={s.codeBoxes}>
-                {Array(6).fill(0).map((_, i) => (
-                  <View key={i} style={[s.codeCell, clientCode[i] && s.codeCellFilled]}>
-                    <Text style={s.codeCellText}>{clientCode[i] || '·'}</Text>
-                  </View>
-                ))}
-              </View>
-              {/* Number pad */}
-              <View style={s.numpad}>
-                {'123456789 0⌫'.split('').filter(c => c !== ' ').concat(['']).map((c, i) => (
-                  c !== '' ? (
-                    <TouchableOpacity key={i} style={s.numKey} onPress={() => {
-                      if (c === '⌫') setClientCode(prev => prev.slice(0, -1));
-                      else if (clientCode.length < 6) setClientCode(prev => prev + c);
-                    }}>
-                      <Text style={s.numKeyText}>{c}</Text>
-                    </TouchableOpacity>
-                  ) : <View key={i} style={s.numKey} />
-                ))}
-              </View>
-            </View>
-          )}
-
-          {/* Action button */}
+          {/* Action Button */}
           {!isConnected ? (
             <TouchableOpacity
-              style={[s.btn, isConnecting && s.btnDisabled]}
+              style={[s.btn, (isConnecting || validating) && s.btnDisabled]}
               onPress={role === 'host' ? handleStartHost : handleStartClient}
-              disabled={isConnecting || !role}>
+              disabled={isConnecting || validating || !role}>
               <LinearGradient
-                colors={isConnecting ? [T.muted, T.muted] : [T.accent, T.accent2]}
+                colors={(isConnecting || validating) ? [T.muted, T.muted] : [T.accent, T.accent2]}
                 start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}
                 style={s.btnGrad}>
                 <Text style={s.btnText}>
-                  {isConnecting ? 'CONNECTING...' : role === 'host' ? 'START SHARING' : 'JOIN NETWORK'}
+                  {validating ? 'VALIDATING...' :
+                    isConnecting ? 'CONNECTING...' :
+                    role === 'host' ? 'START HOSTING' : 'CONNECT'}
                 </Text>
               </LinearGradient>
             </TouchableOpacity>
           ) : (
             <TouchableOpacity style={s.btnStop} onPress={handleStop}>
-              <Text style={s.btnStopText}>STOP</Text>
+              <Text style={s.btnStopText}>DISCONNECT</Text>
             </TouchableOpacity>
           )}
 
-          {/* Error message */}
           {status === 'error' && errorMessage && (
             <Text style={s.error}>{errorMessage}</Text>
           )}
         </View>
 
-        {/* ── Event Log ── */}
+        {/* How it works (client, idle) */}
+        {role === 'client' && !isConnected && (
+          <View style={s.infoCard}>
+            <Text style={s.infoTitle}>HOW TO ACCESS</Text>
+            <Text style={s.infoLine}>1. Get an access code from the platform owner</Text>
+            <Text style={s.infoLine}>2. Enter it above and tap CONNECT</Text>
+            <Text style={s.infoLine}>3. Your internet is automatically routed</Text>
+            <Text style={s.infoLine}>4. If a host goes down, you switch automatically</Text>
+          </View>
+        )}
+
+        {role === 'host' && !isConnected && (
+          <View style={s.infoCard}>
+            <Text style={s.infoTitle}>HOST & EARN</Text>
+            <Text style={s.infoLine}>• Share your WiFi / mobile data connection</Text>
+            <Text style={s.infoLine}>• Earn 50% of platform revenue from your uptime</Text>
+            <Text style={s.infoLine}>• Paid weekly by the platform owner</Text>
+            <Text style={s.infoLine}>• Clients auto-failover if your connection drops</Text>
+          </View>
+        )}
+
+        {/* Event Log */}
         <View style={s.logCard}>
           <Text style={s.logTitle}>EVENT LOG</Text>
           {log.length === 0
@@ -347,27 +402,31 @@ const s = StyleSheet.create({
   content: { padding: 16, paddingBottom: 40 },
 
   header: { alignItems: 'center', marginBottom: 24, paddingTop: 8 },
-  title: { fontSize: 32, fontWeight: '900', color: T.accent, letterSpacing: 8 },
-  subtitle: { fontSize: 11, color: T.muted, letterSpacing: 4, marginTop: 2 },
+  title: { fontSize: 30, fontWeight: '900', color: T.accent, letterSpacing: 8 },
+  subtitle: { fontSize: 10, color: T.muted, letterSpacing: 3, marginTop: 2 },
   badge: { marginTop: 8, paddingHorizontal: 12, paddingVertical: 4,
     borderWidth: 1, borderColor: '#7B61FF44', borderRadius: 4 },
   badgeText: { fontSize: 10, color: T.accent2, letterSpacing: 2 },
 
   tabs: { flexDirection: 'row', marginBottom: 16, gap: 8 },
-  tab: { flex: 1, paddingVertical: 12, borderRadius: 8,
+  tab: { flex: 1, paddingVertical: 14, borderRadius: 8,
     backgroundColor: T.card, borderWidth: 1, borderColor: T.border,
     alignItems: 'center' },
-  tabActive: { backgroundColor: '#00D4FF22', borderColor: T.accent },
-  tabText: { fontSize: 12, color: T.muted, fontWeight: '700', letterSpacing: 1 },
+  tabActive: { backgroundColor: '#00D4FF16', borderColor: T.accent },
+  tabText: { fontSize: 14, color: T.muted, fontWeight: '900', letterSpacing: 2 },
   tabTextActive: { color: T.accent },
+  tabSub: { fontSize: 10, color: T.muted, marginTop: 2 },
 
   networkRow: { flexDirection: 'row', gap: 8, marginBottom: 16 },
   netBtn: { flex: 1, paddingVertical: 10, borderRadius: 8,
-    backgroundColor: T.card, borderWidth: 1, borderColor: T.border,
-    alignItems: 'center' },
-  netBtnActive: { backgroundColor: '#00FF8822', borderColor: T.green },
+    backgroundColor: T.card, borderWidth: 1, borderColor: T.border, alignItems: 'center' },
+  netBtnActive: { backgroundColor: '#00FF8816', borderColor: T.green },
   netBtnText: { fontSize: 11, color: T.muted, fontWeight: '700' },
   netBtnTextActive: { color: T.green },
+
+  failoverBanner: { backgroundColor: '#FFB40020', borderWidth: 1, borderColor: '#FFB40060',
+    borderRadius: 8, padding: 10, marginBottom: 12, alignItems: 'center' },
+  failoverText: { color: T.amber, fontSize: 13, fontWeight: '700' },
 
   card: { backgroundColor: T.card, borderRadius: 16, padding: 20,
     borderWidth: 1, borderColor: T.border, marginBottom: 16 },
@@ -376,40 +435,47 @@ const s = StyleSheet.create({
   statusDot: { width: 10, height: 10, borderRadius: 5, marginRight: 8 },
   statusText: { fontSize: 13, fontWeight: '800', letterSpacing: 3 },
 
-  codeBox: { backgroundColor: '#00D4FF11', borderRadius: 12,
+  codeBox: { backgroundColor: '#00D4FF0E', borderRadius: 12,
     borderWidth: 1, borderColor: '#00D4FF44', padding: 16,
     alignItems: 'center', marginBottom: 16 },
   codeLabel: { fontSize: 10, color: T.muted, letterSpacing: 3, marginBottom: 4 },
-  codeText: { fontSize: 36, fontWeight: '900', color: T.accent, letterSpacing: 8 },
-  codeTap: { fontSize: 10, color: T.muted, marginTop: 4 },
+  codeText: { fontSize: 32, fontWeight: '900', color: T.accent, letterSpacing: 6 },
+  codeSub: { fontSize: 10, color: T.muted, marginTop: 4, textAlign: 'center' },
+
+  earningsBox: { backgroundColor: '#00FF8810', borderRadius: 10,
+    borderWidth: 1, borderColor: '#00FF8840', padding: 14,
+    alignItems: 'center', marginBottom: 16 },
+  earningsLabel: { fontSize: 10, color: T.muted, letterSpacing: 2 },
+  earningsValue: { fontSize: 28, fontWeight: '900', color: T.green, marginVertical: 4 },
+  earningsSub: { fontSize: 10, color: T.muted, textAlign: 'center' },
+
+  accessCodeSection: { marginBottom: 20 },
+  inputLabel: { fontSize: 10, color: T.muted, letterSpacing: 3, marginBottom: 4 },
+  inputHint: { fontSize: 11, color: T.muted, marginBottom: 10 },
+  accessInput: { backgroundColor: '#1A2535', borderWidth: 1, borderColor: T.border,
+    borderRadius: 10, padding: 14, color: T.accent, fontSize: 22,
+    fontWeight: '900', letterSpacing: 6, textAlign: 'center' },
 
   statsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginBottom: 20 },
   stat: { flex: 1, minWidth: 70, alignItems: 'center' },
   statLabel: { fontSize: 9, color: T.muted, letterSpacing: 2, marginBottom: 2 },
   statValue: { fontSize: 15, fontWeight: '800', color: T.text },
 
-  codeInput: { marginBottom: 20 },
-  inputLabel: { fontSize: 10, color: T.muted, letterSpacing: 3, marginBottom: 12, textAlign: 'center' },
-  codeBoxes: { flexDirection: 'row', justifyContent: 'center', gap: 8, marginBottom: 16 },
-  codeCell: { width: 44, height: 52, borderRadius: 8, backgroundColor: '#1A2535',
-    borderWidth: 1, borderColor: T.border, alignItems: 'center', justifyContent: 'center' },
-  codeCellFilled: { borderColor: T.accent, backgroundColor: '#00D4FF11' },
-  codeCellText: { fontSize: 22, fontWeight: '900', color: T.text },
-  numpad: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, justifyContent: 'center' },
-  numKey: { width: 72, height: 48, borderRadius: 8, backgroundColor: '#1A2535',
-    alignItems: 'center', justifyContent: 'center' },
-  numKeyText: { fontSize: 20, fontWeight: '700', color: T.text },
-
   btn: { borderRadius: 12, overflow: 'hidden' },
   btnDisabled: { opacity: 0.5 },
   btnGrad: { paddingVertical: 16, alignItems: 'center' },
   btnText: { fontSize: 15, fontWeight: '900', color: '#000', letterSpacing: 2 },
 
-  btnStop: { backgroundColor: '#FF446622', borderWidth: 1, borderColor: T.red,
+  btnStop: { backgroundColor: '#FF446616', borderWidth: 1, borderColor: T.red,
     borderRadius: 12, paddingVertical: 16, alignItems: 'center' },
   btnStopText: { fontSize: 15, fontWeight: '900', color: T.red, letterSpacing: 2 },
 
   error: { color: T.red, fontSize: 12, textAlign: 'center', marginTop: 12 },
+
+  infoCard: { backgroundColor: T.card, borderRadius: 12, padding: 16,
+    borderWidth: 1, borderColor: T.border, marginBottom: 16 },
+  infoTitle: { fontSize: 10, color: T.muted, letterSpacing: 3, marginBottom: 12 },
+  infoLine: { fontSize: 12, color: T.muted, marginBottom: 6, lineHeight: 18 },
 
   logCard: { backgroundColor: T.card, borderRadius: 12, padding: 16,
     borderWidth: 1, borderColor: T.border },
