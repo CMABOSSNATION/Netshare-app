@@ -124,17 +124,6 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
     }
 
     /**
-     * Send a control message through the active WebSocket connection.
-     * Called from JS layer (VpnService.js) to send HOST_LEAVE, CLIENT_LEAVE, PONG etc.
-     */
-    @ReactMethod
-    public void sendControlMessage(String message) {
-        if (activeService != null) {
-            activeService.sendControlMessage(message);
-        }
-    }
-
-    /**
      * Emit event to React Native JS layer.
      * Called from NetShareVpnService via static reference.
      */
