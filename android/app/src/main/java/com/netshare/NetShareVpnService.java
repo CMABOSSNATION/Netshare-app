@@ -25,6 +25,8 @@ import java.nio.ByteBuffer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+import javax.net.SocketFactory;
+import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
 
 /**
@@ -160,15 +162,12 @@ public class NetShareVpnService extends VpnService {
             }
         };
 
-        // FIX: Use SSLSocketFactory to protect() each socket from routing through VPN itself.
-        // The old wsClient.setSocket(VpnService.protect(...)) was wrong:
-        //   - VpnService.protect() is NOT a static method
-        //   - WebSocketClient has no setSocket(Socket) method
-        // The correct approach is a custom SSLSocketFactory that calls self.protect() on every socket.
-        wsClient.setSocketFactory(new SSLSocketFactory() {
-            private final SSLSocketFactory delegate =
-                (SSLSocketFactory) SSLSocketFactory.getDefault();
-
+        // FIX: Use a plain SocketFactory that calls protect() on each socket.
+        // Do NOT set SSLSocketFactory directly — java_websocket handles TLS
+        // upgrade internally for wss:// URIs using its own SSLContext.
+        // Setting a custom SSLSocketFactory breaks the TLS handshake on Android,
+        // causing the relay to return HTTP 400 Bad Request.
+        wsClient.setSocketFactory(new SocketFactory() {
             @Override
             public Socket createSocket() throws IOException {
                 Socket s = new Socket();
@@ -178,7 +177,7 @@ public class NetShareVpnService extends VpnService {
 
             @Override
             public Socket createSocket(String host, int port) throws IOException {
-                Socket s = delegate.createSocket(host, port);
+                Socket s = new Socket(host, port);
                 self.protect(s);
                 return s;
             }
@@ -186,14 +185,14 @@ public class NetShareVpnService extends VpnService {
             @Override
             public Socket createSocket(String host, int port,
                                        InetAddress localAddr, int localPort) throws IOException {
-                Socket s = delegate.createSocket(host, port, localAddr, localPort);
+                Socket s = new Socket(host, port, localAddr, localPort);
                 self.protect(s);
                 return s;
             }
 
             @Override
             public Socket createSocket(InetAddress host, int port) throws IOException {
-                Socket s = delegate.createSocket(host, port);
+                Socket s = new Socket(host, port);
                 self.protect(s);
                 return s;
             }
@@ -201,29 +200,16 @@ public class NetShareVpnService extends VpnService {
             @Override
             public Socket createSocket(InetAddress address, int port,
                                        InetAddress localAddress, int localPort) throws IOException {
-                Socket s = delegate.createSocket(address, port, localAddress, localPort);
+                Socket s = new Socket(address, port, localAddress, localPort);
                 self.protect(s);
                 return s;
-            }
-
-            @Override
-            public Socket createSocket(Socket plain, String host,
-                                       int port, boolean autoClose) throws IOException {
-                Socket s = delegate.createSocket(plain, host, port, autoClose);
-                self.protect(s);
-                return s;
-            }
-
-            @Override
-            public String[] getDefaultCipherSuites() {
-                return delegate.getDefaultCipherSuites();
-            }
-
-            @Override
-            public String[] getSupportedCipherSuites() {
-                return delegate.getSupportedCipherSuites();
             }
         });
+
+        // Also set the SSL context so wss:// TLS works correctly on Android
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(null, null, null);
+        wsClient.setSSLSocketFactory(sslContext.getSocketFactory());
 
         wsClient.connectBlocking();
 
@@ -236,7 +222,6 @@ public class NetShareVpnService extends VpnService {
     private void startPacketReadLoop() {
         executor.execute(() -> {
             byte[] packet = new byte[32767];
-            // FIX: use try-with-resources to ensure FileInputStream is always closed
             try (FileInputStream in = new FileInputStream(vpnInterface.getFileDescriptor())) {
                 while (isRunning) {
                     int length = in.read(packet);
