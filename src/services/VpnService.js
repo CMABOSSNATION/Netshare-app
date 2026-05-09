@@ -139,10 +139,11 @@ class VpnService {
   // ── Stop ─────────────────────────────────────────────────────────────
   async stop() {
     clearTimeout(this.reconnectTimer);
+    const currentRole = this.role; // save before clearing
     this.role = null;
     this.currentCode = null;
     if (!VpnModule) return;
-    if (this.role === 'host') {
+    if (currentRole === 'host') {
       this._sendControl({ type: 'HOST_LEAVE' });
     } else {
       this._sendControl({ type: 'CLIENT_LEAVE' });
