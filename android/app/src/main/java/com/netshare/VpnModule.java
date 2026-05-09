@@ -75,7 +75,7 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
      * role: "host" or "client"
      */
     @ReactMethod
-    public void startVpn(String relayUrl, String sessionCode, String role, Promise promise) {
+    public void startVpn(String relayUrl, String sessionCode, String role, String hostId, String netType, Promise promise) {
         try {
             Activity activity = getCurrentActivity();
             if (activity == null) {
@@ -87,6 +87,8 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
             serviceIntent.putExtra("RELAY_URL", relayUrl);
             serviceIntent.putExtra("SESSION_CODE", sessionCode);
             serviceIntent.putExtra("ROLE", role);
+            serviceIntent.putExtra("HOST_ID", hostId != null ? hostId : "");
+            serviceIntent.putExtra("NET_TYPE", netType != null ? netType : "WiFi");
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 activity.startForegroundService(serviceIntent);

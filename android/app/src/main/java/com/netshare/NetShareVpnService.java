@@ -60,6 +60,8 @@ public class NetShareVpnService extends VpnService {
     private String relayUrl;
     private String sessionCode;
     private String role;
+    private String hostId;
+    private String netType;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -71,6 +73,9 @@ public class NetShareVpnService extends VpnService {
         relayUrl    = intent.getStringExtra("RELAY_URL");
         sessionCode = intent.getStringExtra("SESSION_CODE");
         role        = intent.getStringExtra("ROLE");
+        hostId      = intent.getStringExtra("HOST_ID");
+        netType     = intent.getStringExtra("NET_TYPE");
+        if (netType == null || netType.isEmpty()) netType = "WiFi";
 
         startForegroundNotification();
         executor = Executors.newFixedThreadPool(3);
@@ -123,9 +128,9 @@ public class NetShareVpnService extends VpnService {
             public void onOpen(ServerHandshake handshake) {
                 Log.i(TAG, "WebSocket connected to relay");
                 if ("host".equals(role)) {
-                    send("{\"type\":\"HOST_REGISTER\",\"netType\":\"WiFi\"}");
+                    send("{\"type\":\"HOST_REGISTER\",\"hostId\":\"" + hostId + "\",\"netType\":\"" + netType + "\"}");
                 } else {
-                    send("{\"type\":\"CLIENT_JOIN\",\"code\":\"" + sessionCode + "\"}");
+                    send("{\"type\":\"CLIENT_JOIN\",\"accessCode\":\"" + sessionCode + "\"}");
                 }
             }
 
