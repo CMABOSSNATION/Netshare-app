@@ -25,7 +25,6 @@ import java.nio.ByteBuffer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-import javax.net.SocketFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
 
@@ -162,22 +161,24 @@ public class NetShareVpnService extends VpnService {
             }
         };
 
-        // FIX: Use a plain SocketFactory that calls protect() on each socket.
-        // Do NOT set SSLSocketFactory directly — java_websocket handles TLS
-        // upgrade internally for wss:// URIs using its own SSLContext.
-        // Setting a custom SSLSocketFactory breaks the TLS handshake on Android,
-        // causing the relay to return HTTP 400 Bad Request.
-        wsClient.setSocketFactory(new SocketFactory() {
+        // Use an SSLSocketFactory that calls protect() on every socket it creates.
+        // This ensures the WebSocket connection bypasses the VPN tunnel (no loop)
+        // AND handles wss:// TLS correctly using Android's default TLS context.
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(null, null, null);
+        final SSLSocketFactory baseSSL = sslContext.getSocketFactory();
+
+        wsClient.setSocketFactory(new SSLSocketFactory() {
             @Override
             public Socket createSocket() throws IOException {
-                Socket s = new Socket();
+                Socket s = baseSSL.createSocket();
                 self.protect(s);
                 return s;
             }
 
             @Override
             public Socket createSocket(String host, int port) throws IOException {
-                Socket s = new Socket(host, port);
+                Socket s = baseSSL.createSocket(host, port);
                 self.protect(s);
                 return s;
             }
@@ -185,14 +186,14 @@ public class NetShareVpnService extends VpnService {
             @Override
             public Socket createSocket(String host, int port,
                                        InetAddress localAddr, int localPort) throws IOException {
-                Socket s = new Socket(host, port, localAddr, localPort);
+                Socket s = baseSSL.createSocket(host, port, localAddr, localPort);
                 self.protect(s);
                 return s;
             }
 
             @Override
             public Socket createSocket(InetAddress host, int port) throws IOException {
-                Socket s = new Socket(host, port);
+                Socket s = baseSSL.createSocket(host, port);
                 self.protect(s);
                 return s;
             }
@@ -200,16 +201,29 @@ public class NetShareVpnService extends VpnService {
             @Override
             public Socket createSocket(InetAddress address, int port,
                                        InetAddress localAddress, int localPort) throws IOException {
-                Socket s = new Socket(address, port, localAddress, localPort);
+                Socket s = baseSSL.createSocket(address, port, localAddress, localPort);
                 self.protect(s);
                 return s;
             }
-        });
 
-        // Also set the SSL context so wss:// TLS works correctly on Android
-        SSLContext sslContext = SSLContext.getInstance("TLS");
-        sslContext.init(null, null, null);
-        wsClient.setSSLSocketFactory(sslContext.getSocketFactory());
+            @Override
+            public Socket createSocket(Socket plain, String host,
+                                       int port, boolean autoClose) throws IOException {
+                Socket s = baseSSL.createSocket(plain, host, port, autoClose);
+                self.protect(s);
+                return s;
+            }
+
+            @Override
+            public String[] getDefaultCipherSuites() {
+                return baseSSL.getDefaultCipherSuites();
+            }
+
+            @Override
+            public String[] getSupportedCipherSuites() {
+                return baseSSL.getSupportedCipherSuites();
+            }
+        });
 
         wsClient.connectBlocking();
 
