@@ -79,6 +79,7 @@ public class NetShareVpnService extends VpnService {
 
         startForegroundNotification();
         executor = Executors.newFixedThreadPool(3);
+        VpnModule.activeService = this;
         executor.execute(this::startVpnTunnel);
 
         return START_STICKY;
@@ -281,6 +282,16 @@ public class NetShareVpnService extends VpnService {
         }
     }
 
+    /**
+     * Called from VpnModule.sendControlMessage (JS layer).
+     * Sends a JSON control message over the active WebSocket.
+     */
+    public void sendControlMessage(String message) {
+        if (wsClient != null && wsClient.isOpen()) {
+            wsClient.send(message);
+        }
+    }
+
     private void stopVpnTunnel() {
         isRunning = false;
 
@@ -338,6 +349,7 @@ public class NetShareVpnService extends VpnService {
 
     @Override
     public void onDestroy() {
+        VpnModule.activeService = null;
         stopVpnTunnel();
         super.onDestroy();
     }

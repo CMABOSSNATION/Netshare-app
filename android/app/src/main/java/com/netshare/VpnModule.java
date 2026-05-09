@@ -29,6 +29,9 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
     private Promise vpnPermissionPromise;
     private static ReactApplicationContext reactContext;
 
+    // Holds reference to running service so JS can send control messages
+    public static NetShareVpnService activeService = null;
+
     public VpnModule(ReactApplicationContext context) {
         super(context);
         reactContext = context;
@@ -120,6 +123,17 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
             promise.resolve(true);
         } catch (Exception e) {
             promise.reject("VPN_STOP_ERROR", e.getMessage());
+        }
+    }
+
+    /**
+     * Send a control message through the active WebSocket.
+     * Called from JS (VpnService.js) to send PONG, HOST_LEAVE, CLIENT_LEAVE etc.
+     */
+    @ReactMethod
+    public void sendControlMessage(String message) {
+        if (activeService != null) {
+            activeService.sendControlMessage(message);
         }
     }
 
