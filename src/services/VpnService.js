@@ -14,6 +14,12 @@
  * 5. on() unsub for local events did nothing (filtered wrong array). Fixed.
  * 6. startAsClient passed sessionCode (null) as the 6th arg to startVpn instead
  *    of the accessCode for the relay JOIN message. Fixed: pass accessCode for relay.
+ * 7. [NEW] startAsHost passed only 5 args to startVpn — RN bridge requires all
+ *    declared positional args before the auto-injected Promise. netType was the 5th
+ *    arg but the Java method declares (relayUrl, sessionCode, role, hostId, netType,
+ *    Promise) — so all 5 data args must be present. Was missing empty sessionCode
+ *    in the correct position — caused the bridge to mis-map args, resulting in the
+ *    Promise never resolving and the app hanging on CONNECTING forever.
  */
 
 import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
@@ -85,18 +91,23 @@ class VpnService {
   }
 
   // ── Start as HOST ────────────────────────────────────────────────────
+  // FIX 7: Java method signature is startVpn(relayUrl, sessionCode, role, hostId, netType, Promise).
+  // All 5 data args must be passed in correct order before the auto-injected Promise.
+  // Previously '' was missing for sessionCode, causing arg mis-mapping and the Promise
+  // to never resolve — app hung on CONNECTING indefinitely.
   async startAsHost(netType = 'WiFi') {
     const granted = await this.prepare();
     if (!granted) throw new Error('VPN permission denied by user');
     this.hostId = await this.getHostId();
     this.role = 'host';
+    // Args: relayUrl, sessionCode='', role='host', hostId, netType
     await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, netType);
   }
 
   // ── Start as CLIENT ──────────────────────────────────────────────────
-  // FIX 6: The 2nd arg to startVpn (sessionCode extra) is used by the Java
-  // CLIENT_JOIN message as the accessCode sent to relay. Pass accessCode here,
-  // not sessionCode (which is null at this point and caused join to fail).
+  // FIX 6 + 7: Pass accessCode as the sessionCode arg (2nd position) so the
+  // Java CLIENT_JOIN message sends the correct code to the relay. netType is
+  // empty for clients (they don't broadcast a network type).
   async startAsClient(accessCode) {
     if (!accessCode || accessCode.length < 8) {
       throw new Error('Invalid access code — must be 8 characters (format: XXXX-XXXX)');
@@ -110,7 +121,7 @@ class VpnService {
     this.role = 'client';
     this.accessCode = accessCode.toUpperCase();
     this.currentCode = null;
-    // Pass the accessCode as SESSION_CODE so the Java layer uses it in CLIENT_JOIN.
+    // Args: relayUrl, sessionCode=accessCode, role='client', hostId='', netType=''
     await VpnModule.startVpn(RELAY_URL, accessCode.toUpperCase(), 'client', '', '');
   }
 
