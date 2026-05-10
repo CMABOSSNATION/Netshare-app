@@ -1,276 +1,242 @@
 /**
  * HomeScreen.jsx — NetShare
  *
- * BUGS FIXED:
- * 1. vpnConnected for HOST set sessionCode to "host" in the store. Fixed: HOST
- *    waits for sessionCreated; vpnConnected only logs for both roles.
- * 2. role captured stale inside vpnConnected effect. Fixed with roleRef.
- * 3. addLog captured stale in listener closures. Fixed with useCallback for stability.
- * 4. handleStop had no try/catch — stopVpn rejection left UI stuck in CONNECTED.
- *    Fixed with try/finally always calling setIdle().
- * 5. handleStartHost/Client left status as 'connecting' on error — no retry possible.
- *    Fixed: setIdle() called after brief delay in catch block.
- * 6. connectionTimeRef had race between effect and interval. Fixed by reading
- *    connectionTime directly from useStore.getState() inside the interval callback.
- * 7. Bandwidth timer not cleared properly on unmount. Fixed with explicit cleanup.
- * 8. accessCode input allowed more than 9 chars but the 9th was always a dash
- *    at position 4 — auto-format the code as XXXX-XXXX while typing.
+ * FIXES APPLIED HERE:
+ * 1. Disconnect button — shown whenever status is 'connecting' or 'connected'.
+ *    Calls vpnService.stop() then store.setIdle() to fully reset state.
+ * 2. vpnError listener — catches native errors (including cold-start timeouts)
+ *    and surfaces them to the user with a Retry button instead of freezing.
+ * 3. vpnDisconnected listener — properly resets state when the host drops,
+ *    server closes the socket, or the user taps Stop in the notification.
+ * 4. sessionCreated / joinSuccess / vpnConnected listeners — drive the store
+ *    into 'connected' state so the UI updates correctly.
+ * 5. clientConnected / clientDisconnected listeners — update connected client count.
+ * 6. hostLeft listener — notifies client that the host ended the session.
+ * 7. All listeners are cleaned up on unmount — no memory leaks.
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet, Animated,
-  Alert, Platform, ScrollView, StatusBar, TextInput,
+  View,
+  Text,
+  TouchableOpacity,
+  TextInput,
+  StyleSheet,
+  ScrollView,
+  ActivityIndicator,
+  Alert,
+  Platform,
+  StatusBar,
+  SafeAreaView,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
-import LinearGradient from 'react-native-linear-gradient';
 import { useStore } from '../store';
-import VpnService from '../services/VpnService';
+import vpnService from '../services/VpnService';
 
-const formatBytes = (bytes) => {
-  if (bytes < 1024) return `${bytes.toFixed(0)} B`;
-  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1048576).toFixed(2)} MB`;
-};
+// ─── helpers ────────────────────────────────────────────────────────────────
 
-const formatDuration = (startMs) => {
-  if (!startMs) return '00:00';
-  const secs = Math.floor((Date.now() - startMs) / 1000);
-  const h = Math.floor(secs / 3600);
-  const m = String(Math.floor((secs % 3600) / 60)).padStart(2, '0');
-  const s = String(secs % 60).padStart(2, '0');
-  return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
-};
+function formatBytes(bytes) {
+  if (bytes < 1024)       return `${bytes} B`;
+  if (bytes < 1048576)    return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`;
+  return `${(bytes / 1073741824).toFixed(2)} GB`;
+}
 
-// FIX 8: format input as XXXX-XXXX while typing
-const formatAccessCode = (raw) => {
-  // Strip everything except alphanumeric
-  const clean = raw.replace(/[^A-Za-z0-9]/g, '').toUpperCase().slice(0, 8);
-  if (clean.length > 4) return clean.slice(0, 4) + '-' + clean.slice(4);
-  return clean;
-};
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m ${sec}s`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
 
-// Estimated host earnings — $0.50 per client-hour (50% of $1/hr per client)
-const estimateHostEarnings = (startMs, clientCount = 0) => {
-  if (!startMs || clientCount === 0) return '0.00';
-  const hrs = (Date.now() - startMs) / 3_600_000;
-  return (hrs * clientCount * 0.50).toFixed(2);
-};
-
-const T = {
-  bg:      '#0A0E1A',
-  card:    '#111827',
-  border:  '#1E2D40',
-  accent:  '#00D4FF',
-  accent2: '#7B61FF',
-  green:   '#00FF88',
-  red:     '#FF4466',
-  amber:   '#FFB400',
-  text:    '#E2E8F0',
-  muted:   '#4A5568',
-};
+// ─── Component ──────────────────────────────────────────────────────────────
 
 export default function HomeScreen() {
   const {
     role, status, sessionCode, connectedClients,
-    networkType, errorMessage, bytesUp, bytesDown,
-    connectionTime, setRole, setNetworkType,
-    setConnecting, setConnected, setError, setIdle,
-    addClient, removeClient, tickBandwidth,
+    errorMessage, bytesUp, bytesDown, networkType,
+    setRole, setNetworkType, setConnecting, setConnected,
+    setError, setIdle, addClient, removeClient,
+    getSessionDurationMs,
   } = useStore();
 
-  const [accessCode, setAccessCodeState] = useState('');
-  const [log, setLog]                    = useState([]);
-  const [duration, setDuration]          = useState('00:00');
-  const [failoverMsg, setFailoverMsg]    = useState('');
-  const [validating, setValidating]      = useState(false);
+  const [accessCodeInput, setAccessCodeInput] = useState('');
+  const [eventLog, setEventLog]               = useState([]);
+  const [sessionTimer, setSessionTimer]       = useState('0s');
+  const timerRef = useRef(null);
+  const bandwidthRef = useRef(null);
 
-  const pulseAnim      = useRef(new Animated.Value(1)).current;
-  const bandwidthTimer = useRef(null);
-  const durationTimer  = useRef(null);
-
-  // FIX 2: roleRef always reflects the current role without stale closure issues
-  const roleRef = useRef(role);
-  useEffect(() => { roleRef.current = role; }, [role]);
-
-  // FIX 3: stable addLog that doesn't change between renders
-  const addLog = useCallback((msg) => {
-    const time = new Date().toLocaleTimeString();
-    setLog(prev => [`[${time}] ${msg}`, ...prev].slice(0, 30));
+  // ── Event log helper ────────────────────────────────────────────────
+  const log = useCallback((msg) => {
+    const ts = new Date().toLocaleTimeString();
+    setEventLog(prev => [`[${ts}] ${msg}`, ...prev].slice(0, 50));
   }, []);
 
-  // FIX 8: handle access code input with auto-formatting
-  const handleAccessCodeChange = useCallback((text) => {
-    setAccessCodeState(formatAccessCode(text));
-  }, []);
+  // ── Disconnect (shared by host + client) ────────────────────────────
+  const handleDisconnect = useCallback(async () => {
+    log('Disconnecting...');
+    clearInterval(timerRef.current);
+    clearInterval(bandwidthRef.current);
+    await vpnService.stop();
+    setIdle();
+    log('Disconnected.');
+  }, [log, setIdle]);
 
-  // ── Pulse animation + bandwidth/duration timers ──────────────────────
+  // ── Native event listeners ──────────────────────────────────────────
   useEffect(() => {
-    if (status === 'connected') {
-      pulseAnim.stopAnimation();
-      Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulseAnim, { toValue: 1.15, duration: 800, useNativeDriver: true }),
-          Animated.timing(pulseAnim, { toValue: 1,    duration: 800, useNativeDriver: true }),
-        ])
-      ).start();
+    // vpnConnected — WS is open; for HOST we still wait for SESSION_CREATED
+    const unVpnConnected = vpnService.on('vpnConnected', (data) => {
+      log(`VPN connected (${data || 'ok'})`);
+      // CLIENT gets their session code via joinSuccess; HOST via sessionCreated.
+      // Don't call setConnected here for host — wait for SESSION_CREATED.
+      if (useStore.getState().role === 'client') {
+        // Will be confirmed by joinSuccess, but optimistically show connecting
+      }
+    });
 
-      bandwidthTimer.current = setInterval(tickBandwidth, 500);
+    // sessionCreated — relay assigned a code to HOST
+    const unSessionCreated = vpnService.on('sessionCreated', (code) => {
+      log(`Session created: ${code}`);
+      setConnected(code);
+      startTimers();
+    });
 
-      // FIX 6: read connectionTime directly from store state inside the interval
-      // so the closure is never stale.
-      durationTimer.current = setInterval(() => {
-        const ct = useStore.getState().connectionTime;
-        setDuration(formatDuration(ct ? ct.getTime() : null));
-      }, 1000);
-    } else {
-      pulseAnim.stopAnimation();
-      pulseAnim.setValue(1);
-      clearInterval(bandwidthTimer.current);
-      clearInterval(durationTimer.current);
-      setDuration('00:00');
-    }
-    // FIX 7: always clean up on unmount or status change
-    return () => {
-      clearInterval(bandwidthTimer.current);
-      clearInterval(durationTimer.current);
-    };
-  }, [status]);
+    // joinSuccess — relay confirmed CLIENT joined a session
+    const unJoinSuccess = vpnService.on('joinSuccess', (code) => {
+      log(`Joined session: ${code}`);
+      setConnected(code);
+      startTimers();
+    });
 
-  // ── VPN Events ───────────────────────────────────────────────────────
-  useEffect(() => {
-    const unsubs = [
+    // joinError — relay rejected the access code
+    const unJoinError = vpnService.on('joinError', (reason) => {
+      log(`Join error: ${reason}`);
+      setError(reason || 'Invalid access code');
+    });
 
-      VpnService.on('sessionCreated', (code) => {
-        // HOST: relay confirmed session is live with this code
-        addLog('✓ Session active — sharing is live');
-        setConnected(code || 'host-session');
-      }),
+    // vpnError — any native-layer error (timeout, socket failure, etc.)
+    const unVpnError = vpnService.on('vpnError', (msg) => {
+      log(`Error: ${msg}`);
+      clearInterval(timerRef.current);
+      clearInterval(bandwidthRef.current);
+      setError(msg || 'Connection failed');
+    });
 
-      // FIX 1+2: vpnConnected only logs; setConnected is triggered by
-      // sessionCreated (host) or joinSuccess (client). Using roleRef avoids stale closure.
-      VpnService.on('vpnConnected', (_payload) => {
-        addLog('VPN tunnel established');
-        // Do NOT call setConnected here for either role — wait for
-        // sessionCreated (host) or joinSuccess (client) which carry the real code.
-      }),
+    // vpnDisconnected — clean shutdown from native side or notification Stop tap
+    const unVpnDisconnected = vpnService.on('vpnDisconnected', (reason) => {
+      log(`Disconnected: ${reason}`);
+      clearInterval(timerRef.current);
+      clearInterval(bandwidthRef.current);
+      // Only reset if we were connected/connecting (not if user already tapped disconnect)
+      const s = useStore.getState().status;
+      if (s !== 'idle') setIdle();
+    });
 
-      VpnService.on('joinSuccess', (code) => {
-        // CLIENT: relay confirmed we are connected through a host
-        addLog('✓ Connected — traffic is routing through host');
-        setConnected(typeof code === 'string' && code.length > 0 ? code : 'connected');
-        setFailoverMsg('');
-      }),
+    // clientConnected — HOST sees a new client join
+    const unClientConnected = vpnService.on('clientConnected', (clientId) => {
+      log(`Client connected: ${clientId || 'unknown'}`);
+      addClient();
+    });
 
-      VpnService.on('joinError', (reason) => {
-        addLog(`✕ Join failed: ${reason}`);
-        setError(reason);
-        setTimeout(() => setIdle(), 3000);
-      }),
+    // clientDisconnected — HOST sees a client leave
+    const unClientDisconnected = vpnService.on('clientDisconnected', () => {
+      log('Client disconnected');
+      removeClient();
+    });
 
-      VpnService.on('clientConnected', (clientId) => {
-        addClient();
-        addLog(`Client connected${clientId ? ` (${clientId})` : ''}`);
-      }),
-
-      VpnService.on('clientDisconnected', (_payload) => {
-        removeClient();
-        addLog('Client disconnected');
-      }),
-
-      VpnService.on('hostLeft', () => {
-        addLog('Host ended the session');
-        setIdle();
-      }),
-
-      // hostFailover is a LOCAL JS event — fired by VpnService._handleFailover()
-      VpnService.on('hostFailover', (_newCode) => {
-        addLog('⟳ Auto-switched to a new host');
-        setFailoverMsg('Switched to a faster host ⚡');
-        setTimeout(() => setFailoverMsg(''), 4000);
-      }),
-
-      VpnService.on('vpnDisconnected', (reason) => {
-        addLog(`Disconnected: ${reason || 'connection closed'}`);
-        setIdle();
-      }),
-
-      VpnService.on('vpnError', (msg) => {
-        addLog(`Error: ${msg}`);
-        setError(msg);
-        setTimeout(() => setIdle(), 3000);
-      }),
-    ];
+    // hostLeft — CLIENT sees host end the session
+    const unHostLeft = vpnService.on('hostLeft', (msg) => {
+      log(`Host ended session: ${msg}`);
+      clearInterval(timerRef.current);
+      clearInterval(bandwidthRef.current);
+      Alert.alert('Session Ended', 'The host ended the sharing session.', [
+        { text: 'OK', onPress: () => setIdle() },
+      ]);
+    });
 
     return () => {
-      unsubs.forEach(unsub => { if (typeof unsub === 'function') unsub(); });
+      unVpnConnected();
+      unSessionCreated();
+      unJoinSuccess();
+      unJoinError();
+      unVpnError();
+      unVpnDisconnected();
+      unClientConnected();
+      unClientDisconnected();
+      unHostLeft();
+      clearInterval(timerRef.current);
+      clearInterval(bandwidthRef.current);
     };
-  }, [addLog, addClient, removeClient, setConnected, setError, setIdle]);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Start HOST ───────────────────────────────────────────────────────
+  // ── Session timer + bandwidth simulation ───────────────────────────
+  function startTimers() {
+    clearInterval(timerRef.current);
+    clearInterval(bandwidthRef.current);
+
+    timerRef.current = setInterval(() => {
+      setSessionTimer(formatDuration(useStore.getState().getSessionDurationMs()));
+    }, 1000);
+
+    bandwidthRef.current = setInterval(() => {
+      useStore.getState().tickBandwidth();
+    }, 1500);
+  }
+
+  // ── Start HOST ──────────────────────────────────────────────────────
   const handleStartHost = async () => {
     try {
+      setRole('host');
       setConnecting();
-      addLog('Starting host mode...');
-      await VpnService.startAsHost(networkType);
-      addLog('Connecting to relay...');
+      log(`Starting host on ${networkType}...`);
+      await vpnService.startAsHost(networkType);
     } catch (e) {
-      addLog(`✕ ${e.message}`);
+      log(`Host start failed: ${e.message}`);
       setError(e.message);
-      Alert.alert('Error', e.message);
-      // FIX 5: let user retry after a short delay
-      setTimeout(() => setIdle(), 2000);
     }
   };
 
-  // ── Start CLIENT ─────────────────────────────────────────────────────
+  // ── Start CLIENT ────────────────────────────────────────────────────
   const handleStartClient = async () => {
-    // Strip dash for length check
-    const code = accessCode.replace('-', '').trim();
-    if (code.length < 8) {
-      Alert.alert('Invalid Code', 'Enter the access code from the platform owner (format: XXXX-XXXX)');
+    const code = accessCodeInput.trim().toUpperCase();
+    if (!code || code.replace('-', '').length < 8) {
+      Alert.alert('Invalid Code', 'Please enter a valid 8-character access code (XXXX-XXXX).');
       return;
     }
     try {
-      setValidating(true);
-      addLog('Validating access code...');
+      setRole('client');
       setConnecting();
-      await VpnService.startAsClient(accessCode);
-      addLog('Connecting to best available host...');
+      log(`Joining session with code ${code}...`);
+      await vpnService.startAsClient(code);
     } catch (e) {
-      addLog(`✕ ${e.message}`);
+      log(`Client join failed: ${e.message}`);
       setError(e.message);
-      Alert.alert('Access Denied', e.message);
-      // FIX 5: reset so user can try again
-      setTimeout(() => setIdle(), 2000);
-    } finally {
-      setValidating(false);
     }
   };
 
-  // ── Stop ─────────────────────────────────────────────────────────────
-  // FIX 4: try/finally — setIdle() always runs even if stopVpn rejects.
-  const handleStop = async () => {
-    try {
-      await VpnService.stop();
-    } catch (e) {
-      console.warn('handleStop error:', e?.message);
-    } finally {
-      setIdle();
-      addLog('Stopped');
-    }
+  // ── Retry after error ───────────────────────────────────────────────
+  const handleRetry = async () => {
+    await vpnService.stop();
+    setIdle();
+    log('Ready to retry.');
   };
 
-  const isConnected  = status === 'connected';
-  const isConnecting = status === 'connecting';
-  const connectionTimeMs = connectionTime ? connectionTime.getTime() : null;
+  // ─── Render ──────────────────────────────────────────────────────────
+
+  const isIdle        = status === 'idle';
+  const isConnecting  = status === 'connecting';
+  const isConnected   = status === 'connected';
+  const isError       = status === 'error';
+  const isActive      = isConnecting || isConnected;
 
   return (
-    <SafeAreaView style={s.safe}>
-      <StatusBar barStyle="light-content" backgroundColor={T.bg}/>
-      <ScrollView style={s.scroll} contentContainerStyle={s.content}>
+    <SafeAreaView style={s.safeArea}>
+      <StatusBar barStyle="light-content" backgroundColor="#0a0e1a" />
+      <ScrollView contentContainerStyle={s.scroll} keyboardShouldPersistTaps="handled">
 
-        {/* Header */}
+        {/* ── Header ── */}
         <View style={s.header}>
           <Text style={s.title}>NETSHARE</Text>
           <Text style={s.subtitle}>PREMIUM NETWORK SHARING</Text>
@@ -279,276 +245,295 @@ export default function HomeScreen() {
           </View>
         </View>
 
-        {/* Role Tabs */}
+        {/* ── Role tabs ── */}
         <View style={s.tabs}>
-          {[
-            { id: 'host',   label: 'HOST',   sub: 'Share & Earn' },
-            { id: 'client', label: 'CLIENT', sub: 'Access Network' },
-          ].map(r => (
-            <TouchableOpacity
-              key={r.id}
-              style={[s.tab, role === r.id && s.tabActive]}
-              onPress={() => { if (!isConnected && !isConnecting) setRole(r.id); }}
-              disabled={isConnected || isConnecting}>
-              <Text style={[s.tabText, role === r.id && s.tabTextActive]}>{r.label}</Text>
-              <Text style={[s.tabSub,  role === r.id && { color: T.accent }]}>{r.sub}</Text>
-            </TouchableOpacity>
-          ))}
+          <TouchableOpacity
+            style={[s.tab, role !== 'client' && s.tabActive]}
+            onPress={() => { if (isIdle || isError) { setRole('host'); setIdle(); } }}
+            disabled={isActive}
+          >
+            <Text style={[s.tabTitle, role !== 'client' && s.tabTitleActive]}>HOST</Text>
+            <Text style={[s.tabSub,   role !== 'client' && s.tabSubActive]}>Share &amp; Earn</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[s.tab, role === 'client' && s.tabActive]}
+            onPress={() => { if (isIdle || isError) { setRole('client'); setIdle(); } }}
+            disabled={isActive}
+          >
+            <Text style={[s.tabTitle, role === 'client' && s.tabTitleActive]}>CLIENT</Text>
+            <Text style={[s.tabSub,   role === 'client' && s.tabSubActive]}>Access Network</Text>
+          </TouchableOpacity>
         </View>
 
-        {/* Network Type (host only) */}
-        {role === 'host' && (
-          <View style={s.networkRow}>
-            {['WiFi', '4G LTE', '5G'].map(n => (
+        {/* ── Network type selector (HOST only) ── */}
+        {role !== 'client' && (
+          <View style={s.netRow}>
+            {['WiFi', '4G LTE', '5G'].map((t) => (
               <TouchableOpacity
-                key={n}
-                style={[s.netBtn, networkType === n && s.netBtnActive]}
-                onPress={() => setNetworkType(n)}
-                disabled={isConnected}>
-                <Text style={[s.netBtnText, networkType === n && s.netBtnTextActive]}>{n}</Text>
+                key={t}
+                style={[s.netBtn, networkType === t && s.netBtnActive]}
+                onPress={() => { if (!isActive) setNetworkType(t); }}
+                disabled={isActive}
+              >
+                <Text style={[s.netBtnText, networkType === t && s.netBtnTextActive]}>{t}</Text>
               </TouchableOpacity>
             ))}
           </View>
         )}
 
-        {/* Failover Banner */}
-        {!!failoverMsg && (
-          <View style={s.failoverBanner}>
-            <Text style={s.failoverText}>⚡ {failoverMsg}</Text>
-          </View>
-        )}
-
-        {/* Main Card */}
+        {/* ── Status card ── */}
         <View style={s.card}>
-
-          {/* Status indicator */}
+          {/* Status row */}
           <View style={s.statusRow}>
-            <Animated.View style={[
-              s.statusDot,
-              { backgroundColor: isConnected ? T.green : isConnecting ? T.accent : T.muted },
-              isConnected && { transform: [{ scale: pulseAnim }] },
-            ]}/>
-            <Text style={[s.statusText, {
-              color: isConnected ? T.green : isConnecting ? T.accent : T.muted
-            }]}>
-              {isConnected
-                ? 'CONNECTED'
-                : isConnecting
-                  ? (validating ? 'VALIDATING...' : 'CONNECTING...')
-                  : 'OFFLINE'}
+            <View style={[
+              s.dot,
+              isConnected  && s.dotGreen,
+              isConnecting && s.dotYellow,
+              isError      && s.dotRed,
+              isIdle       && s.dotGrey,
+            ]} />
+            <Text style={s.statusText}>
+              {isIdle       ? 'IDLE'
+             : isConnecting ? 'CONNECTING...'
+             : isConnected  ? 'CONNECTED'
+             :                'ERROR'}
             </Text>
           </View>
 
-          {/* HOST connected: earnings */}
-          {isConnected && role === 'host' && (
-            <View style={s.earningsBox}>
-              <Text style={s.earningsLabel}>ESTIMATED THIS SESSION</Text>
-              <Text style={s.earningsValue}>
-                ${estimateHostEarnings(connectionTimeMs, connectedClients)}
-              </Text>
-              <Text style={s.earningsSub}>Based on active clients · Paid weekly · 50% revenue share</Text>
-            </View>
+          {/* Error message */}
+          {isError && (
+            <Text style={s.errorMsg}>{errorMessage}</Text>
           )}
 
-          {/* CLIENT idle: access code input */}
-          {role === 'client' && !isConnected && !isConnecting && (
-            <View style={s.accessCodeSection}>
-              <Text style={s.inputLabel}>ACCESS CODE</Text>
-              <Text style={s.inputHint}>Enter the code provided by the platform owner</Text>
-              <TextInput
-                style={s.accessInput}
-                value={accessCode}
-                onChangeText={handleAccessCodeChange}
-                placeholder="XXXX-XXXX"
-                placeholderTextColor={T.muted}
-                autoCapitalize="characters"
-                maxLength={9}
-              />
-            </View>
-          )}
-
-          {/* CLIENT connected: status box */}
-          {isConnected && role === 'client' && (
+          {/* Session code (host connected) */}
+          {isConnected && role !== 'client' && sessionCode && (
             <View style={s.codeBox}>
-              <Text style={s.codeLabel}>NETWORK STATUS</Text>
-              <Text style={[s.codeText, { color: T.green, fontSize: 22, letterSpacing: 2 }]}>
-                SECURED ✓
-              </Text>
-              <Text style={s.codeSub}>Traffic routed through host network</Text>
+              <Text style={s.codeLabel}>YOUR SESSION CODE</Text>
+              <Text style={s.codeValue}>{sessionCode}</Text>
+              <Text style={s.codeHint}>Share this code with clients</Text>
             </View>
           )}
 
-          {/* Stats (both roles when connected) */}
+          {/* Stats (connected) */}
           {isConnected && (
             <View style={s.statsRow}>
-              <View style={s.stat}>
-                <Text style={s.statLabel}>DURATION</Text>
-                <Text style={s.statValue}>{duration}</Text>
+              <View style={s.statItem}>
+                <Text style={s.statLabel}>⏱ Duration</Text>
+                <Text style={s.statValue}>{sessionTimer}</Text>
               </View>
-              {role === 'host' && (
-                <View style={s.stat}>
-                  <Text style={s.statLabel}>CLIENTS</Text>
+              <View style={s.statItem}>
+                <Text style={s.statLabel}>↑ Upload</Text>
+                <Text style={s.statValue}>{formatBytes(bytesUp)}</Text>
+              </View>
+              <View style={s.statItem}>
+                <Text style={s.statLabel}>↓ Download</Text>
+                <Text style={s.statValue}>{formatBytes(bytesDown)}</Text>
+              </View>
+              {role !== 'client' && (
+                <View style={s.statItem}>
+                  <Text style={s.statLabel}>👥 Clients</Text>
                   <Text style={s.statValue}>{connectedClients}</Text>
                 </View>
               )}
-              <View style={s.stat}>
-                <Text style={s.statLabel}>↑ UP</Text>
-                <Text style={s.statValue}>{formatBytes(bytesUp)}</Text>
-              </View>
-              <View style={s.stat}>
-                <Text style={s.statLabel}>↓ DOWN</Text>
-                <Text style={s.statValue}>{formatBytes(bytesDown)}</Text>
-              </View>
             </View>
           )}
 
-          {/* Action button */}
-          {!isConnected ? (
+          {/* Client: access code input */}
+          {role === 'client' && isIdle && (
+            <TextInput
+              style={s.input}
+              placeholder="Enter access code (XXXX-XXXX)"
+              placeholderTextColor="#4a5568"
+              value={accessCodeInput}
+              onChangeText={setAccessCodeInput}
+              autoCapitalize="characters"
+              maxLength={9}
+            />
+          )}
+
+          {/* ── Action buttons ── */}
+
+          {/* CONNECT button — only when idle */}
+          {isIdle && (
             <TouchableOpacity
-              style={[s.btn, (isConnecting || validating) && s.btnDisabled]}
-              onPress={role === 'host' ? handleStartHost : handleStartClient}
-              disabled={isConnecting || validating || !role}>
-              <LinearGradient
-                colors={(isConnecting || validating) ? [T.muted, T.muted] : [T.accent, T.accent2]}
-                start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }}
-                style={s.btnGrad}>
-                <Text style={s.btnText}>
-                  {validating    ? 'VALIDATING...'  :
-                   isConnecting  ? 'CONNECTING...'  :
-                   role === 'host' ? 'START HOSTING' : 'CONNECT'}
-                </Text>
-              </LinearGradient>
-            </TouchableOpacity>
-          ) : (
-            <TouchableOpacity style={s.btnStop} onPress={handleStop}>
-              <Text style={s.btnStopText}>DISCONNECT</Text>
+              style={s.btnConnect}
+              onPress={role === 'client' ? handleStartClient : handleStartHost}
+            >
+              <Text style={s.btnConnectText}>
+                {role === 'client' ? 'JOIN NETWORK' : 'START HOSTING'}
+              </Text>
             </TouchableOpacity>
           )}
 
-          {status === 'error' && !!errorMessage && (
-            <Text style={s.error}>{errorMessage}</Text>
+          {/* CONNECTING spinner + cancel */}
+          {isConnecting && (
+            <View style={s.connectingBox}>
+              <ActivityIndicator color="#00e5ff" size="large" />
+              <Text style={s.connectingLabel}>CONNECTING...</Text>
+              <TouchableOpacity style={s.btnDisconnect} onPress={handleDisconnect}>
+                <Text style={s.btnDisconnectText}>CANCEL</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {/* DISCONNECT button — when connected */}
+          {isConnected && (
+            <TouchableOpacity style={s.btnDisconnect} onPress={handleDisconnect}>
+              <Text style={s.btnDisconnectText}>
+                {role === 'client' ? 'DISCONNECT' : 'STOP HOSTING'}
+              </Text>
+            </TouchableOpacity>
+          )}
+
+          {/* RETRY button — on error */}
+          {isError && (
+            <TouchableOpacity style={s.btnRetry} onPress={handleRetry}>
+              <Text style={s.btnRetryText}>TRY AGAIN</Text>
+            </TouchableOpacity>
           )}
         </View>
 
-        {/* Info cards */}
-        {role === 'client' && !isConnected && (
+        {/* ── Host & Earn info (host idle) ── */}
+        {role !== 'client' && isIdle && (
           <View style={s.infoCard}>
-            <Text style={s.infoTitle}>HOW TO ACCESS</Text>
-            <Text style={s.infoLine}>1. Get an access code from the platform owner</Text>
-            <Text style={s.infoLine}>2. Enter it above and tap CONNECT</Text>
-            <Text style={s.infoLine}>3. Your internet is automatically routed</Text>
-            <Text style={s.infoLine}>4. If a host goes down, you switch automatically</Text>
+            <Text style={s.infoTitle}>HOST &amp; EARN</Text>
+            <Text style={s.infoItem}>• Share your WiFi / mobile data connection</Text>
+            <Text style={s.infoItem}>• Earn 50% of platform revenue from your uptime</Text>
+            <Text style={s.infoItem}>• Paid weekly by the platform owner</Text>
+            <Text style={s.infoItem}>• Clients auto-failover if your connection drops</Text>
           </View>
         )}
 
-        {role === 'host' && !isConnected && (
-          <View style={s.infoCard}>
-            <Text style={s.infoTitle}>HOST & EARN</Text>
-            <Text style={s.infoLine}>• Share your WiFi / mobile data connection</Text>
-            <Text style={s.infoLine}>• Earn 50% of platform revenue from your uptime</Text>
-            <Text style={s.infoLine}>• Paid weekly by the platform owner</Text>
-            <Text style={s.infoLine}>• Clients auto-failover if your connection drops</Text>
+        {/* ── Event log ── */}
+        {eventLog.length > 0 && (
+          <View style={s.logCard}>
+            <Text style={s.logTitle}>EVENT LOG</Text>
+            {eventLog.slice(0, 8).map((line, i) => (
+              <Text key={i} style={s.logLine}>{line}</Text>
+            ))}
           </View>
         )}
-
-        {/* Event Log */}
-        <View style={s.logCard}>
-          <Text style={s.logTitle}>EVENT LOG</Text>
-          {log.length === 0
-            ? <Text style={s.logEmpty}>Waiting for events...</Text>
-            : log.map((l, i) => <Text key={i} style={s.logLine}>{l}</Text>)
-          }
-        </View>
 
       </ScrollView>
     </SafeAreaView>
   );
 }
 
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
+const CYAN   = '#00e5ff';
+const GREEN  = '#00ff88';
+const RED    = '#ff4d6a';
+const YELLOW = '#ffd600';
+const BG     = '#0a0e1a';
+const CARD   = '#111827';
+const BORDER = '#1e2a3a';
+
 const s = StyleSheet.create({
-  safe:    { flex: 1, backgroundColor: T.bg },
-  scroll:  { flex: 1 },
-  content: { padding: 16, paddingBottom: 40 },
+  safeArea:  { flex: 1, backgroundColor: BG },
+  scroll:    { padding: 16, paddingBottom: 40 },
 
-  header:   { alignItems: 'center', marginBottom: 24, paddingTop: 8 },
-  title:    { fontSize: 30, fontWeight: '900', color: T.accent, letterSpacing: 8 },
-  subtitle: { fontSize: 10, color: T.muted, letterSpacing: 3, marginTop: 2 },
-  badge:    { marginTop: 8, paddingHorizontal: 12, paddingVertical: 4,
-    borderWidth: 1, borderColor: '#7B61FF44', borderRadius: 4 },
-  badgeText: { fontSize: 10, color: T.accent2, letterSpacing: 2 },
+  // Header
+  header:    { alignItems: 'center', marginBottom: 24, marginTop: 8 },
+  title:     { fontSize: 38, fontWeight: '900', color: CYAN, letterSpacing: 8 },
+  subtitle:  { color: '#4a6080', fontSize: 11, letterSpacing: 4, marginTop: 2 },
+  badge:     { borderWidth: 1, borderColor: '#2a3a5a', borderRadius: 4, paddingHorizontal: 12, paddingVertical: 4, marginTop: 10 },
+  badgeText: { color: '#6080a0', fontSize: 11, letterSpacing: 2 },
 
-  tabs:        { flexDirection: 'row', marginBottom: 16, gap: 8 },
-  tab:         { flex: 1, paddingVertical: 14, borderRadius: 8,
-    backgroundColor: T.card, borderWidth: 1, borderColor: T.border,
-    alignItems: 'center' },
-  tabActive:   { backgroundColor: '#00D4FF16', borderColor: T.accent },
-  tabText:     { fontSize: 14, color: T.muted, fontWeight: '900', letterSpacing: 2 },
-  tabTextActive: { color: T.accent },
-  tabSub:      { fontSize: 10, color: T.muted, marginTop: 2 },
+  // Role tabs
+  tabs:          { flexDirection: 'row', gap: 10, marginBottom: 12 },
+  tab:           { flex: 1, padding: 14, borderRadius: 10, borderWidth: 1, borderColor: BORDER, backgroundColor: CARD, alignItems: 'center' },
+  tabActive:     { borderColor: CYAN, backgroundColor: '#0d2030' },
+  tabTitle:      { color: '#4a6080', fontWeight: '700', fontSize: 15, letterSpacing: 2 },
+  tabTitleActive:{ color: CYAN },
+  tabSub:        { color: '#2a3a5a', fontSize: 11, marginTop: 2 },
+  tabSubActive:  { color: '#6090b0' },
 
-  networkRow:       { flexDirection: 'row', gap: 8, marginBottom: 16 },
-  netBtn:           { flex: 1, paddingVertical: 10, borderRadius: 8,
-    backgroundColor: T.card, borderWidth: 1, borderColor: T.border, alignItems: 'center' },
-  netBtnActive:     { backgroundColor: '#00FF8816', borderColor: T.green },
-  netBtnText:       { fontSize: 11, color: T.muted, fontWeight: '700' },
-  netBtnTextActive: { color: T.green },
+  // Network type
+  netRow:           { flexDirection: 'row', gap: 8, marginBottom: 14 },
+  netBtn:           { flex: 1, paddingVertical: 10, borderRadius: 8, borderWidth: 1, borderColor: BORDER, backgroundColor: CARD, alignItems: 'center' },
+  netBtnActive:     { borderColor: GREEN, backgroundColor: '#0d2318' },
+  netBtnText:       { color: '#4a6080', fontWeight: '600', fontSize: 13 },
+  netBtnTextActive: { color: GREEN },
 
-  failoverBanner: { backgroundColor: '#FFB40020', borderWidth: 1, borderColor: '#FFB40060',
-    borderRadius: 8, padding: 10, marginBottom: 12, alignItems: 'center' },
-  failoverText: { color: T.amber, fontSize: 13, fontWeight: '700' },
+  // Status card
+  card:       { backgroundColor: CARD, borderRadius: 12, borderWidth: 1, borderColor: BORDER, padding: 16, marginBottom: 14 },
+  statusRow:  { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
+  dot:        { width: 12, height: 12, borderRadius: 6, marginRight: 10 },
+  dotGreen:   { backgroundColor: GREEN },
+  dotYellow:  { backgroundColor: YELLOW },
+  dotRed:     { backgroundColor: RED },
+  dotGrey:    { backgroundColor: '#2a3a5a' },
+  statusText: { color: CYAN, fontWeight: '700', fontSize: 15, letterSpacing: 3 },
 
-  card: { backgroundColor: T.card, borderRadius: 16, padding: 20,
-    borderWidth: 1, borderColor: T.border, marginBottom: 16 },
+  errorMsg:   { color: RED, fontSize: 13, marginBottom: 12, lineHeight: 18 },
 
-  statusRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 20 },
-  statusDot: { width: 10, height: 10, borderRadius: 5, marginRight: 8 },
-  statusText: { fontSize: 13, fontWeight: '800', letterSpacing: 3 },
+  // Session code
+  codeBox:   { backgroundColor: '#0d1a2a', borderRadius: 8, padding: 14, alignItems: 'center', marginBottom: 14 },
+  codeLabel: { color: '#4a6080', fontSize: 10, letterSpacing: 3, marginBottom: 6 },
+  codeValue: { color: GREEN, fontSize: 28, fontWeight: '900', letterSpacing: 6 },
+  codeHint:  { color: '#2a4060', fontSize: 11, marginTop: 4 },
 
-  codeBox:   { backgroundColor: '#00D4FF0E', borderRadius: 12,
-    borderWidth: 1, borderColor: '#00D4FF44', padding: 16,
-    alignItems: 'center', marginBottom: 16 },
-  codeLabel: { fontSize: 10, color: T.muted, letterSpacing: 3, marginBottom: 4 },
-  codeText:  { fontSize: 32, fontWeight: '900', color: T.accent, letterSpacing: 6 },
-  codeSub:   { fontSize: 10, color: T.muted, marginTop: 4, textAlign: 'center' },
+  // Stats
+  statsRow:   { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
+  statItem:   { flex: 1, minWidth: '45%', backgroundColor: '#0d1a2a', borderRadius: 8, padding: 10 },
+  statLabel:  { color: '#4a6080', fontSize: 10, letterSpacing: 1, marginBottom: 3 },
+  statValue:  { color: '#c0d8f0', fontSize: 15, fontWeight: '700' },
 
-  earningsBox:   { backgroundColor: '#00FF8810', borderRadius: 10,
-    borderWidth: 1, borderColor: '#00FF8840', padding: 14,
-    alignItems: 'center', marginBottom: 16 },
-  earningsLabel: { fontSize: 10, color: T.muted, letterSpacing: 2 },
-  earningsValue: { fontSize: 28, fontWeight: '900', color: T.green, marginVertical: 4 },
-  earningsSub:   { fontSize: 10, color: T.muted, textAlign: 'center' },
+  // Input
+  input: {
+    backgroundColor: '#0d1a2a',
+    borderWidth: 1,
+    borderColor: BORDER,
+    borderRadius: 8,
+    color: '#c0d8f0',
+    fontSize: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 14,
+    letterSpacing: 2,
+    textAlign: 'center',
+  },
 
-  accessCodeSection: { marginBottom: 20 },
-  inputLabel:        { fontSize: 10, color: T.muted, letterSpacing: 3, marginBottom: 4 },
-  inputHint:         { fontSize: 11, color: T.muted, marginBottom: 10 },
-  accessInput:       { backgroundColor: '#1A2535', borderWidth: 1, borderColor: T.border,
-    borderRadius: 10, padding: 14, color: T.accent, fontSize: 22,
-    fontWeight: '900', letterSpacing: 6, textAlign: 'center' },
+  // Buttons
+  btnConnect: {
+    backgroundColor: CYAN,
+    borderRadius: 10,
+    paddingVertical: 16,
+    alignItems: 'center',
+  },
+  btnConnectText: { color: '#000', fontWeight: '900', fontSize: 15, letterSpacing: 3 },
 
-  statsRow:  { flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginBottom: 20 },
-  stat:      { flex: 1, minWidth: 70, alignItems: 'center' },
-  statLabel: { fontSize: 9, color: T.muted, letterSpacing: 2, marginBottom: 2 },
-  statValue: { fontSize: 15, fontWeight: '800', color: T.text },
+  connectingBox:    { alignItems: 'center', paddingVertical: 8, gap: 10 },
+  connectingLabel:  { color: YELLOW, fontWeight: '700', letterSpacing: 3, fontSize: 13 },
 
-  btn:        { borderRadius: 12, overflow: 'hidden' },
-  btnDisabled:{ opacity: 0.5 },
-  btnGrad:    { paddingVertical: 16, alignItems: 'center' },
-  btnText:    { fontSize: 15, fontWeight: '900', color: '#000', letterSpacing: 2 },
+  btnDisconnect: {
+    borderWidth: 1,
+    borderColor: RED,
+    borderRadius: 10,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  btnDisconnectText: { color: RED, fontWeight: '700', fontSize: 14, letterSpacing: 2 },
 
-  btnStop:     { backgroundColor: '#FF446616', borderWidth: 1, borderColor: T.red,
-    borderRadius: 12, paddingVertical: 16, alignItems: 'center' },
-  btnStopText: { fontSize: 15, fontWeight: '900', color: T.red, letterSpacing: 2 },
+  btnRetry: {
+    backgroundColor: YELLOW,
+    borderRadius: 10,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  btnRetryText: { color: '#000', fontWeight: '900', fontSize: 14, letterSpacing: 2 },
 
-  error: { color: T.red, fontSize: 12, textAlign: 'center', marginTop: 12 },
+  // Info card
+  infoCard:  { backgroundColor: CARD, borderRadius: 12, borderWidth: 1, borderColor: BORDER, padding: 16, marginBottom: 14 },
+  infoTitle: { color: '#4a6080', fontSize: 10, letterSpacing: 3, marginBottom: 10 },
+  infoItem:  { color: '#6080a0', fontSize: 13, lineHeight: 22 },
 
-  infoCard:  { backgroundColor: T.card, borderRadius: 12, padding: 16,
-    borderWidth: 1, borderColor: T.border, marginBottom: 16 },
-  infoTitle: { fontSize: 10, color: T.muted, letterSpacing: 3, marginBottom: 12 },
-  infoLine:  { fontSize: 12, color: T.muted, marginBottom: 6, lineHeight: 18 },
-
-  logCard:  { backgroundColor: T.card, borderRadius: 12, padding: 16,
-    borderWidth: 1, borderColor: T.border },
-  logTitle: { fontSize: 10, color: T.muted, letterSpacing: 3, marginBottom: 10 },
-  logEmpty: { fontSize: 12, color: T.muted, fontStyle: 'italic' },
-  logLine:  { fontSize: 11, color: '#64748B', marginBottom: 3, fontFamily: 'monospace' },
+  // Log card
+  logCard:   { backgroundColor: CARD, borderRadius: 12, borderWidth: 1, borderColor: BORDER, padding: 14 },
+  logTitle:  { color: '#4a6080', fontSize: 10, letterSpacing: 3, marginBottom: 8 },
+  logLine:   { color: '#2a4060', fontSize: 11, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', lineHeight: 17 },
 });
