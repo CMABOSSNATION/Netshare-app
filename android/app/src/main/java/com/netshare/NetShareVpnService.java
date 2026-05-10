@@ -190,42 +190,24 @@ public class NetShareVpnService extends VpnService {
                 return;
             }
 
-            // CLIENT: build TUN interface
-            // MTU 1400: WS+TLS framing adds overhead; 1500 causes fragmentation
-            // that drops UDP datagrams (TikTok video, WhatsApp media). 1400 is safe.
+            // CLIENT: build a PLACEHOLDER TUN interface before connecting to relay.
+            // We use a minimal route (only 10.8.0.0/24, no default route) so that
+            // the WS relay connection itself is NOT routed through the VPN tunnel.
+            // Full routing (0.0.0.0/0, ::/0) is set up in JOIN_SUCCESS after the
+            // server assigns our tunIp. This prevents a routing loop where the WS
+            // connection tries to go through the VPN that hasn't opened yet.
             Builder builder = new Builder();
             builder.setSession("NetShare")
-                   // assignedTunIp is set to "10.8.0.2" as default; updated to the
-                   // server-assigned address once JOIN_SUCCESS arrives (see handleRelayMessage).
-                   // We build the TUN here with the default then rebuild if needed after JOIN_SUCCESS.
-                   .addAddress(assignedTunIp, 24)
-                   // Route ALL IPv4 traffic through the tunnel — every app, every service.
-                   .addRoute("0.0.0.0", 0)
-                   // Route ALL IPv6 traffic so apps using IPv6 (most modern apps) are
-                   // also tunnelled. Without this, IPv6 traffic bypasses the VPN entirely.
-                   // WhatsApp and TikTok both use IPv6 on modern Android.
-                   .addRoute("::", 0)
-                   // Primary DNS servers via the tunnel — prevents DNS leaks outside VPN.
-                   // WhatsApp uses its own DNS over HTTPS; routing 8.8.8.8 + 1.1.1.1
-                   // ensures those DoH connections also go through the tunnel.
+                   .addAddress("10.8.0.2", 24)   // placeholder — overwritten in JOIN_SUCCESS
+                   // Only route the VPN subnet for now — no default route yet.
+                   // The WS relay traffic uses the real network interface (protected socket).
+                   .addRoute("10.8.0.0", 24)
                    .addDnsServer("8.8.8.8")
-                   .addDnsServer("8.8.4.4")
                    .addDnsServer("1.1.1.1")
-                   // IPv6 DNS via tunnel
-                   .addDnsServer("2001:4860:4860::8888")
-                   .addDnsServer("2606:4700:4700::1111")
                    .setMtu(TUN_MTU);
 
-            // BYPASS PREVENTION: On Android 10+ (API 29), apps can opt out of VPNs
-            // via vpnService.setAlwaysOn() exemptions. We cannot fully prevent this from
-            // inside the service, but we ensure our routes are as broad as possible so
-            // there is no non-VPN path for apps to discover by default routing.
-            // The host app should also set android:usesCleartextTraffic="false" in manifest
-            // and set VPN lockdown mode via DevicePolicyManager if available.
-
             try {
-                // Exclude only this app from the tunnel so the WS relay connection
-                // is not routed through itself (avoids a routing loop).
+                // Exclude this app so the WS relay connection is not routed through the TUN.
                 builder.addDisallowedApplication(getPackageName());
             } catch (Exception e) {
                 Log.w(TAG, "addDisallowedApplication: " + e.getMessage());
@@ -239,7 +221,9 @@ public class NetShareVpnService extends VpnService {
 
             tunOut    = new FileOutputStream(vpnInterface.getFileDescriptor());
             isRunning = true;
-            Log.i(TAG, "CLIENT TUN established");
+            Log.i(TAG, "CLIENT TUN placeholder established — connecting to relay for JOIN_SUCCESS");
+            // Connect to relay. Full TUN (with 0.0.0.0/0 route) is set up in
+            // JOIN_SUCCESS after the server assigns our tunIp.
             connectToRelay();
 
         } catch (Exception e) {
@@ -265,10 +249,16 @@ public class NetShareVpnService extends VpnService {
                     VpnModule.emitEvent("vpnConnected", "host");
                     send(j3("type", "HOST_REGISTER", "hostId", hostId, "netType", netType));
                 } else {
-                    // CLIENT TUN already up; WS is now ready
+                    // CLIENT TUN already up; WS is now ready.
+                    // CRITICAL FIX: Do NOT start the packet read loop here.
+                    // We must wait for JOIN_SUCCESS (which assigns our tunIp).
+                    // Sending packets before the server knows our tunIp means
+                    // reply packets can never be routed back — this was why
+                    // WhatsApp (and all apps) never received any responses.
+                    // startPacketReadLoop() is called in JOIN_SUCCESS handler
+                    // after the TUN is rebuilt with the correct assigned IP.
                     VpnModule.emitEvent("vpnConnected", sessionCode);
                     send(j2("type", "CLIENT_JOIN", "accessCode", sessionCode));
-                    startPacketReadLoop();
                 }
             }
 
@@ -401,41 +391,51 @@ public class NetShareVpnService extends VpnService {
                     break;
                 case "JOIN_SUCCESS": {
                     String assignedIp = jsonGet(msg, "tunIp");
-                    if (assignedIp != null && !assignedIp.isEmpty()
-                            && !assignedIp.equals(assignedTunIp)) {
-                        // Server assigned a unique TUN IP for this client.
-                        // Rebuild the TUN interface with the correct address so the
-                        // server can route reply packets back to exactly this client.
-                        assignedTunIp = assignedIp;
-                        Log.i(TAG, "JOIN_SUCCESS: assigned TUN IP " + assignedTunIp + " — rebuilding TUN");
-                        try {
-                            // Close old interface
-                            if (tunOut != null) { try { tunOut.close(); } catch (Exception ignored) {} tunOut = null; }
-                            if (vpnInterface != null) { try { vpnInterface.close(); } catch (Exception ignored) {} vpnInterface = null; }
 
-                            Builder b2 = new Builder();
-                            b2.setSession("NetShare")
-                              .addAddress(assignedTunIp, 24)
-                              .addRoute("0.0.0.0", 0)
-                              .addRoute("::", 0)
-                              .addDnsServer("8.8.8.8")
-                              .addDnsServer("8.8.4.4")
-                              .addDnsServer("1.1.1.1")
-                              .addDnsServer("2001:4860:4860::8888")
-                              .addDnsServer("2606:4700:4700::1111")
-                              .setMtu(TUN_MTU);
-                            try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
-                            vpnInterface = b2.establish();
-                            if (vpnInterface != null) {
-                                tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
-                                // Restart packet read loop with new interface
-                                startPacketReadLoop();
-                            } else {
-                                Log.e(TAG, "JOIN_SUCCESS: failed to rebuild TUN");
-                            }
-                        } catch (Exception e) {
-                            Log.e(TAG, "JOIN_SUCCESS TUN rebuild: " + e.getMessage());
+                    // ALWAYS rebuild TUN on JOIN_SUCCESS — even if the assigned IP
+                    // matches our default. The packet read loop must only start here,
+                    // after the server has registered our tunIp. Starting it earlier
+                    // (in onOpen) meant packets were sent before the server could
+                    // route replies back — the root cause of WhatsApp never working.
+                    if (assignedIp != null && !assignedIp.isEmpty()) {
+                        assignedTunIp = assignedIp;
+                    }
+                    Log.i(TAG, "JOIN_SUCCESS: tunIp=" + assignedTunIp + " — rebuilding TUN and starting read loop");
+                    try {
+                        // Close old interface before rebuilding
+                        if (tunOut != null) { try { tunOut.close(); } catch (Exception ignored) {} tunOut = null; }
+                        if (vpnInterface != null) { try { vpnInterface.close(); } catch (Exception ignored) {} vpnInterface = null; }
+
+                        Builder b2 = new Builder();
+                        b2.setSession("NetShare")
+                          .addAddress(assignedTunIp, 24)
+                          .addRoute("0.0.0.0", 0)
+                          .addRoute("::", 0)
+                          // DNS via tunnel — prevents WhatsApp DNS leaks outside VPN.
+                          // WhatsApp validates connectivity with its own DNS lookups;
+                          // if DNS bypasses the VPN, WhatsApp detects a broken network.
+                          .addDnsServer("8.8.8.8")
+                          .addDnsServer("8.8.4.4")
+                          .addDnsServer("1.1.1.1")
+                          .addDnsServer("2001:4860:4860::8888")
+                          .addDnsServer("2606:4700:4700::1111")
+                          .setMtu(TUN_MTU);
+                        try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
+                        vpnInterface = b2.establish();
+                        if (vpnInterface != null) {
+                            tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
+                            // START READ LOOP HERE — server now knows our tunIp,
+                            // so it can route reply packets back to this client.
+                            startPacketReadLoop();
+                        } else {
+                            Log.e(TAG, "JOIN_SUCCESS: failed to rebuild TUN — VPN interface null");
+                            VpnModule.emitEvent("vpnError", "Failed to establish VPN tunnel");
+                            return;
                         }
+                    } catch (Exception e) {
+                        Log.e(TAG, "JOIN_SUCCESS TUN rebuild: " + e.getMessage());
+                        VpnModule.emitEvent("vpnError", "VPN tunnel error: " + e.getMessage());
+                        return;
                     }
                     VpnModule.emitEvent("joinSuccess", orEmpty(jsonGet(msg, "code")));
                     break;
@@ -693,10 +693,24 @@ public class NetShareVpnService extends VpnService {
             // 64 KB read buffer — HTTP/2 (used by WhatsApp, TikTok API) sends large frames
             byte[]      buf = new byte[65535 - IP4_HEADER_LEN - TCP_HEADER_LEN];
             int len;
-            while (isRunning && !sock.isClosed() && (len = in.read(buf)) > 0) {
+            // len == -1 means clean EOF (server closed connection gracefully).
+            // len == 0 should never happen with blocking sockets but guard anyway.
+            // SocketTimeoutException is caught below and is non-fatal — it just
+            // means the socket was idle for setSoTimeout() ms (5 min). WhatsApp
+            // XMPP connections can be idle for minutes between messages; a timeout
+            // does not mean the connection is dead, so we log and continue.
+            while (isRunning && !sock.isClosed()) {
+                try {
+                    len = in.read(buf);
+                } catch (java.net.SocketTimeoutException ste) {
+                    // Idle timeout — connection is still valid. WhatsApp long-lived
+                    // connections (XMPP port 5222, push port 5228) sit idle often.
+                    Log.d(TAG, "TCP idle timeout [" + key + "] — keeping alive");
+                    continue;
+                }
+                if (len <= 0) break; // EOF
                 if (wsClient != null && wsClient.isOpen()) {
                     bytesOut.addAndGet(len);
-                    // FIX 6: build a proper IPv4+TCP packet so client TUN kernel accepts it
                     ByteBuffer pkt = buildIpTcpPacket(
                             remoteIpBytes, clientIpBytes,
                             remoteDstPort, clientSrcPort,
