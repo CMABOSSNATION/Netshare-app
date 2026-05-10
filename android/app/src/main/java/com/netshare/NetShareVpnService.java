@@ -22,6 +22,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.net.URI;
@@ -110,6 +111,8 @@ public class NetShareVpnService extends VpnService {
     private String role;
     private String hostId;
     private String netType;
+    // Assigned TUN IP received from server in JOIN_SUCCESS (e.g. "10.8.0.3")
+    private volatile String assignedTunIp = "10.8.0.2";
 
     private final Map<String, Socket>         tcpConnections = new ConcurrentHashMap<>();
     private final Map<String, DatagramSocket> udpSockets     = new ConcurrentHashMap<>();
@@ -171,14 +174,27 @@ public class NetShareVpnService extends VpnService {
             // that drops UDP datagrams (TikTok video, WhatsApp media). 1400 is safe.
             Builder builder = new Builder();
             builder.setSession("NetShare")
-                   .addAddress("10.8.0.2", 24)
+                   // assignedTunIp is set to "10.8.0.2" as default; updated to the
+                   // server-assigned address once JOIN_SUCCESS arrives (see handleRelayMessage).
+                   // We build the TUN here with the default then rebuild if needed after JOIN_SUCCESS.
+                   .addAddress(assignedTunIp, 24)
+                   // Route ALL IPv4 traffic through the tunnel — every app, every service.
                    .addRoute("0.0.0.0", 0)
+                   // Route ALL IPv6 traffic so apps using IPv6 (most modern apps) are
+                   // also tunnelled. Without this, IPv6 traffic bypasses the VPN entirely.
+                   .addRoute("::", 0)
+                   // Primary DNS servers via the tunnel — prevents DNS leaks outside VPN.
                    .addDnsServer("8.8.8.8")
                    .addDnsServer("8.8.4.4")
                    .addDnsServer("1.1.1.1")
+                   // IPv6 DNS via tunnel
+                   .addDnsServer("2001:4860:4860::8888")
+                   .addDnsServer("2606:4700:4700::1111")
                    .setMtu(1400);
 
             try {
+                // Exclude only this app from the tunnel so the WS relay connection
+                // is not routed through itself (avoids a routing loop).
                 builder.addDisallowedApplication(getPackageName());
             } catch (Exception e) {
                 Log.w(TAG, "addDisallowedApplication: " + e.getMessage());
@@ -343,9 +359,47 @@ public class NetShareVpnService extends VpnService {
                 case "SESSION_CREATED":
                     VpnModule.emitEvent("sessionCreated", orEmpty(jsonGet(msg, "code")));
                     break;
-                case "JOIN_SUCCESS":
+                case "JOIN_SUCCESS": {
+                    String assignedIp = jsonGet(msg, "tunIp");
+                    if (assignedIp != null && !assignedIp.isEmpty()
+                            && !assignedIp.equals(assignedTunIp)) {
+                        // Server assigned a unique TUN IP for this client.
+                        // Rebuild the TUN interface with the correct address so the
+                        // server can route reply packets back to exactly this client.
+                        assignedTunIp = assignedIp;
+                        Log.i(TAG, "JOIN_SUCCESS: assigned TUN IP " + assignedTunIp + " — rebuilding TUN");
+                        try {
+                            // Close old interface
+                            if (tunOut != null) { try { tunOut.close(); } catch (Exception ignored) {} tunOut = null; }
+                            if (vpnInterface != null) { try { vpnInterface.close(); } catch (Exception ignored) {} vpnInterface = null; }
+
+                            Builder b2 = new Builder();
+                            b2.setSession("NetShare")
+                              .addAddress(assignedTunIp, 24)
+                              .addRoute("0.0.0.0", 0)
+                              .addRoute("::", 0)
+                              .addDnsServer("8.8.8.8")
+                              .addDnsServer("8.8.4.4")
+                              .addDnsServer("1.1.1.1")
+                              .addDnsServer("2001:4860:4860::8888")
+                              .addDnsServer("2606:4700:4700::1111")
+                              .setMtu(1400);
+                            try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
+                            vpnInterface = b2.establish();
+                            if (vpnInterface != null) {
+                                tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
+                                // Restart packet read loop with new interface
+                                startPacketReadLoop();
+                            } else {
+                                Log.e(TAG, "JOIN_SUCCESS: failed to rebuild TUN");
+                            }
+                        } catch (Exception e) {
+                            Log.e(TAG, "JOIN_SUCCESS TUN rebuild: " + e.getMessage());
+                        }
+                    }
                     VpnModule.emitEvent("joinSuccess", orEmpty(jsonGet(msg, "code")));
                     break;
+                }
                 case "JOIN_ERROR":
                     VpnModule.emitEvent("joinError", orEmpty(jsonGet(msg, "reason")));
                     break;
@@ -380,6 +434,89 @@ public class NetShareVpnService extends VpnService {
         if (pkt.length < 20) return;
         try {
             int version = (pkt[0] >> 4) & 0xF;
+
+            // ── IPv6 ──────────────────────────────────────────────────────
+            // IPv6 header is fixed 40 bytes. Forward TCP/UDP the same way as IPv4.
+            if (version == 6) {
+                if (pkt.length < 40) return;
+                int proto6  = pkt[6] & 0xFF;  // Next Header
+                int pOff6   = 40;
+                // Extract src/dst addresses (bytes 8-23 = src, 24-39 = dst)
+                byte[] src6 = new byte[16]; System.arraycopy(pkt, 8,  src6, 0, 16);
+                byte[] dst6 = new byte[16]; System.arraycopy(pkt, 24, dst6, 0, 16);
+                InetAddress dst6Addr = InetAddress.getByAddress(dst6);
+                String src6Ip = InetAddress.getByAddress(src6).getHostAddress();
+
+                if (proto6 == 6 && pkt.length >= pOff6 + 14) {    // TCP over IPv6
+                    int srcPort = u16(pkt, pOff6);
+                    int dstPort = u16(pkt, pOff6 + 2);
+                    int flags   = pkt[pOff6 + 13] & 0xFF;
+                    boolean isSyn = (flags & 0x02) != 0;
+                    boolean isFin = (flags & 0x01) != 0;
+                    boolean isRst = (flags & 0x04) != 0;
+                    int tOff = ((pkt[pOff6 + 12] >> 4) & 0xF) * 4;
+                    if (tOff < 20) tOff = 20;
+                    int pOff = pOff6 + tOff;
+                    int pLen = pkt.length - pOff;
+                    String key = src6Ip + ":" + srcPort + "-" + dst6Addr.getHostAddress() + ":" + dstPort;
+                    if (isRst) {
+                        Socket s = tcpConnections.remove(key);
+                        if (s != null) try { s.close(); } catch (Exception ignored) {}
+                        return;
+                    }
+                    if (isSyn || !tcpConnections.containsKey(key)) {
+                        Socket old = tcpConnections.remove(key);
+                        if (old != null) try { old.close(); } catch (Exception ignored) {}
+                        Socket sock = new Socket();
+                        protect(sock);
+                        try {
+                            sock.connect(new java.net.InetSocketAddress(dst6Addr, dstPort), 10_000);
+                            sock.setSoTimeout(300_000);
+                            sock.setTcpNoDelay(true);
+                        } catch (Exception e) {
+                            Log.w(TAG, "IPv6 TCP connect [" + key + "]: " + e.getMessage());
+                            try { sock.close(); } catch (Exception ignored) {}
+                            return;
+                        }
+                        tcpConnections.put(key, sock);
+                        final byte[] fSrc6 = src6;
+                        final int fSrcPort = srcPort; final int fDstPort = dstPort;
+                        final InetAddress fDst = dst6Addr; final String fk = key;
+                        executor.execute(() -> readTcpResponses(sock, fk, fSrc6, fSrcPort, fDstPort, fDst));
+                    }
+                    if (pLen > 0) {
+                        Socket sock = tcpConnections.get(key);
+                        if (sock != null && !sock.isClosed()) {
+                            try { OutputStream out = sock.getOutputStream(); out.write(pkt, pOff, pLen); out.flush(); }
+                            catch (Exception e) { tcpConnections.remove(key); try { sock.close(); } catch (Exception ignored) {} }
+                        }
+                    }
+                    if (isFin) { Socket s = tcpConnections.remove(key); if (s != null) try { s.close(); } catch (Exception ignored) {} }
+
+                } else if (proto6 == 17 && pkt.length >= pOff6 + 8) {  // UDP over IPv6
+                    int srcPort = u16(pkt, pOff6);
+                    int dstPort = u16(pkt, pOff6 + 2);
+                    int pOff = pOff6 + 8;
+                    int pLen = pkt.length - pOff;
+                    if (pLen <= 0) return;
+                    String key = src6Ip + ":" + srcPort + "-" + dst6Addr.getHostAddress() + ":" + dstPort;
+                    if (!udpSockets.containsKey(key)) {
+                        DatagramSocket udpSock = new DatagramSocket();
+                        protect(udpSock);
+                        udpSockets.put(key, udpSock);
+                        final byte[] fSrc6 = src6;
+                        final int fSrcPort = srcPort; final int fDstPort = dstPort; final String fk = key;
+                        executor.execute(() -> readUdpResponses(udpSock, fk, fSrc6, fSrcPort, fDstPort));
+                    }
+                    DatagramSocket udpSock = udpSockets.get(key);
+                    if (udpSock != null && !udpSock.isClosed()) {
+                        udpSock.send(new DatagramPacket(pkt, pOff, pLen, dst6Addr, dstPort));
+                    }
+                }
+                return;
+            }
+
+            // ── IPv4 ──────────────────────────────────────────────────────
             if (version != 4) return;
 
             int proto = pkt[9] & 0xFF;
@@ -658,6 +795,10 @@ public class NetShareVpnService extends VpnService {
 
     private static int u16(byte[] b, int off) {
         return ((b[off] & 0xFF) << 8) | (b[off+1] & 0xFF);
+    }
+    private byte[] tunIpBytes() {
+        try { return InetAddress.getByName(assignedTunIp).getAddress(); }
+        catch (Exception e) { return new byte[]{10,8,0,2}; }
     }
     private static byte[] ipBytes(String ip) {
         try { return InetAddress.getByName(ip).getAddress(); }
