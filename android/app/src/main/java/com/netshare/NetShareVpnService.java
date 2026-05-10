@@ -254,10 +254,10 @@ public class NetShareVpnService extends VpnService {
             @Override
             public void onClose(int code, String reason, boolean remote) {
                 Log.i(TAG, "WS closed code=" + code + " reason=" + reason);
-                if (isRunning) {
-                    VpnModule.emitEvent("vpnDisconnected",
-                            reason != null && !reason.isEmpty() ? reason : "Connection closed");
-                }
+                // Always emit — even if isRunning=false (WS failed before onOpen for HOST).
+                // Without this, a pre-connection close leaves the app frozen on CONNECTING.
+                String msg = reason != null && !reason.isEmpty() ? reason : "Connection closed";
+                VpnModule.emitEvent(isRunning ? "vpnDisconnected" : "vpnError", msg);
                 stopVpnTunnel();
             }
 
@@ -265,12 +265,12 @@ public class NetShareVpnService extends VpnService {
             public void onError(Exception ex) {
                 String raw = ex != null ? ex.getMessage() : null;
                 Log.e(TAG, "WS error: " + raw);
-                if (isRunning) {
-                    String friendly = (raw != null && (raw.contains("timed out") || raw.contains("timeout")))
-                            ? "Server is starting up — please wait 30 seconds and try again."
-                            : (raw != null ? raw : "WebSocket error");
-                    VpnModule.emitEvent("vpnError", friendly);
-                }
+                // Always emit — even if isRunning=false (WS failed before onOpen for HOST).
+                // Without this, a connection error leaves the app frozen on CONNECTING forever.
+                String friendly = (raw != null && (raw.contains("timed out") || raw.contains("timeout")))
+                        ? "Server is starting up — please wait 30 seconds and try again."
+                        : (raw != null ? raw : "WebSocket error");
+                VpnModule.emitEvent("vpnError", friendly);
                 stopVpnTunnel();
             }
         };
