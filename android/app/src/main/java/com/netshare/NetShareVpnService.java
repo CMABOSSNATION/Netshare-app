@@ -280,26 +280,25 @@ public class NetShareVpnService extends VpnService {
         sslCtx.init(null, null, null);
         final SSLSocketFactory baseSSL = sslCtx.getSocketFactory();
 
+        // FIX: Previous factory created plain new Socket() objects without SSL wrapping.
+        // java-websocket connects wss:// by calling createSocket(Socket,host,port,autoClose)
+        // on a plain socket it opened itself. We protect() that socket first (so the
+        // VPN tunnel doesn't route it back through itself), then delegate to baseSSL to
+        // wrap it with TLS. All other overrides also delegate to baseSSL so SSL is applied.
         wsClient.setSocketFactory(new SSLSocketFactory() {
-            @Override public Socket createSocket() throws IOException {
-                Socket s = new Socket(); self.protect(s); return s; }
-            @Override public Socket createSocket(String h, int p) throws IOException {
-                Socket s = new Socket(); self.protect(s);
-                s.connect(new java.net.InetSocketAddress(h, p)); return s; }
-            @Override public Socket createSocket(String h, int p, InetAddress la, int lp) throws IOException {
-                Socket s = new Socket(); self.protect(s);
-                s.bind(new java.net.InetSocketAddress(la, lp));
-                s.connect(new java.net.InetSocketAddress(h, p)); return s; }
-            @Override public Socket createSocket(InetAddress h, int p) throws IOException {
-                Socket s = new Socket(); self.protect(s);
-                s.connect(new java.net.InetSocketAddress(h, p)); return s; }
-            @Override public Socket createSocket(InetAddress a, int p, InetAddress la, int lp) throws IOException {
-                Socket s = new Socket(); self.protect(s);
-                s.bind(new java.net.InetSocketAddress(la, lp));
-                s.connect(new java.net.InetSocketAddress(a, p)); return s; }
             @Override public Socket createSocket(Socket plain, String h, int p, boolean ac) throws IOException {
                 self.protect(plain);
                 return baseSSL.createSocket(plain, h, p, ac); }
+            @Override public Socket createSocket() throws IOException {
+                Socket s = baseSSL.createSocket(); self.protect(s); return s; }
+            @Override public Socket createSocket(String h, int p) throws IOException {
+                Socket s = baseSSL.createSocket(h, p); self.protect(s); return s; }
+            @Override public Socket createSocket(String h, int p, InetAddress la, int lp) throws IOException {
+                Socket s = baseSSL.createSocket(h, p, la, lp); self.protect(s); return s; }
+            @Override public Socket createSocket(InetAddress h, int p) throws IOException {
+                Socket s = baseSSL.createSocket(h, p); self.protect(s); return s; }
+            @Override public Socket createSocket(InetAddress a, int p, InetAddress la, int lp) throws IOException {
+                Socket s = baseSSL.createSocket(a, p, la, lp); self.protect(s); return s; }
             @Override public String[] getDefaultCipherSuites() { return baseSSL.getDefaultCipherSuites(); }
             @Override public String[] getSupportedCipherSuites() { return baseSSL.getSupportedCipherSuites(); }
         });
