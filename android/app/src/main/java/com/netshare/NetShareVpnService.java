@@ -167,13 +167,16 @@ public class NetShareVpnService extends VpnService {
             }
 
             // CLIENT: build TUN interface
+            // MTU 1400: WS+TLS framing adds overhead; 1500 causes fragmentation
+            // that drops UDP datagrams (TikTok video, WhatsApp media). 1400 is safe.
             Builder builder = new Builder();
             builder.setSession("NetShare")
                    .addAddress("10.8.0.2", 24)
                    .addRoute("0.0.0.0", 0)
                    .addDnsServer("8.8.8.8")
                    .addDnsServer("8.8.4.4")
-                   .setMtu(1500);
+                   .addDnsServer("1.1.1.1")
+                   .setMtu(1400);
 
             try {
                 builder.addDisallowedApplication(getPackageName());
@@ -416,8 +419,10 @@ public class NetShareVpnService extends VpnService {
                     Socket sock = new Socket();
                     protect(sock);
                     try {
-                        sock.connect(new java.net.InetSocketAddress(dst, dstPort), 5000);
-                        sock.setSoTimeout(30_000);
+                        sock.connect(new java.net.InetSocketAddress(dst, dstPort), 10_000);
+                        // 5 min timeout — streaming apps (TikTok, YouTube) hold TCP
+                        // connections open for minutes; 30s killed them mid-stream.
+                        sock.setSoTimeout(300_000);
                         sock.setTcpNoDelay(true);
                     } catch (Exception e) {
                         Log.w(TAG, "TCP connect [" + key + "]: " + e.getMessage());
@@ -460,6 +465,11 @@ public class NetShareVpnService extends VpnService {
                 int pLen    = pkt.length - pOff;
                 if (pLen <= 0) return;
 
+                // Key by srcIp+srcPort+dst — each unique client flow gets its own socket.
+                // This is proper UDP NAT: responses come back to the bound socket and are
+                // forwarded back to the correct client srcPort. WhatsApp and TikTok open
+                // many parallel UDP flows; each needs its own socket for replies to route
+                // back correctly.
                 String key = srcIp + ":" + srcPort + "-" + dst.getHostAddress() + ":" + dstPort;
                 if (!udpSockets.containsKey(key)) {
                     DatagramSocket udpSock = new DatagramSocket();
@@ -516,7 +526,9 @@ public class NetShareVpnService extends VpnService {
         try {
             byte[]         buf = new byte[32767 - IP4_HEADER_LEN - UDP_HEADER_LEN];
             DatagramPacket dp  = new DatagramPacket(buf, buf.length);
-            udpSock.setSoTimeout(60_000);
+            // 5 min timeout — WhatsApp voice/video and TikTok keep UDP flows open
+            // for minutes. 60s killed these sessions mid-call or mid-video.
+            udpSock.setSoTimeout(300_000);
             while (isRunning && !udpSock.isClosed()) {
                 udpSock.receive(dp);
                 byte[] remoteIpBytes = dp.getAddress().getAddress();
