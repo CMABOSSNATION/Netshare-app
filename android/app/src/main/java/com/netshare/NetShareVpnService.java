@@ -70,7 +70,7 @@ public class NetShareVpnService extends VpnService {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && "STOP_VPN".equals(intent.getAction())) {
-            stopVpnTunnel();
+            stopVpnTunnelFromUser();
             return START_NOT_STICKY;
         }
 
@@ -107,9 +107,6 @@ public class NetShareVpnService extends VpnService {
                    .addDnsServer("8.8.8.8")
                    .addDnsServer("8.8.4.4")
                    .setMtu(1500);
-
-            // BUG 3 FIX: No IPv6 default route — HOST only handles IPv4.
-            // IPv6 traffic stays on the native interface; not routed into TUN.
 
             try {
                 builder.addDisallowedApplication(getPackageName());
@@ -170,8 +167,6 @@ public class NetShareVpnService extends VpnService {
                     executor.execute(() -> forwardPacketToInternet(packet));
 
                 } else {
-                    // BUG 2 FIX: HOST now sends complete IPv4 packets (not raw payloads).
-                    // Write them directly to TUN — no routing header to strip.
                     if (tunOut == null) return;
                     try {
                         byte[] data = new byte[bytes.remaining()];
@@ -202,26 +197,23 @@ public class NetShareVpnService extends VpnService {
                 String msg = ex != null ? ex.getMessage() : "WebSocket error";
                 Log.e(TAG, "WS error: " + msg);
                 if (isRunning) {
-                    VpnModule.emitEvent("vpnError", msg != null ? msg : "WebSocket error");
+                    // FIX: emit a user-friendly timeout message if it's a connection timeout
+                    String userMsg = (msg != null && msg.contains("timed out"))
+                            ? "Server is starting up, please try again in 30 seconds."
+                            : (msg != null ? msg : "WebSocket error");
+                    VpnModule.emitEvent("vpnError", userMsg);
                 }
                 stopVpnTunnel();
             }
         };
 
-        // BUG 1 FIX: protect() must be called on the PLAIN socket, not the SSL wrapper.
-        // Android VpnService.protect() works on the raw file-descriptor; SSLSocket wraps
-        // it in a Java layer so protect() silently fails when called on the SSL socket.
-        // Solution: protect the plain socket BEFORE handing it to createSocket(plain,...).
+        // Protect plain socket BEFORE SSL wrapping so VPN tunnel bypass works correctly.
         SSLContext sslCtx = SSLContext.getInstance("TLS");
         sslCtx.init(null, null, null);
         final SSLSocketFactory baseSSL = sslCtx.getSocketFactory();
 
         wsClient.setSocketFactory(new SSLSocketFactory() {
-            // java-websocket calls createSocket() with no args to get an unconnected socket,
-            // then connects it, then calls createSocket(plain, host, port, true) for SSL upgrade.
             @Override public Socket createSocket() throws IOException {
-                // Return a plain unconnected socket; protect it so that when it connects
-                // it bypasses the VPN tunnel (relevant for CLIENT; no-op for HOST).
                 Socket s = new Socket();
                 self.protect(s);
                 return s;
@@ -240,8 +232,6 @@ public class NetShareVpnService extends VpnService {
                 Socket s = new Socket(); self.protect(s);
                 s.bind(new java.net.InetSocketAddress(la, lp));
                 s.connect(new java.net.InetSocketAddress(a, p)); return s; }
-            // BUG 1 FIX (critical path): java-websocket passes the connected plain socket here
-            // for SSL upgrading. Protect the PLAIN socket before wrapping — not the SSL socket.
             @Override public Socket createSocket(Socket plain, String h, int p, boolean ac) throws IOException {
                 self.protect(plain);                            // protect plain fd first
                 return baseSSL.createSocket(plain, h, p, ac);  // then wrap in SSL
@@ -251,10 +241,14 @@ public class NetShareVpnService extends VpnService {
         });
 
         wsClient.setConnectionLostTimeout(30);
-        // BUG 4 FIX: connectBlocking with 15s timeout. Render free-tier backends can take
-        // up to ~50s to spin up; without a timeout the HOST hangs indefinitely.
-        // If it times out, onError fires and the user gets a clear error message.
-        wsClient.connectBlocking(15, TimeUnit.SECONDS);
+
+        // FIX: Increased from 15s to 60s — Render free-tier cold starts take up to ~50s.
+        // If it still times out, onError fires with a user-friendly "starting up" message.
+        boolean connected = wsClient.connectBlocking(60, TimeUnit.SECONDS);
+        if (!connected && isRunning) {
+            VpnModule.emitEvent("vpnError", "Could not reach server. It may be starting up — please try again in 30 seconds.");
+            stopVpnTunnel();
+        }
     }
 
     // ─── CLIENT: TUN → relay packet loop ─────────────────────────────────
@@ -370,11 +364,11 @@ public class NetShareVpnService extends VpnService {
                         return;
                     }
                     tcpConnections.put(key, sock);
-                    final String      fk       = key;
+                    final String      fk        = key;
                     final byte[]      fClientIp = ipBytes(srcIp);
-                    final int         fSrcPort = srcPort;
-                    final int         fDstPort = dstPort;
-                    final InetAddress fDst     = dst;
+                    final int         fSrcPort  = srcPort;
+                    final int         fDstPort  = dstPort;
+                    final InetAddress fDst      = dst;
                     executor.execute(() -> readTcpResponses(sock, fk, fClientIp, fSrcPort, fDstPort, fDst));
                 }
 
@@ -411,10 +405,10 @@ public class NetShareVpnService extends VpnService {
                     DatagramSocket udpSock = new DatagramSocket();
                     protect(udpSock);
                     udpSockets.put(key, udpSock);
-                    final String      fk       = key;
-                    final byte[]      fClientIp = ipBytes(srcIp);
-                    final int         fSrcPort = srcPort;
-                    final int         fDstPort = dstPort;
+                    final String  fk        = key;
+                    final byte[]  fClientIp = ipBytes(srcIp);
+                    final int     fSrcPort  = srcPort;
+                    final int     fDstPort  = dstPort;
                     executor.execute(() -> readUdpResponses(udpSock, fk, fClientIp, fSrcPort, fDstPort));
                 }
                 DatagramSocket udpSock = udpSockets.get(key);
@@ -428,9 +422,6 @@ public class NetShareVpnService extends VpnService {
     }
 
     // ─── HOST: TCP response → relay ───────────────────────────────────────
-    // BUG 2 FIX: Build a complete synthetic IPv4+TCP packet so the CLIENT TUN
-    // kernel accepts it. Previously HOST sent raw TCP stream bytes which the
-    // kernel rejected (byte[0] was never a valid IPv4 version byte).
 
     private void readTcpResponses(Socket sock, String key,
                                    byte[] clientIpBytes, int clientSrcPort, int remoteDstPort,
@@ -442,9 +433,6 @@ public class NetShareVpnService extends VpnService {
             int len;
             while (isRunning && !sock.isClosed() && (len = in.read(buf)) > 0) {
                 if (wsClient != null && wsClient.isOpen()) {
-                    // Build a complete IPv4+TCP packet:
-                    //   src = remote server IP:port  (the "from" address)
-                    //   dst = client's TUN IP:port   (the "to" address on the TUN)
                     ByteBuffer pkt = buildIpTcpPacket(
                             remoteIpBytes, clientIpBytes,
                             remoteDstPort, clientSrcPort,
@@ -461,7 +449,6 @@ public class NetShareVpnService extends VpnService {
     }
 
     // ─── HOST: UDP response → relay ───────────────────────────────────────
-    // BUG 2 FIX: Build complete synthetic IPv4+UDP packets.
 
     private void readUdpResponses(DatagramSocket udpSock, String key,
                                    byte[] clientIpBytes, int clientSrcPort, int remoteDstPort) {
@@ -489,50 +476,37 @@ public class NetShareVpnService extends VpnService {
     }
 
     // ─── Synthetic IPv4 packet builders ──────────────────────────────────
-    // The CLIENT's TUN interface expects complete IPv4 packets (IP hdr + transport hdr + payload).
-    // We build minimal but standards-compliant packets with correct checksums.
 
-    /**
-     * Build a synthetic IPv4 + TCP packet.
-     *   srcIp   = remote server IP (4 bytes) — appears as "from" to the client kernel
-     *   dstIp   = client's TUN IP  (4 bytes) — the client device's VPN address
-     *   srcPort = remote server port (e.g. 443)
-     *   dstPort = client's ephemeral source port
-     */
     private static ByteBuffer buildIpTcpPacket(byte[] srcIp, byte[] dstIp,
                                                 int srcPort, int dstPort,
                                                 byte[] payload, int off, int len) {
         int totalLen = IP4_HEADER_LEN + TCP_HEADER_LEN + len;
         ByteBuffer b = ByteBuffer.allocate(totalLen);
 
-        // IPv4 header
-        b.put(IP4_VERSION_IHL);           // version=4, IHL=5 (20 bytes, no options)
-        b.put((byte) 0x00);               // DSCP/ECN = 0
-        b.putShort((short) totalLen);     // total length
-        b.putShort((short) 0);            // identification (0 = no fragmentation)
-        b.putShort((short) 0x4000);       // flags=DF, fragment offset=0
-        b.put((byte) 64);                 // TTL
-        b.put(PROTO_TCP);                 // protocol
-        b.putShort((short) 0);            // checksum placeholder (filled below)
-        b.put(srcIp);                     // source address
-        b.put(dstIp);                     // destination address
+        b.put(IP4_VERSION_IHL);
+        b.put((byte) 0x00);
+        b.putShort((short) totalLen);
+        b.putShort((short) 0);
+        b.putShort((short) 0x4000);
+        b.put((byte) 64);
+        b.put(PROTO_TCP);
+        b.putShort((short) 0);
+        b.put(srcIp);
+        b.put(dstIp);
         b.putShort(10, (short) checksum(b.array(), 0, IP4_HEADER_LEN));
 
-        // TCP header (minimal: no options, flags = ACK+PSH)
-        b.putShort((short) srcPort);      // source port
-        b.putShort((short) dstPort);      // destination port
-        b.putInt(0);                      // sequence number
-        b.putInt(0);                      // acknowledgement number
-        b.put((byte) (TCP_HEADER_LEN << 2)); // data offset = 5 (0x50), no options
-        b.put((byte) 0x18);               // flags: ACK(0x10) + PSH(0x08)
-        b.putShort((short) 65535);        // window size
-        b.putShort((short) 0);            // checksum placeholder
-        b.putShort((short) 0);            // urgent pointer
+        b.putShort((short) srcPort);
+        b.putShort((short) dstPort);
+        b.putInt(0);
+        b.putInt(0);
+        b.put((byte) (TCP_HEADER_LEN << 2));
+        b.put((byte) 0x18);
+        b.putShort((short) 65535);
+        b.putShort((short) 0);
+        b.putShort((short) 0);
 
-        // Payload
         b.put(payload, off, len);
 
-        // TCP checksum (over pseudo-header + TCP segment)
         int tcpLen  = TCP_HEADER_LEN + len;
         int tcpCsum = tcpUdpChecksum(srcIp, dstIp, PROTO_TCP, b.array(), IP4_HEADER_LEN, tcpLen);
         b.putShort(IP4_HEADER_LEN + 16, (short) tcpCsum);
@@ -541,16 +515,12 @@ public class NetShareVpnService extends VpnService {
         return b;
     }
 
-    /**
-     * Build a synthetic IPv4 + UDP packet.
-     */
     private static ByteBuffer buildIpUdpPacket(byte[] srcIp, byte[] dstIp,
                                                 int srcPort, int dstPort,
                                                 byte[] payload, int off, int len) {
         int totalLen = IP4_HEADER_LEN + UDP_HEADER_LEN + len;
         ByteBuffer b = ByteBuffer.allocate(totalLen);
 
-        // IPv4 header
         b.put(IP4_VERSION_IHL);
         b.put((byte) 0x00);
         b.putShort((short) totalLen);
@@ -563,13 +533,11 @@ public class NetShareVpnService extends VpnService {
         b.put(dstIp);
         b.putShort(10, (short) checksum(b.array(), 0, IP4_HEADER_LEN));
 
-        // UDP header
         b.putShort((short) srcPort);
         b.putShort((short) dstPort);
         b.putShort((short) (UDP_HEADER_LEN + len));
-        b.putShort((short) 0);  // checksum=0 means disabled (valid for IPv4 UDP)
+        b.putShort((short) 0);
 
-        // Payload
         b.put(payload, off, len);
 
         b.flip();
@@ -578,7 +546,6 @@ public class NetShareVpnService extends VpnService {
 
     // ─── Checksum helpers ─────────────────────────────────────────────────
 
-    /** RFC-1071 one's-complement 16-bit checksum. */
     private static int checksum(byte[] buf, int offset, int length) {
         int sum = 0;
         int i   = offset;
@@ -595,12 +562,10 @@ public class NetShareVpnService extends VpnService {
         return (~sum) & 0xFFFF;
     }
 
-    /** TCP/UDP checksum using the IPv4 pseudo-header (RFC 793 / RFC 768). */
     private static int tcpUdpChecksum(byte[] srcIp, byte[] dstIp, byte proto,
                                        byte[] segment, int segOff, int segLen) {
-        // pseudo-header: [srcIp 4B][dstIp 4B][0][proto][segLen 2B]
         int pseudoLen = 12 + segLen;
-        byte[] scratch = new byte[pseudoLen + (pseudoLen % 2)]; // even-length for checksum
+        byte[] scratch = new byte[pseudoLen + (pseudoLen % 2)];
         scratch[0] = srcIp[0]; scratch[1] = srcIp[1];
         scratch[2] = srcIp[2]; scratch[3] = srcIp[3];
         scratch[4] = dstIp[0]; scratch[5] = dstIp[1];
@@ -695,7 +660,7 @@ public class NetShareVpnService extends VpnService {
             Log.w(TAG, "WS close: " + e.getMessage());
         }
 
-        try { if (tunOut      != null) { tunOut.close();       tunOut      = null; } } catch (Exception ignored) {}
+        try { if (tunOut       != null) { tunOut.close();       tunOut      = null; } } catch (Exception ignored) {}
         try { if (vpnInterface != null) { vpnInterface.close(); vpnInterface = null; } }
         catch (Exception e) { Log.w(TAG, "TUN close: " + e.getMessage()); }
 
