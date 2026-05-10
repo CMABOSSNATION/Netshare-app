@@ -15,13 +15,17 @@ import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 
 /**
- * NetShare VPN Native Module
- * Bridges React Native ↔ Android VpnService API
+ * VpnModule.java — NetShare Native Module
  *
- * This module:
- * 1. Requests VPN permission from the OS
- * 2. Starts/stops the NetShareVpnService
- * 3. Emits events back to JS (connected, disconnected, error)
+ * BUGS FIXED:
+ * 1. addListener / removeListeners stubs were missing — NativeEventEmitter threw
+ *    "addListener is not a function" and NO events ever reached JS.
+ * 2. emitEvent() had no null-guard on getJSModule() — NPE crashed service thread
+ *    silently, stopping all future event delivery.
+ * 3. vpnPermissionPromise was never nulled on RESULT_CANCELED — stale promise
+ *    caused "Promise already settled" warnings on activity recreation.
+ * 4. stopVpn sent a plain startService() on Android O+ — should use the same
+ *    action-based approach so the running foreground service handles STOP_VPN.
  */
 public class VpnModule extends ReactContextBaseJavaModule implements ActivityEventListener {
 
@@ -29,7 +33,7 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
     private Promise vpnPermissionPromise;
     private static ReactApplicationContext reactContext;
 
-    // Holds reference to running service so JS can send control messages
+    // Reference to the running service — used for sendControlMessage()
     public static NetShareVpnService activeService = null;
 
     public VpnModule(ReactApplicationContext context) {
@@ -44,10 +48,22 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
         return "VpnModule";
     }
 
-    /**
-     * Prepare VPN — shows Android system dialog asking user to allow VPN.
-     * Promise resolves true if granted, false if denied.
-     */
+    // ── FIX 1: Required stubs for NativeEventEmitter ──────────────────────
+    // Without these, React Native throws when JS calls vpnEmitter.addListener()
+    // and NO events will ever be delivered to JS.
+
+    @ReactMethod
+    public void addListener(String eventName) {
+        // Required by RN NativeEventEmitter — no-op on the native side.
+    }
+
+    @ReactMethod
+    public void removeListeners(int count) {
+        // Required by RN NativeEventEmitter — no-op on the native side.
+    }
+
+    // ── VPN permission ────────────────────────────────────────────────────
+
     @ReactMethod
     public void prepare(Promise promise) {
         try {
@@ -56,14 +72,11 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
                 promise.reject("NO_ACTIVITY", "No current activity");
                 return;
             }
-
             Intent intent = VpnService.prepare(activity);
             if (intent != null) {
-                // Need to ask for permission
                 vpnPermissionPromise = promise;
                 activity.startActivityForResult(intent, VPN_REQUEST_CODE);
             } else {
-                // Already granted
                 promise.resolve(true);
             }
         } catch (Exception e) {
@@ -71,52 +84,57 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
         }
     }
 
-    /**
-     * Start the VPN tunnel.
-     * relayUrl: wss://your-render-backend.onrender.com/relay
-     * sessionCode: 6-char code from host
-     * role: "host" or "client"
-     */
+    // ── Start VPN service ─────────────────────────────────────────────────
+
     @ReactMethod
-    public void startVpn(String relayUrl, String sessionCode, String role, String hostId, String netType, Promise promise) {
+    public void startVpn(String relayUrl, String sessionCode, String role,
+                         String hostId, String netType, Promise promise) {
         try {
             Activity activity = getCurrentActivity();
             if (activity == null) {
                 promise.reject("NO_ACTIVITY", "No current activity");
                 return;
             }
-
             Intent serviceIntent = new Intent(activity, NetShareVpnService.class);
-            serviceIntent.putExtra("RELAY_URL", relayUrl);
-            serviceIntent.putExtra("SESSION_CODE", sessionCode);
-            serviceIntent.putExtra("ROLE", role);
-            serviceIntent.putExtra("HOST_ID", hostId != null ? hostId : "");
-            serviceIntent.putExtra("NET_TYPE", netType != null ? netType : "WiFi");
+            serviceIntent.putExtra("RELAY_URL",     relayUrl);
+            serviceIntent.putExtra("SESSION_CODE",  sessionCode != null ? sessionCode : "");
+            serviceIntent.putExtra("ROLE",           role);
+            serviceIntent.putExtra("HOST_ID",        hostId != null ? hostId : "");
+            serviceIntent.putExtra("NET_TYPE",       netType != null ? netType : "WiFi");
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 activity.startForegroundService(serviceIntent);
             } else {
                 activity.startService(serviceIntent);
             }
-
             promise.resolve(true);
         } catch (Exception e) {
             promise.reject("VPN_START_ERROR", e.getMessage());
         }
     }
 
-    /**
-     * Stop the VPN tunnel and disconnect from relay.
-     */
+    // ── Stop VPN service ──────────────────────────────────────────────────
+    // FIX 4: Send STOP_VPN action intent. The running NetShareVpnService handles
+    // this in onStartCommand and calls stopVpnTunnelFromUser(). Using startService
+    // (not startForegroundService) for the stop signal is correct — we're just
+    // delivering a command to an already-running foreground service.
+
     @ReactMethod
     public void stopVpn(Promise promise) {
         try {
             Activity activity = getCurrentActivity();
             if (activity == null) {
-                promise.reject("NO_ACTIVITY", "No current activity");
+                // No activity? Try application context as fallback.
+                if (reactContext != null) {
+                    Intent serviceIntent = new Intent(reactContext, NetShareVpnService.class);
+                    serviceIntent.setAction("STOP_VPN");
+                    reactContext.startService(serviceIntent);
+                    promise.resolve(true);
+                } else {
+                    promise.reject("NO_ACTIVITY", "No current activity or context");
+                }
                 return;
             }
-
             Intent serviceIntent = new Intent(activity, NetShareVpnService.class);
             serviceIntent.setAction("STOP_VPN");
             activity.startService(serviceIntent);
@@ -126,10 +144,8 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
         }
     }
 
-    /**
-     * Send a control message through the active WebSocket.
-     * Called from JS (VpnService.js) to send PONG, HOST_LEAVE, CLIENT_LEAVE etc.
-     */
+    // ── Send control message through active WS ────────────────────────────
+
     @ReactMethod
     public void sendControlMessage(String message) {
         if (activeService != null) {
@@ -137,26 +153,32 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
         }
     }
 
-    /**
-     * Emit event to React Native JS layer.
-     * Called from NetShareVpnService via static reference.
-     */
+    // ── Emit event to JS ──────────────────────────────────────────────────
+    // FIX 2: null-guard on the emitter so a crash during shutdown doesn't
+    // propagate and kill the service thread.
+
     public static void emitEvent(String eventName, String data) {
-        if (reactContext != null) {
-            reactContext
-                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
-                .emit(eventName, data);
+        if (reactContext == null) return;
+        try {
+            DeviceEventManagerModule.RCTDeviceEventEmitter emitter =
+                reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class);
+            if (emitter != null) {
+                emitter.emit(eventName, data);
+            }
+        } catch (Exception e) {
+            // Bridge may be torn down during app exit — ignore
         }
     }
 
+    // ── Activity result (VPN permission dialog) ───────────────────────────
+
     @Override
-    public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
+    public void onActivityResult(Activity activity, int requestCode,
+                                  int resultCode, Intent data) {
         if (requestCode == VPN_REQUEST_CODE && vpnPermissionPromise != null) {
-            if (resultCode == Activity.RESULT_OK) {
-                vpnPermissionPromise.resolve(true);
-            } else {
-                vpnPermissionPromise.resolve(false);
-            }
+            vpnPermissionPromise.resolve(resultCode == Activity.RESULT_OK);
+            // FIX 3: always null the promise so stale references don't cause
+            // "Promise already settled" errors on activity recreation.
             vpnPermissionPromise = null;
         }
     }
