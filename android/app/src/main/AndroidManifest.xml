@@ -36,8 +36,14 @@
         </activity>
 
         <!-- VPN Service - MUST have BIND_VPN_SERVICE permission -->
+        <!-- FIX: Use fully-qualified class name so Android resolves it correctly
+             regardless of the app's applicationId (com.netsharebuild in the build
+             scaffold vs com.netshare in the source). Relative names like
+             ".NetShareVpnService" resolve against applicationId, pointing to a
+             class that doesn't exist, so Android silently ignores the service
+             and VpnService.prepare() never shows the permission dialog. -->
         <service
-            android:name=".NetShareVpnService"
+            android:name="com.netshare.NetShareVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
             android:exported="false"
             android:foregroundServiceType="connectedDevice">
