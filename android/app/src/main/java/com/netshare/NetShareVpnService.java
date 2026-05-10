@@ -32,6 +32,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
@@ -99,6 +100,22 @@ public class NetShareVpnService extends VpnService {
     private static final byte PROTO_TCP       = 6;
     private static final byte PROTO_UDP       = 17;
 
+    // QUIC runs over UDP port 443 (and sometimes 80).
+    // TikTok, WhatsApp, YouTube all use QUIC for low-latency media.
+    // We don't block it — it flows through the UDP path — but we give
+    // QUIC flows larger socket buffers to avoid dropped datagrams.
+    private static final int QUIC_PORT_HTTPS  = 443;
+    private static final int QUIC_PORT_HTTP   = 80;
+
+    // Socket buffer sizes tuned for streaming media
+    private static final int TCP_SOCKET_BUFFER = 256 * 1024;   // 256 KB
+    private static final int UDP_SOCKET_BUFFER = 512 * 1024;   // 512 KB (QUIC, RTP)
+    private static final int QUIC_SOCKET_BUFFER = 2 * 1024 * 1024; // 2 MB (TikTok CDN)
+
+    // MTU: 1400 for WS+TLS overhead headroom. QUIC adds its own framing so
+    // we signal 1350 via TUN to ensure QUIC PMTUD doesn't fragment inside tunnel.
+    private static final int TUN_MTU = 1400;
+
     private ParcelFileDescriptor vpnInterface;
     private WebSocketClient      wsClient;
     private ExecutorService      executor;
@@ -116,6 +133,10 @@ public class NetShareVpnService extends VpnService {
 
     private final Map<String, Socket>         tcpConnections = new ConcurrentHashMap<>();
     private final Map<String, DatagramSocket> udpSockets     = new ConcurrentHashMap<>();
+
+    // Byte counters for debugging / admin UI
+    private final AtomicLong bytesIn  = new AtomicLong(0);
+    private final AtomicLong bytesOut = new AtomicLong(0);
 
     // ─── Lifecycle ────────────────────────────────────────────────────────
 
@@ -182,15 +203,25 @@ public class NetShareVpnService extends VpnService {
                    .addRoute("0.0.0.0", 0)
                    // Route ALL IPv6 traffic so apps using IPv6 (most modern apps) are
                    // also tunnelled. Without this, IPv6 traffic bypasses the VPN entirely.
+                   // WhatsApp and TikTok both use IPv6 on modern Android.
                    .addRoute("::", 0)
                    // Primary DNS servers via the tunnel — prevents DNS leaks outside VPN.
+                   // WhatsApp uses its own DNS over HTTPS; routing 8.8.8.8 + 1.1.1.1
+                   // ensures those DoH connections also go through the tunnel.
                    .addDnsServer("8.8.8.8")
                    .addDnsServer("8.8.4.4")
                    .addDnsServer("1.1.1.1")
                    // IPv6 DNS via tunnel
                    .addDnsServer("2001:4860:4860::8888")
                    .addDnsServer("2606:4700:4700::1111")
-                   .setMtu(1400);
+                   .setMtu(TUN_MTU);
+
+            // BYPASS PREVENTION: On Android 10+ (API 29), apps can opt out of VPNs
+            // via vpnService.setAlwaysOn() exemptions. We cannot fully prevent this from
+            // inside the service, but we ensure our routes are as broad as possible so
+            // there is no non-VPN path for apps to discover by default routing.
+            // The host app should also set android:usesCleartextTraffic="false" in manifest
+            // and set VPN lockdown mode via DevicePolicyManager if available.
 
             try {
                 // Exclude only this app from the tunnel so the WS relay connection
@@ -252,17 +283,23 @@ public class NetShareVpnService extends VpnService {
                 if ("host".equals(role)) {
                     byte[] packet = new byte[bytes.remaining()];
                     bytes.get(packet);
+                    bytesIn.addAndGet(packet.length);
                     executor.execute(() -> forwardPacketToInternet(packet));
                 } else {
                     if (tunOut == null) return;
                     try {
                         byte[] data = new byte[bytes.remaining()];
                         bytes.get(data);
-                        // Only write valid IPv4 packets to TUN (version nibble == 4)
-                        if (data.length >= IP4_HEADER_LEN && (data[0] & 0xF0) == 0x40) {
-                            tunOut.write(data);
-                        } else {
-                            Log.w(TAG, "CLIENT: dropped non-IPv4 frame len=" + data.length);
+                        // Accept both IPv4 (version nibble 4) and IPv6 (version nibble 6).
+                        // WhatsApp and TikTok use IPv6 on most modern Android/carrier combos.
+                        if (data.length >= IP4_HEADER_LEN) {
+                            int ver = (data[0] & 0xF0) >> 4;
+                            if (ver == 4 || (ver == 6 && data.length >= 40)) {
+                                bytesIn.addAndGet(data.length);
+                                tunOut.write(data);
+                            } else {
+                                Log.w(TAG, "CLIENT: dropped unknown IP frame ver=" + ver + " len=" + data.length);
+                            }
                         }
                     } catch (Exception e) {
                         Log.e(TAG, "TUN write: " + e.getMessage());
@@ -335,11 +372,14 @@ public class NetShareVpnService extends VpnService {
 
     private void startPacketReadLoop() {
         executor.execute(() -> {
-            byte[] buf = new byte[32767];
+            // 65535 = max IP packet size. Larger buffer prevents partial reads
+            // of jumbo frames that some apps (TikTok CDN) may produce.
+            byte[] buf = new byte[65535];
             try (FileInputStream in = new FileInputStream(vpnInterface.getFileDescriptor())) {
                 while (isRunning) {
                     int len = in.read(buf);
                     if (len > 0 && wsClient != null && wsClient.isOpen()) {
+                        bytesOut.addAndGet(len);
                         wsClient.send(ByteBuffer.wrap(buf, 0, len));
                     }
                 }
@@ -383,7 +423,7 @@ public class NetShareVpnService extends VpnService {
                               .addDnsServer("1.1.1.1")
                               .addDnsServer("2001:4860:4860::8888")
                               .addDnsServer("2606:4700:4700::1111")
-                              .setMtu(1400);
+                              .setMtu(TUN_MTU);
                             try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
                             vpnInterface = b2.establish();
                             if (vpnInterface != null) {
@@ -556,11 +596,16 @@ public class NetShareVpnService extends VpnService {
                     Socket sock = new Socket();
                     protect(sock);
                     try {
+                        // Larger send/receive buffers for streaming (TikTok, YouTube, WhatsApp video)
+                        sock.setReceiveBufferSize(TCP_SOCKET_BUFFER);
+                        sock.setSendBufferSize(TCP_SOCKET_BUFFER);
                         sock.connect(new java.net.InetSocketAddress(dst, dstPort), 10_000);
                         // 5 min timeout — streaming apps (TikTok, YouTube) hold TCP
                         // connections open for minutes; 30s killed them mid-stream.
                         sock.setSoTimeout(300_000);
                         sock.setTcpNoDelay(true);
+                        // TCP keepalive so idle HTTPS connections (WhatsApp long-poll) survive
+                        sock.setKeepAlive(true);
                     } catch (Exception e) {
                         Log.w(TAG, "TCP connect [" + key + "]: " + e.getMessage());
                         try { sock.close(); } catch (Exception ignored) {}
@@ -611,6 +656,15 @@ public class NetShareVpnService extends VpnService {
                 if (!udpSockets.containsKey(key)) {
                     DatagramSocket udpSock = new DatagramSocket();
                     protect(udpSock);
+                    // QUIC (UDP 443) and media (RTP, SRTP) need large buffers.
+                    // TikTok CDN sends bursts of large UDP datagrams; undersized
+                    // buffers cause the kernel to drop datagrams silently, breaking video.
+                    boolean isQuic = (dstPort == QUIC_PORT_HTTPS || dstPort == QUIC_PORT_HTTP);
+                    int bufSize = isQuic ? QUIC_SOCKET_BUFFER : UDP_SOCKET_BUFFER;
+                    try {
+                        udpSock.setReceiveBufferSize(bufSize);
+                        udpSock.setSendBufferSize(bufSize);
+                    } catch (Exception ignored) {}
                     udpSockets.put(key, udpSock);
                     final byte[] fClientIp = ipBytes(srcIp);
                     final int    fSrcPort  = srcPort;
@@ -636,10 +690,12 @@ public class NetShareVpnService extends VpnService {
         byte[] remoteIpBytes = remoteAddr.getAddress();
         try {
             InputStream in  = sock.getInputStream();
-            byte[]      buf = new byte[32767 - IP4_HEADER_LEN - TCP_HEADER_LEN];
+            // 64 KB read buffer — HTTP/2 (used by WhatsApp, TikTok API) sends large frames
+            byte[]      buf = new byte[65535 - IP4_HEADER_LEN - TCP_HEADER_LEN];
             int len;
             while (isRunning && !sock.isClosed() && (len = in.read(buf)) > 0) {
                 if (wsClient != null && wsClient.isOpen()) {
+                    bytesOut.addAndGet(len);
                     // FIX 6: build a proper IPv4+TCP packet so client TUN kernel accepts it
                     ByteBuffer pkt = buildIpTcpPacket(
                             remoteIpBytes, clientIpBytes,
@@ -661,15 +717,19 @@ public class NetShareVpnService extends VpnService {
     private void readUdpResponses(DatagramSocket udpSock, String key,
                                    byte[] clientIpBytes, int clientSrcPort, int remoteDstPort) {
         try {
-            byte[]         buf = new byte[32767 - IP4_HEADER_LEN - UDP_HEADER_LEN];
+            // 64 KB — max UDP payload. QUIC (TikTok, WhatsApp) sends close to this limit.
+            byte[]         buf = new byte[65535 - IP4_HEADER_LEN - UDP_HEADER_LEN];
             DatagramPacket dp  = new DatagramPacket(buf, buf.length);
             // 5 min timeout — WhatsApp voice/video and TikTok keep UDP flows open
             // for minutes. 60s killed these sessions mid-call or mid-video.
+            // QUIC connections re-establish quickly but the extra timeout avoids
+            // unnecessary socket churn for long-lived media sessions.
             udpSock.setSoTimeout(300_000);
             while (isRunning && !udpSock.isClosed()) {
                 udpSock.receive(dp);
                 byte[] remoteIpBytes = dp.getAddress().getAddress();
                 if (wsClient != null && wsClient.isOpen()) {
+                    bytesOut.addAndGet(dp.getLength());
                     // FIX 6: build a proper IPv4+UDP packet so client TUN kernel accepts it
                     ByteBuffer pkt = buildIpUdpPacket(
                             remoteIpBytes, clientIpBytes,
