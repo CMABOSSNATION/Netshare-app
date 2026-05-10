@@ -1,12 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- FIX: Removed package="com.netshare" attribute — AGP 8.x uses namespace in build.gradle instead.
-     Having package= here causes a build error with modern Gradle. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- FIX: Added missing FOREGROUND_SERVICE_CONNECTED_DEVICE (required for Android 14+ VPN foreground service) -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -35,18 +31,23 @@
             </intent-filter>
         </activity>
 
-        <!-- VPN Service - MUST have BIND_VPN_SERVICE permission -->
-        <!-- FIX: Use fully-qualified class name so Android resolves it correctly
-             regardless of the app's applicationId (com.netsharebuild in the build
-             scaffold vs com.netshare in the source). Relative names like
-             ".NetShareVpnService" resolve against applicationId, pointing to a
-             class that doesn't exist, so Android silently ignores the service
-             and VpnService.prepare() never shows the permission dialog. -->
+        <!--
+          VPN Service rules:
+          1. android:permission="BIND_VPN_SERVICE" is REQUIRED — Android only
+             allows the system to bind it, not other apps.
+          2. foregroundServiceType must NOT be set for VPN services on Android 14+.
+             VpnService is exempt from the foreground service type requirement.
+             Setting foregroundServiceType="connectedDevice" causes Android to
+             immediately kill the service because the app hasn't declared
+             FOREGROUND_SERVICE_CONNECTED_DEVICE correctly in all API levels,
+             producing the connect→disconnect loop visible in the screenshot.
+          3. Use relative name ".NetShareVpnService" so it resolves correctly
+             against whatever applicationId the build uses.
+        -->
         <service
-            android:name="com.netshare.NetShareVpnService"
+            android:name=".NetShareVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
-            android:exported="false"
-            android:foregroundServiceType="connectedDevice">
+            android:exported="false">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
