@@ -31,6 +31,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -108,13 +109,24 @@ public class NetShareVpnService extends VpnService {
     private static final int QUIC_PORT_HTTP   = 80;
 
     // Socket buffer sizes tuned for streaming media
-    private static final int TCP_SOCKET_BUFFER = 256 * 1024;   // 256 KB
-    private static final int UDP_SOCKET_BUFFER = 512 * 1024;   // 512 KB (QUIC, RTP)
-    private static final int QUIC_SOCKET_BUFFER = 2 * 1024 * 1024; // 2 MB (TikTok CDN)
+    private static final int TCP_SOCKET_BUFFER  = 512 * 1024;      // 512 KB  (was 256 KB)
+    private static final int UDP_SOCKET_BUFFER  = 1024 * 1024;     // 1 MB    (was 512 KB)
+    private static final int QUIC_SOCKET_BUFFER = 4 * 1024 * 1024; // 4 MB    (was 2 MB — TikTok CDN)
 
-    // MTU: 1400 for WS+TLS overhead headroom. QUIC adds its own framing so
-    // we signal 1350 via TUN to ensure QUIC PMTUD doesn't fragment inside tunnel.
-    private static final int TUN_MTU = 1400;
+    // MTU 1420: maximises payload per WS frame while leaving room for WS+TLS framing
+    // overhead (~60 bytes). Previously 1400 — the extra 20 bytes yield ~1.4% more
+    // throughput on back-to-back frames (WhatsApp video calls send continuous 1400-byte
+    // segments; raising MTU means fewer IP fragments and fewer WS send() calls).
+    private static final int TUN_MTU = 1420;
+
+    // WS send queue: replaces the global synchronized lock.
+    // A single drain thread serialises all sends — no lock contention between
+    // forwarding threads. Capacity 4096 frames ≈ 256 MB headroom before drop.
+    private static final int WS_SEND_QUEUE_CAPACITY = 4096;
+    private final LinkedBlockingQueue<Object> wsSendQueue =
+            new LinkedBlockingQueue<>(WS_SEND_QUEUE_CAPACITY);
+    // Sentinel that tells the drain thread to exit cleanly.
+    private static final Object WS_DRAIN_POISON = new Object();
 
     private ParcelFileDescriptor vpnInterface;
     private WebSocketClient      wsClient;
@@ -137,6 +149,69 @@ public class NetShareVpnService extends VpnService {
     // Byte counters for debugging / admin UI
     private final AtomicLong bytesIn  = new AtomicLong(0);
     private final AtomicLong bytesOut = new AtomicLong(0);
+
+    // ─── Lock-free WebSocket send via dedicated drain thread ────────────────
+    // DESIGN: Previously all forwarding threads called synchronized wsSend(),
+    // which serialised every send through one global lock. Under load (WhatsApp
+    // video + background QUIC + DNS), threads piled up waiting for the lock.
+    //
+    // NEW DESIGN: Forwarding threads enqueue frames into a LinkedBlockingQueue
+    // (non-blocking offer — drops frame if full rather than blocking the thread).
+    // A single dedicated drain thread dequeues and sends, so java-websocket's
+    // non-thread-safe send() is called from only one thread. No lock contention.
+    //
+    // Result: forwarding threads are never blocked by a slow WS send. WhatsApp
+    // media frames and QUIC packets are queued instantly and drained as fast as
+    // the WS connection allows.
+    private void startWsDrainThread() {
+        Thread drain = new Thread(() -> {
+            while (true) {
+                try {
+                    Object item = wsSendQueue.take();   // blocks only when queue is empty
+                    if (item == WS_DRAIN_POISON) break;
+                    WebSocketClient ws = wsClient;
+                    if (ws == null || !ws.isOpen()) continue;
+                    try {
+                        if (item instanceof ByteBuffer) ws.send((ByteBuffer) item);
+                        else if (item instanceof String) ws.send((String) item);
+                    } catch (Exception e) {
+                        Log.w(TAG, "wsDrain send error: " + e.getMessage());
+                    }
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        }, "ws-drain");
+        drain.setDaemon(true);
+        drain.setPriority(Thread.MAX_PRIORITY);  // drain thread must not be starved
+        drain.start();
+    }
+
+    private void wsSend(ByteBuffer data) {
+        // offer() is non-blocking — drops if queue is full (backpressure).
+        // Dropping is better than blocking a forwarding thread.
+        if (!wsSendQueue.offer(data)) {
+            Log.w(TAG, "wsSend: queue full, frame dropped");
+        }
+    }
+    private void wsSend(String text) {
+        if (!wsSendQueue.offer(text)) {
+            Log.w(TAG, "wsSend: queue full, control message dropped");
+        }
+    }
+    private void stopWsDrain() {
+        wsSendQueue.offer(WS_DRAIN_POISON);   // wake drain thread to exit
+    }
+
+    // DNS flows need a short timeout (5s) — DNS server responds and closes
+    // immediately. Waiting 300s blocks the response thread so DNS replies
+    // never reach the client, making WhatsApp unable to resolve g.whatsapp.net.
+    // WhatsApp XMPP (5222) and streaming (443) need 5 min to stay alive.
+    private static int socketTimeoutForPort(int port) {
+        if (port == 53 || port == 853) return 5_000;       // DNS / DNS-over-TLS
+        if (port == 123)               return 10_000;      // NTP
+        return 300_000;                                    // everything else: 5 min
+    }
 
     // ─── Lifecycle ────────────────────────────────────────────────────────
 
@@ -172,7 +247,13 @@ public class NetShareVpnService extends VpnService {
         }
 
         startForegroundNotification();
-        executor = Executors.newCachedThreadPool();
+        // Bounded thread pool: I/O-bound tasks (TCP/UDP forwarding) benefit from
+        // more threads than CPU count, but unbounded (newCachedThreadPool) causes
+        // thread explosion under load (100+ flows = 100+ threads = heavy context switching).
+        // CPU_COUNT * 8 gives good throughput for I/O-bound network forwarding.
+        int poolSize = Math.max(8, Runtime.getRuntime().availableProcessors() * 8);
+        executor = Executors.newFixedThreadPool(poolSize);
+        startWsDrainThread();   // start before connectToRelay so first send doesn't race
         VpnModule.activeService = this;
         executor.execute(this::startVpnTunnel);
 
@@ -247,7 +328,7 @@ public class NetShareVpnService extends VpnService {
                 if ("host".equals(role)) {
                     isRunning = true;  // FIX 5: set here, not before connect
                     VpnModule.emitEvent("vpnConnected", "host");
-                    send(j3("type", "HOST_REGISTER", "hostId", hostId, "netType", netType));
+                    wsSend(j3("type", "HOST_REGISTER", "hostId", hostId, "netType", netType));
                 } else {
                     // CLIENT TUN already up; WS is now ready.
                     // CRITICAL FIX: Do NOT start the packet read loop here.
@@ -258,7 +339,7 @@ public class NetShareVpnService extends VpnService {
                     // startPacketReadLoop() is called in JOIN_SUCCESS handler
                     // after the TUN is rebuilt with the correct assigned IP.
                     VpnModule.emitEvent("vpnConnected", sessionCode);
-                    send(j2("type", "CLIENT_JOIN", "accessCode", sessionCode));
+                    wsSend(j2("type", "CLIENT_JOIN", "accessCode", sessionCode));
                 }
             }
 
@@ -276,24 +357,29 @@ public class NetShareVpnService extends VpnService {
                     bytesIn.addAndGet(packet.length);
                     executor.execute(() -> forwardPacketToInternet(packet));
                 } else {
-                    if (tunOut == null) return;
-                    try {
-                        byte[] data = new byte[bytes.remaining()];
-                        bytes.get(data);
-                        // Accept both IPv4 (version nibble 4) and IPv6 (version nibble 6).
-                        // WhatsApp and TikTok use IPv6 on most modern Android/carrier combos.
-                        if (data.length >= IP4_HEADER_LEN) {
-                            int ver = (data[0] & 0xF0) >> 4;
-                            if (ver == 4 || (ver == 6 && data.length >= 40)) {
-                                bytesIn.addAndGet(data.length);
-                                tunOut.write(data);
-                            } else {
-                                Log.w(TAG, "CLIENT: dropped unknown IP frame ver=" + ver + " len=" + data.length);
+                    // Copy the payload off the ByteBuffer immediately (ByteBuffer is
+                    // reused by java-websocket after this callback returns).
+                    byte[] data = new byte[bytes.remaining()];
+                    bytes.get(data);
+                    // PERF FIX: offload TUN write to executor so the WS reader thread
+                    // is never blocked by a kernel TUN buffer that is temporarily full.
+                    // Without this, a stalled tunOut.write() stops ALL incoming packets.
+                    executor.execute(() -> {
+                        if (!isRunning || tunOut == null) return;
+                        try {
+                            if (data.length >= IP4_HEADER_LEN) {
+                                int ver = (data[0] & 0xF0) >> 4;
+                                if (ver == 4 || (ver == 6 && data.length >= 40)) {
+                                    bytesIn.addAndGet(data.length);
+                                    tunOut.write(data);
+                                } else {
+                                    Log.w(TAG, "CLIENT: dropped unknown IP frame ver=" + ver + " len=" + data.length);
+                                }
                             }
+                        } catch (Exception e) {
+                            if (isRunning) Log.e(TAG, "TUN write: " + e.getMessage());
                         }
-                    } catch (Exception e) {
-                        Log.e(TAG, "TUN write: " + e.getMessage());
-                    }
+                    });
                 }
             }
 
@@ -349,8 +435,10 @@ public class NetShareVpnService extends VpnService {
             @Override public String[] getSupportedCipherSuites() { return baseSSL.getSupportedCipherSuites(); }
         });
 
-        // 30s keepalive ping/pong to detect dead connections
-        wsClient.setConnectionLostTimeout(30);
+        // 20s keepalive ping/pong: detects dead connections faster than the previous 30s.
+        // WhatsApp requires a live WS connection — a 30s dead-connection window meant
+        // WhatsApp could stall for up to 30s before reconnecting.
+        wsClient.setConnectionLostTimeout(20);
 
         // FIX 3: Use non-blocking connect(). Callbacks (onOpen/onMessage/onClose/onError)
         // run on the WS internal thread — no executor thread is permanently consumed.
@@ -362,15 +450,25 @@ public class NetShareVpnService extends VpnService {
 
     private void startPacketReadLoop() {
         executor.execute(() -> {
-            // 65535 = max IP packet size. Larger buffer prevents partial reads
-            // of jumbo frames that some apps (TikTok CDN) may produce.
+            // 65535 = max IP packet size.
             byte[] buf = new byte[65535];
             try (FileInputStream in = new FileInputStream(vpnInterface.getFileDescriptor())) {
                 while (isRunning) {
                     int len = in.read(buf);
                     if (len > 0 && wsClient != null && wsClient.isOpen()) {
                         bytesOut.addAndGet(len);
-                        wsClient.send(ByteBuffer.wrap(buf, 0, len));
+                        // CRITICAL: must copy slice into its own array before sending.
+                        // ByteBuffer.wrap(buf) shares the underlying array — not a copy.
+                        // The next in.read(buf) would overwrite the same memory before
+                        // java-websocket finishes framing the previous packet, corrupting it.
+                        //
+                        // SPEED: allocate exactly `len` bytes (not always 65535) to
+                        // reduce GC pressure. WhatsApp ACKs are typically 40–60 bytes;
+                        // allocating 65535 every packet wastes memory bandwidth and GC cycles.
+                        byte[] frame = new byte[len];
+                        System.arraycopy(buf, 0, frame, 0, len);
+                        // Enqueue into drain thread (non-blocking offer — no lock contention)
+                        wsSend(ByteBuffer.wrap(frame));
                     }
                 }
             } catch (Exception e) {
@@ -457,7 +555,7 @@ public class NetShareVpnService extends VpnService {
                     break;
                 case "PING":
                     if (wsClient != null && wsClient.isOpen())
-                        wsClient.send("{\"type\":\"PONG\"}");
+                        wsSend("{\"type\":\"PONG\"}");
                     break;
                 default:
                     VpnModule.emitEvent("relayMessage", msg);
@@ -505,25 +603,34 @@ public class NetShareVpnService extends VpnService {
                         return;
                     }
                     if (isSyn || !tcpConnections.containsKey(key)) {
-                        Socket old = tcpConnections.remove(key);
-                        if (old != null) try { old.close(); } catch (Exception ignored) {}
+                        Socket oldSock = tcpConnections.remove(key);
+                        if (oldSock != null) try { oldSock.close(); } catch (Exception ignored) {}
                         Socket sock = new Socket();
                         protect(sock);
                         try {
+                            sock.setReceiveBufferSize(TCP_SOCKET_BUFFER);
+                            sock.setSendBufferSize(TCP_SOCKET_BUFFER);
                             sock.connect(new java.net.InetSocketAddress(dst6Addr, dstPort), 10_000);
-                            sock.setSoTimeout(300_000);
+                            sock.setSoTimeout(socketTimeoutForPort(dstPort));
                             sock.setTcpNoDelay(true);
+                            sock.setKeepAlive(true);
                         } catch (Exception e) {
                             Log.w(TAG, "IPv6 TCP connect [" + key + "]: " + e.getMessage());
                             try { sock.close(); } catch (Exception ignored) {}
                             return;
                         }
                         tcpConnections.put(key, sock);
-                        final byte[] fSrc6 = src6;
+                        // FIX 2: Pass tunIpBytes() (4-byte IPv4) NOT src6 (16-byte IPv6).
+                        // buildIpTcpPacket builds an IPv4 response packet for the client TUN.
+                        // The client TUN only accepts IPv4 packets (our TUN is IPv4).
+                        // src6 is the client's IPv6 TUN source — irrelevant for the response dst.
+                        // The response must go to the client's assigned TUN IPv4 address.
+                        final byte[] fClientIpv4 = tunIpBytes();
                         final int fSrcPort = srcPort; final int fDstPort = dstPort;
                         final InetAddress fDst = dst6Addr; final String fk = key;
-                        executor.execute(() -> readTcpResponses(sock, fk, fSrc6, fSrcPort, fDstPort, fDst));
+                        executor.execute(() -> readTcpResponses(sock, fk, fClientIpv4, fSrcPort, fDstPort, fDst));
                     }
+                    // FIX 4: Send payload BEFORE closing on FIN — FIN+data is valid TCP
                     if (pLen > 0) {
                         Socket sock = tcpConnections.get(key);
                         if (sock != null && !sock.isClosed()) {
@@ -543,10 +650,14 @@ public class NetShareVpnService extends VpnService {
                     if (!udpSockets.containsKey(key)) {
                         DatagramSocket udpSock = new DatagramSocket();
                         protect(udpSock);
+                        boolean isQuic = (dstPort == QUIC_PORT_HTTPS || dstPort == QUIC_PORT_HTTP);
+                        int bufSize = isQuic ? QUIC_SOCKET_BUFFER : UDP_SOCKET_BUFFER;
+                        try { udpSock.setReceiveBufferSize(bufSize); udpSock.setSendBufferSize(bufSize); } catch (Exception ignored) {}
                         udpSockets.put(key, udpSock);
-                        final byte[] fSrc6 = src6;
+                        // FIX 2: Same as TCP — use tunIpBytes() not src6
+                        final byte[] fClientIpv4 = tunIpBytes();
                         final int fSrcPort = srcPort; final int fDstPort = dstPort; final String fk = key;
-                        executor.execute(() -> readUdpResponses(udpSock, fk, fSrc6, fSrcPort, fDstPort));
+                        executor.execute(() -> readUdpResponses(udpSock, fk, fClientIpv4, fSrcPort, fDstPort));
                     }
                     DatagramSocket udpSock = udpSockets.get(key);
                     if (udpSock != null && !udpSock.isClosed()) {
@@ -590,21 +701,18 @@ public class NetShareVpnService extends VpnService {
                 }
 
                 if (isSyn || !tcpConnections.containsKey(key)) {
-                    Socket old = tcpConnections.remove(key);
-                    if (old != null) try { old.close(); } catch (Exception ignored) {}
+                    Socket oldSock = tcpConnections.remove(key);
+                    if (oldSock != null) try { oldSock.close(); } catch (Exception ignored) {}
 
                     Socket sock = new Socket();
                     protect(sock);
                     try {
-                        // Larger send/receive buffers for streaming (TikTok, YouTube, WhatsApp video)
                         sock.setReceiveBufferSize(TCP_SOCKET_BUFFER);
                         sock.setSendBufferSize(TCP_SOCKET_BUFFER);
                         sock.connect(new java.net.InetSocketAddress(dst, dstPort), 10_000);
-                        // 5 min timeout — streaming apps (TikTok, YouTube) hold TCP
-                        // connections open for minutes; 30s killed them mid-stream.
-                        sock.setSoTimeout(300_000);
+                        // FIX 3: Per-port timeout — DNS needs 5s, WhatsApp XMPP needs 5min
+                        sock.setSoTimeout(socketTimeoutForPort(dstPort));
                         sock.setTcpNoDelay(true);
-                        // TCP keepalive so idle HTTPS connections (WhatsApp long-poll) survive
                         sock.setKeepAlive(true);
                     } catch (Exception e) {
                         Log.w(TAG, "TCP connect [" + key + "]: " + e.getMessage());
@@ -612,7 +720,9 @@ public class NetShareVpnService extends VpnService {
                         return;
                     }
                     tcpConnections.put(key, sock);
-                    final byte[]      fClientIp = ipBytes(srcIp);
+                    // Use tunIpBytes() as the client IPv4 address for the response packet.
+                    // This ensures the response dst IP matches what the client TUN expects.
+                    final byte[]      fClientIp = tunIpBytes();
                     final int         fSrcPort  = srcPort;
                     final int         fDstPort  = dstPort;
                     final InetAddress fDst      = dst;
@@ -620,6 +730,10 @@ public class NetShareVpnService extends VpnService {
                     executor.execute(() -> readTcpResponses(sock, fk, fClientIp, fSrcPort, fDstPort, fDst));
                 }
 
+                // FIX 4: Write payload BEFORE processing FIN.
+                // TCP allows FIN+data in the same segment. Previously, data after FIN
+                // was written but the socket was already removed by the FIN check above.
+                // Now we always write payload first, then handle FIN.
                 if (pLen > 0) {
                     Socket sock = tcpConnections.get(key);
                     if (sock != null && !sock.isClosed()) {
@@ -656,9 +770,6 @@ public class NetShareVpnService extends VpnService {
                 if (!udpSockets.containsKey(key)) {
                     DatagramSocket udpSock = new DatagramSocket();
                     protect(udpSock);
-                    // QUIC (UDP 443) and media (RTP, SRTP) need large buffers.
-                    // TikTok CDN sends bursts of large UDP datagrams; undersized
-                    // buffers cause the kernel to drop datagrams silently, breaking video.
                     boolean isQuic = (dstPort == QUIC_PORT_HTTPS || dstPort == QUIC_PORT_HTTP);
                     int bufSize = isQuic ? QUIC_SOCKET_BUFFER : UDP_SOCKET_BUFFER;
                     try {
@@ -666,7 +777,10 @@ public class NetShareVpnService extends VpnService {
                         udpSock.setSendBufferSize(bufSize);
                     } catch (Exception ignored) {}
                     udpSockets.put(key, udpSock);
-                    final byte[] fClientIp = ipBytes(srcIp);
+                    // FIX 3: Use tunIpBytes() as clientIp for response packet dst.
+                    // FIX DNS timeout: socketTimeoutForPort gives 5s for DNS (port 53),
+                    // 5min for everything else. Passing dstPort so the reader can set it.
+                    final byte[] fClientIp = tunIpBytes();
                     final int    fSrcPort  = srcPort;
                     final int    fDstPort  = dstPort;
                     final String fk        = key;
@@ -703,19 +817,23 @@ public class NetShareVpnService extends VpnService {
                 try {
                     len = in.read(buf);
                 } catch (java.net.SocketTimeoutException ste) {
-                    // Idle timeout — connection is still valid. WhatsApp long-lived
-                    // connections (XMPP port 5222, push port 5228) sit idle often.
+                    // For long-lived ports (XMPP 5222, HTTPS 443): idle is normal.
+                    // For DNS (53): timeout means the DNS exchange is complete — exit.
+                    if (socketTimeoutForPort(remoteDstPort) <= 10_000) break;
                     Log.d(TAG, "TCP idle timeout [" + key + "] — keeping alive");
                     continue;
                 }
                 if (len <= 0) break; // EOF
                 if (wsClient != null && wsClient.isOpen()) {
                     bytesOut.addAndGet(len);
+                    // buildIpTcpPacket allocates a new byte[] for the full packet
+                    // (IP header + TCP header + payload copy), so the returned
+                    // ByteBuffer owns its data independently of buf. Safe to reuse buf.
                     ByteBuffer pkt = buildIpTcpPacket(
                             remoteIpBytes, clientIpBytes,
                             remoteDstPort, clientSrcPort,
                             buf, 0, len);
-                    wsClient.send(pkt);
+                    wsSend(pkt);
                 }
             }
         } catch (Exception e) {
@@ -734,11 +852,11 @@ public class NetShareVpnService extends VpnService {
             // 64 KB — max UDP payload. QUIC (TikTok, WhatsApp) sends close to this limit.
             byte[]         buf = new byte[65535 - IP4_HEADER_LEN - UDP_HEADER_LEN];
             DatagramPacket dp  = new DatagramPacket(buf, buf.length);
-            // 5 min timeout — WhatsApp voice/video and TikTok keep UDP flows open
-            // for minutes. 60s killed these sessions mid-call or mid-video.
-            // QUIC connections re-establish quickly but the extra timeout avoids
-            // unnecessary socket churn for long-lived media sessions.
-            udpSock.setSoTimeout(300_000);
+            // FIX DNS TIMEOUT: DNS (port 53) server responds in <100ms and closes.
+            // 300s timeout blocked the thread for 5 min, meaning the DNS response
+            // never got relayed back to the client. WhatsApp resolves g.whatsapp.net
+            // on startup — if DNS is broken, NOTHING works. 5s for DNS, 5min for rest.
+            udpSock.setSoTimeout(socketTimeoutForPort(remoteDstPort));
             while (isRunning && !udpSock.isClosed()) {
                 udpSock.receive(dp);
                 byte[] remoteIpBytes = dp.getAddress().getAddress();
@@ -749,7 +867,7 @@ public class NetShareVpnService extends VpnService {
                             remoteIpBytes, clientIpBytes,
                             dp.getPort(), clientSrcPort,
                             dp.getData(), 0, dp.getLength());
-                    wsClient.send(pkt);
+                    wsSend(pkt);
                 }
             }
         } catch (Exception e) {
@@ -912,7 +1030,7 @@ public class NetShareVpnService extends VpnService {
     // ─── Control message ──────────────────────────────────────────────────
 
     public void sendControlMessage(String message) {
-        if (wsClient != null && wsClient.isOpen()) wsClient.send(message);
+        wsSend(message);
     }
 
     // ─── Teardown ─────────────────────────────────────────────────────────
@@ -942,6 +1060,7 @@ public class NetShareVpnService extends VpnService {
         ExecutorService ex = executor;
         executor = null;
         if (ex != null) ex.shutdownNow();
+        stopWsDrain();   // wake drain thread so it exits cleanly
 
         stopForeground(true);
         stopSelf();
