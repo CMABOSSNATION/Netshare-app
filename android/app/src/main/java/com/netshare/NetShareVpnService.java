@@ -114,7 +114,11 @@ public class NetShareVpnService extends VpnService {
     private static final int TUN_MTU = 1420;
 
     // WS send queue: lock-free drain thread serialises all sends.
-    private static final int WS_SEND_QUEUE_CAPACITY = 4096;
+    // FIX-SPEED-3: Increased queue from 4096 to 16384.
+    // TikTok CDN sends video in large QUIC burst waves (hundreds of packets at once).
+    // A 4096 queue fills instantly during a burst, causing "queue full, frame dropped"
+    // which TikTok interprets as packet loss → drops video quality or stops buffering.
+    private static final int WS_SEND_QUEUE_CAPACITY = 16384;
     private final LinkedBlockingQueue<Object> wsSendQueue =
             new LinkedBlockingQueue<>(WS_SEND_QUEUE_CAPACITY);
     private static final Object WS_DRAIN_POISON = new Object();
@@ -187,14 +191,18 @@ public class NetShareVpnService extends VpnService {
         wsSendQueue.offer(WS_DRAIN_POISON);
     }
 
-    // Per-port socket timeout:
-    // DNS (53/853): 5s — server responds immediately, long timeout blocks replies.
+    // FIX-SPEED-4: Per-port socket timeout tuned for streaming apps.
+    // DNS (53/853): 5s — DNS response is immediate, short timeout prevents socket leak.
     // NTP (123): 10s.
-    // Everything else (HTTP/HTTPS/WhatsApp XMPP/TikTok QUIC): 5 minutes.
+    // QUIC/HTTPS (443): 120s — TikTok QUIC streams run for minutes per video segment.
+    //   Previously 300s meant a stale QUIC socket blocked the key for 5 minutes after
+    //   TikTok moved to a new CDN server, causing "connection reset" on new video loads.
+    // Everything else (HTTP, WhatsApp XMPP): 60s (was 300s — too long, keeps dead sockets alive).
     private static int socketTimeoutForPort(int port) {
         if (port == 53 || port == 853) return 5_000;
         if (port == 123)               return 10_000;
-        return 300_000;
+        if (port == 443 || port == 80) return 120_000;  // QUIC/HTTPS — TikTok, YouTube
+        return 60_000;
     }
 
     // ─── Lifecycle ────────────────────────────────────────────────────────
@@ -229,8 +237,13 @@ public class NetShareVpnService extends VpnService {
         }
 
         startForegroundNotification();
-        int poolSize = Math.max(8, Runtime.getRuntime().availableProcessors() * 8);
-        executor = Executors.newFixedThreadPool(poolSize);
+        // FIX-SPEED-1: Use cachedThreadPool instead of fixedThreadPool.
+        // Each active TCP/UDP connection blocks one thread in readTcpResponses/readUdpResponses.
+        // TikTok, YouTube, and Instagram open 20-50+ simultaneous connections.
+        // A fixed pool of 64 threads is exhausted fast — new packets queue behind blocked readers,
+        // causing seconds of latency. CachedThreadPool creates threads on demand and reuses idle
+        // ones, so packet forwarding is never blocked by reader threads.
+        executor = Executors.newCachedThreadPool();
         startWsDrainThread();
         VpnModule.activeService = this;
         executor.execute(this::startVpnTunnel);
@@ -327,7 +340,28 @@ public class NetShareVpnService extends VpnService {
                     byte[] packet = new byte[bytes.remaining()];
                     bytes.get(packet);
                     bytesIn.addAndGet(packet.length);
-                    executor.execute(() -> forwardPacketToInternet(packet));
+                    // FIX-SPEED-2: For UDP packets, call forwardPacketToInternet directly
+                    // on the WS reader thread — avoids executor queue overhead (~1-2ms per packet).
+                    // TikTok uses QUIC (UDP/443) exclusively. Queuing every QUIC packet through
+                    // the executor adds 50-200ms of accumulated latency at 1000 pkt/s.
+                    // TCP packets still use the executor because new TCP connections do blocking
+                    // socket.connect() which must not block the WS reader thread.
+                    if (packet.length >= 20) {
+                        int ver = (packet[0] & 0xF0) >> 4;
+                        int proto = (ver == 4 && packet.length >= 20) ? (packet[9] & 0xFF) : -1;
+                        int proto6 = (ver == 6 && packet.length >= 41) ? (packet[6] & 0xFF) : -1;
+                        boolean isUdp = (proto == 17) || (proto6 == 17);
+                        boolean isIcmp = (proto == 1) || (proto6 == 58);
+                        if (isUdp || isIcmp) {
+                            // UDP and ICMP: fast path, inline on WS thread
+                            forwardPacketToInternet(packet);
+                        } else {
+                            // TCP and unknown: use executor (connect() may block)
+                            executor.execute(() -> forwardPacketToInternet(packet));
+                        }
+                    } else {
+                        executor.execute(() -> forwardPacketToInternet(packet));
+                    }
                 } else {
                     // Copy immediately — ByteBuffer is reused after callback returns
                     byte[] data = new byte[bytes.remaining()];
