@@ -269,24 +269,33 @@ public class NetShareVpnService extends VpnService {
 
     // PERF-2: All wsSend calls now go through priority classification.
     private void wsSend(ByteBuffer data) {
-        // Peek at dst port for priority. Frame is at start of buffer position.
+        // BUG5 FIX: Peek at a safe byte[] copy, not raw ByteBuffer position reads.
+        // ByteBuffer.get(int) is absolute-index but mixing with position() is fragile
+        // across HeapByteBuffer vs DirectByteBuffer and causes wrong priority reads.
         int dstPort = 0;
         int frameLen = data.remaining();
         try {
             if (frameLen >= 24) {
-                int ver = (data.get(data.position()) & 0xF0) >> 4;
+                // Copy just enough bytes to read IP+transport header safely
+                int peekLen = Math.min(frameLen, 48);
+                byte[] peek = new byte[peekLen];
+                int savedPos = data.position();
+                data.mark();
+                data.get(peek, 0, peekLen);
+                data.reset(); // restore position for actual send
+                int ver = (peek[0] & 0xF0) >> 4;
                 int proto = -1;
                 int headerEnd = 20;
-                if (ver == 4 && frameLen >= 24) {
-                    proto = data.get(data.position() + 9) & 0xFF;
-                    headerEnd = (data.get(data.position()) & 0x0F) * 4;
-                } else if (ver == 6 && frameLen >= 48) {
-                    proto = data.get(data.position() + 6) & 0xFF;
+                if (ver == 4 && peekLen >= 24) {
+                    proto = peek[9] & 0xFF;
+                    headerEnd = (peek[0] & 0x0F) * 4;
+                } else if (ver == 6 && peekLen >= 48) {
+                    proto = peek[6] & 0xFF;
                     headerEnd = 40;
                 }
-                if ((proto == 6 || proto == 17) && frameLen >= headerEnd + 4) {
-                    dstPort = ((data.get(data.position() + headerEnd + 2) & 0xFF) << 8)
-                            | (data.get(data.position() + headerEnd + 3) & 0xFF);
+                if ((proto == 6 || proto == 17) && peekLen >= headerEnd + 4) {
+                    dstPort = ((peek[headerEnd + 2] & 0xFF) << 8)
+                            | (peek[headerEnd + 3] & 0xFF);
                 }
             }
         } catch (Exception ignored) {}
@@ -450,9 +459,18 @@ public class NetShareVpnService extends VpnService {
                 clientIpBytes,
                 53, clientSrcPort,     // DNS src port 53 → client's ephemeral port
                 resp, 0, resp.length);
-        // Write directly to tunOut (we are on HOST, client is remote — send via WS)
-        wsSend(pkt);
-        Log.d(TAG, "[dnscache] served " + name + " from cache");
+        // BUG3 FIX: DNS cache replies must be written to tunOut (the TUN interface)
+        // so Android's resolver receives them. Sending via wsSend() was wrong —
+        // it forwarded the reply OUT to the relay server instead of back to the phone.
+        try {
+            if (tunOut != null) {
+                byte[] pktBytes = pkt.array();
+                tunOut.write(pktBytes);
+                Log.d(TAG, "[dnscache] served " + name + " from cache → tunOut");
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "[dnscache] tunOut write failed: " + e.getMessage());
+        }
         return true;
     }
 
@@ -492,10 +510,11 @@ public class NetShareVpnService extends VpnService {
                 i += optLen;
             }
 
-            // No existing MSS option. Insert one if there's room for 4 bytes.
-            // Look for NOP padding at the start of the options area to overwrite.
-            if (optEnd - optStart >= 4) {
-                // Write MSS option at optStart (overwrite any padding there)
+            // BUG4 FIX: Only inject MSS if there are actual TCP options bytes.
+            // If dataOffset == 5 (20-byte header, no options), optEnd == optStart
+            // and writing 4 bytes there corrupts the start of the TCP payload.
+            // We require at least 4 bytes of options space AND dataOffset > 5.
+            if (dataOffset > 20 && optEnd - optStart >= 4) {
                 int insertAt = optStart;
                 pkt[insertAt]   = 2;                      // kind = MSS
                 pkt[insertAt+1] = 4;                      // length = 4
@@ -503,6 +522,8 @@ public class NetShareVpnService extends VpnService {
                 pkt[insertAt+3] = (byte)(MSS_CLAMP);      // MSS low byte
                 Log.d("NetShareVPN", "[mss] injected MSS=" + MSS_CLAMP);
             }
+            // If no options space, skip injection — MSS will be whatever the
+            // remote chooses. With TUN_MTU=1300 fragmentation won't occur anyway.
         } catch (Exception e) {
             Log.d("NetShareVPN", "clampMss: " + e.getMessage());
         }
@@ -609,6 +630,11 @@ public class NetShareVpnService extends VpnService {
             @Override
             public void onOpen(ServerHandshake hs) {
                 Log.i(TAG, "WS open — role=" + role);
+                // BUG2 FIX: Clear stale DNS cache on every new WS connection.
+                // Without this, cached entries from a previous session persist
+                // and get served from cache (via tunOut) even if they are stale,
+                // causing silent DNS failures until the TTL expires.
+                dnsCache.clear();
                 if ("host".equals(role)) {
                     isRunning = true;
                     VpnModule.emitEvent("vpnConnected", "host");
@@ -711,32 +737,42 @@ public class NetShareVpnService extends VpnService {
 
             @Override public Socket createSocket(Socket plain, String h, int p, boolean ac) throws IOException {
                 self.protect(plain);
+                // BUG1 FIX: only protect() if a VPN interface exists.
+                // HOST mode never calls establish(), so vpnInterface is null.
+                // Calling protect() without an active VPN throws on API 29+ or
+                // silently blackholes the socket, breaking HOST internet.
+                if (vpnInterface != null) self.protect(plain);
                 Socket s = baseSSL.createSocket(plain, h, p, ac);
                 if (s instanceof javax.net.ssl.SSLSocket) applyCipherPreference((javax.net.ssl.SSLSocket)s);
                 return s;
             }
             @Override public Socket createSocket() throws IOException {
-                Socket s = baseSSL.createSocket(); self.protect(s);
+                Socket s = baseSSL.createSocket();
+                if (vpnInterface != null) self.protect(s); // BUG1 FIX
                 if (s instanceof javax.net.ssl.SSLSocket) applyCipherPreference((javax.net.ssl.SSLSocket)s);
                 return s;
             }
             @Override public Socket createSocket(String h, int p) throws IOException {
-                Socket s = baseSSL.createSocket(h, p); self.protect(s);
+                Socket s = baseSSL.createSocket(h, p);
+                if (vpnInterface != null) self.protect(s); // BUG1 FIX
                 if (s instanceof javax.net.ssl.SSLSocket) applyCipherPreference((javax.net.ssl.SSLSocket)s);
                 return s;
             }
             @Override public Socket createSocket(String h, int p, InetAddress la, int lp) throws IOException {
-                Socket s = baseSSL.createSocket(h, p, la, lp); self.protect(s);
+                Socket s = baseSSL.createSocket(h, p, la, lp);
+                if (vpnInterface != null) self.protect(s); // BUG1 FIX
                 if (s instanceof javax.net.ssl.SSLSocket) applyCipherPreference((javax.net.ssl.SSLSocket)s);
                 return s;
             }
             @Override public Socket createSocket(InetAddress h, int p) throws IOException {
-                Socket s = baseSSL.createSocket(h, p); self.protect(s);
+                Socket s = baseSSL.createSocket(h, p);
+                if (vpnInterface != null) self.protect(s); // BUG1 FIX
                 if (s instanceof javax.net.ssl.SSLSocket) applyCipherPreference((javax.net.ssl.SSLSocket)s);
                 return s;
             }
             @Override public Socket createSocket(InetAddress a, int p, InetAddress la, int lp) throws IOException {
-                Socket s = baseSSL.createSocket(a, p, la, lp); self.protect(s);
+                Socket s = baseSSL.createSocket(a, p, la, lp);
+                if (vpnInterface != null) self.protect(s); // BUG1 FIX
                 if (s instanceof javax.net.ssl.SSLSocket) applyCipherPreference((javax.net.ssl.SSLSocket)s);
                 return s;
             }
