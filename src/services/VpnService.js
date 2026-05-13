@@ -60,9 +60,9 @@ const vpnEmitter = VpnModule ? new NativeEventEmitter(VpnModule) : null;
 // Cloudflare terminates QUIC/HTTP3 at the edge; the relay itself runs behind it.
 // Set up: see relay.js header for cloudflared deployment instructions.
 export const RELAY_URL = process.env.RELAY_URL
-  || 'wss://relay.yourdomain.com/relay';           // ← Replace with your tunnel URL
+  || 'wss://netshare-relay.YOUR-SUBDOMAIN.workers.dev/relay';           // ← Replace with your tunnel URL
 export const API_URL   = process.env.API_URL
-  || 'https://relay.yourdomain.com';               // ← Same hostname, HTTPS
+  || 'https://netshare-relay.YOUR-SUBDOMAIN.workers.dev/relay';               // ← Same hostname, HTTPS
 
 // Events that are synthesised in JS (not from NativeEventEmitter)
 const LOCAL_EVENTS = new Set(['hostFailover']);
