@@ -378,25 +378,19 @@ public class NetShareVpnService extends VpnService {
                 return;
             }
 
-            Builder builder = new Builder();
-            builder.setSession("NetShare")
-                   .addAddress("10.8.0.2", 24)
-                   .addRoute("10.8.0.0", 24)
-                   .setMtu(TUN_MTU);    // PERF-1
-
-            try { builder.addDisallowedApplication(getPackageName()); } catch (Exception e) {
-                Log.w(TAG, "addDisallowedApplication: " + e.getMessage());
-            }
-
-            vpnInterface = builder.establish();
-            if (vpnInterface == null) {
-                VpnModule.emitEvent("vpnError", "Failed to establish VPN interface");
-                return;
-            }
-
-            tunOut    = new FileOutputStream(vpnInterface.getFileDescriptor());
-            isRunning = true;
-            Log.i(TAG, "CLIENT TUN placeholder established — connecting to relay via QUIC/Cloudflare");
+            // FIX-CLIENT-1: Do NOT establish a placeholder TUN before connecting.
+            // The old code built a TUN first, then tore it down in JOIN_SUCCESS.
+            // Closing vpnInterface mid-handshake killed the relay WebSocket with it,
+            // so JOIN_SUCCESS was never fully processed → connect/disconnect loop.
+            //
+            // FIX-CLIENT-2: Connect relay with vpnInterface=null so the SocketFactory
+            // always calls protect() unconditionally (same as host mode), guaranteeing
+            // the relay socket bypasses the VPN tunnel on every Android API level.
+            //
+            // FIX-CLIENT-3: isRunning stays false until JOIN_SUCCESS confirms the
+            // relay accepted us, so onClosed fires vpnError (not vpnDisconnected)
+            // if the relay rejects or times out before the TUN is built.
+            Log.i(TAG, "CLIENT — connecting to relay first, TUN will be built on JOIN_SUCCESS");
             connectToRelay();
 
         } catch (Exception e) {
@@ -437,32 +431,35 @@ public class NetShareVpnService extends VpnService {
             .socketFactory(new javax.net.SocketFactory() {
                 @Override public Socket createSocket() throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket();
-                    // BUG1 FIX: only protect() when a VPN interface is active.
-                    // HOST mode has no vpnInterface; calling protect() without one
-                    // silently blackholes the socket on API 29+.
-                    if (vpnInterface != null) self.protect(s);
+                    // FIX: Always protect() unconditionally.
+                    // Both HOST (vpnInterface always null) and CLIENT (vpnInterface null
+                    // until JOIN_SUCCESS) must protect the relay socket so it bypasses
+                    // the VPN tunnel. The old guard "if (vpnInterface != null)" meant
+                    // the client relay socket was never protected during the handshake,
+                    // allowing Android to route it into the TUN and blackhole it.
+                    self.protect(s);
                     return s;
                 }
                 @Override public Socket createSocket(String h, int p) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(h, p);
-                    if (vpnInterface != null) self.protect(s);
+                    self.protect(s);
                     return s;
                 }
                 @Override public Socket createSocket(String h, int p,
                         InetAddress la, int lp) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(h, p, la, lp);
-                    if (vpnInterface != null) self.protect(s);
+                    self.protect(s);
                     return s;
                 }
                 @Override public Socket createSocket(InetAddress h, int p) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(h, p);
-                    if (vpnInterface != null) self.protect(s);
+                    self.protect(s);
                     return s;
                 }
                 @Override public Socket createSocket(InetAddress a, int p,
                         InetAddress la, int lp) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(a, p, la, lp);
-                    if (vpnInterface != null) self.protect(s);
+                    self.protect(s);
                     return s;
                 }
             })
@@ -658,6 +655,9 @@ public class NetShareVpnService extends VpnService {
                         vpnInterface = b2.establish();
                         if (vpnInterface != null) {
                             tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
+                            // FIX-CLIENT-3: Set isRunning only now — relay confirmed,
+                            // TUN is live. onClosed before this point fires vpnError.
+                            isRunning = true;
                             startPacketReadLoop();
                         } else {
                             Log.e(TAG, "JOIN_SUCCESS: failed to rebuild TUN");
