@@ -129,7 +129,7 @@ public class NetShareVpnService extends VpnService {
 
     // QUIC-ANDROID-4: OkHttp ping interval replaces manual keepalive scheduler.
     // 15s matches the relay's QUIC-3 heartbeat interval.
-    private static final long OKHTTP_PING_INTERVAL_MS = 25_000L; /* FIX: increased to outlast CF DO alarm */
+    private static final long OKHTTP_PING_INTERVAL_MS = 15_000L;
 
     // QUIC-ANDROID-2: Singleton OkHttpClient enables connection pool reuse and
     // 0-RTT reconnects after QUIC migration.
@@ -139,9 +139,9 @@ public class NetShareVpnService extends VpnService {
         if (sharedHttpClient == null) {
             OkHttpClient.Builder builder = new OkHttpClient.Builder()
                 .pingInterval(OKHTTP_PING_INTERVAL_MS, TimeUnit.MILLISECONDS)
-                .connectTimeout(30, TimeUnit.SECONDS) /* FIX: increased for slow mobile */
+                .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(0,  TimeUnit.MILLISECONDS)  // no read timeout for WS
-                .writeTimeout(30, TimeUnit.SECONDS) /* FIX: increased for slow mobile */;
+                .writeTimeout(15, TimeUnit.SECONDS);
 
             // QUIC-ANDROID-1: Request HTTP/3 protocol negotiation.
             // OkHttp negotiates via Alt-Svc from Cloudflare's initial HTTP response.
@@ -334,12 +334,12 @@ public class NetShareVpnService extends VpnService {
         if (intent == null) {
             Log.w(TAG, "onStartCommand: null intent, stopping");
             stopSelf();
-            return START_STICKY;
+            return START_NOT_STICKY;
         }
 
         if ("STOP_VPN".equals(intent.getAction())) {
             stopVpnTunnelFromUser();
-            return START_STICKY;
+            return START_NOT_STICKY;
         }
 
         relayUrl    = intent.getStringExtra("RELAY_URL");
@@ -365,7 +365,7 @@ public class NetShareVpnService extends VpnService {
         VpnModule.activeService = this;
         executor.execute(this::startVpnTunnel);
 
-        return START_STICKY; // FIX: keep service alive
+        return START_NOT_STICKY;
     }
 
     // ─── Tunnel setup ─────────────────────────────────────────────────────
@@ -378,19 +378,25 @@ public class NetShareVpnService extends VpnService {
                 return;
             }
 
-            // FIX-CLIENT-1: Do NOT establish a placeholder TUN before connecting.
-            // The old code built a TUN first, then tore it down in JOIN_SUCCESS.
-            // Closing vpnInterface mid-handshake killed the relay WebSocket with it,
-            // so JOIN_SUCCESS was never fully processed → connect/disconnect loop.
-            //
-            // FIX-CLIENT-2: Connect relay with vpnInterface=null so the SocketFactory
-            // always calls protect() unconditionally (same as host mode), guaranteeing
-            // the relay socket bypasses the VPN tunnel on every Android API level.
-            //
-            // FIX-CLIENT-3: isRunning stays false until JOIN_SUCCESS confirms the
-            // relay accepted us, so onClosed fires vpnError (not vpnDisconnected)
-            // if the relay rejects or times out before the TUN is built.
-            Log.i(TAG, "CLIENT — connecting to relay first, TUN will be built on JOIN_SUCCESS");
+            Builder builder = new Builder();
+            builder.setSession("NetShare")
+                   .addAddress("10.8.0.2", 24)
+                   .addRoute("10.8.0.0", 24)
+                   .setMtu(TUN_MTU);    // PERF-1
+
+            try { builder.addDisallowedApplication(getPackageName()); } catch (Exception e) {
+                Log.w(TAG, "addDisallowedApplication: " + e.getMessage());
+            }
+
+            vpnInterface = builder.establish();
+            if (vpnInterface == null) {
+                VpnModule.emitEvent("vpnError", "Failed to establish VPN interface");
+                return;
+            }
+
+            tunOut    = new FileOutputStream(vpnInterface.getFileDescriptor());
+            isRunning = true;
+            Log.i(TAG, "CLIENT TUN placeholder established — connecting to relay via QUIC/Cloudflare");
             connectToRelay();
 
         } catch (Exception e) {
@@ -431,35 +437,32 @@ public class NetShareVpnService extends VpnService {
             .socketFactory(new javax.net.SocketFactory() {
                 @Override public Socket createSocket() throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket();
-                    // FIX: Always protect() unconditionally.
-                    // Both HOST (vpnInterface always null) and CLIENT (vpnInterface null
-                    // until JOIN_SUCCESS) must protect the relay socket so it bypasses
-                    // the VPN tunnel. The old guard "if (vpnInterface != null)" meant
-                    // the client relay socket was never protected during the handshake,
-                    // allowing Android to route it into the TUN and blackhole it.
-                    self.protect(s);
+                    // BUG1 FIX: only protect() when a VPN interface is active.
+                    // HOST mode has no vpnInterface; calling protect() without one
+                    // silently blackholes the socket on API 29+.
+                    if (vpnInterface != null) self.protect(s);
                     return s;
                 }
                 @Override public Socket createSocket(String h, int p) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(h, p);
-                    self.protect(s);
+                    if (vpnInterface != null) self.protect(s);
                     return s;
                 }
                 @Override public Socket createSocket(String h, int p,
                         InetAddress la, int lp) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(h, p, la, lp);
-                    self.protect(s);
+                    if (vpnInterface != null) self.protect(s);
                     return s;
                 }
                 @Override public Socket createSocket(InetAddress h, int p) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(h, p);
-                    self.protect(s);
+                    if (vpnInterface != null) self.protect(s);
                     return s;
                 }
                 @Override public Socket createSocket(InetAddress a, int p,
                         InetAddress la, int lp) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(a, p, la, lp);
-                    self.protect(s);
+                    if (vpnInterface != null) self.protect(s);
                     return s;
                 }
             })
@@ -642,22 +645,60 @@ public class NetShareVpnService extends VpnService {
                         Builder b2 = new Builder();
                         b2.setSession("NetShare")
                           .addAddress(assignedTunIp, 24)
+                          // Route all IPv4 and IPv6 through TUN
                           .addRoute("0.0.0.0", 0)
                           .addRoute("::", 0)
-                          .addDnsServer("8.8.8.8")
-                          .addDnsServer("8.8.4.4")
+                          // DNS: Cloudflare primary, Google fallback (both IPv4 + IPv6)
                           .addDnsServer("1.1.1.1")
                           .addDnsServer("1.0.0.1")
-                          .addDnsServer("2001:4860:4860::8888")
+                          .addDnsServer("8.8.8.8")
+                          .addDnsServer("8.8.4.4")
                           .addDnsServer("2606:4700:4700::1111")
-                          .setMtu(TUN_MTU);   // PERF-1
+                          .addDnsServer("2001:4860:4860::8888")
+                          .setMtu(TUN_MTU);
+                        // Exclude our own app from the tunnel
                         try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
+                        // FIX-TIKTOK-WHATSAPP: Exclude apps that rely heavily on QUIC/UDP-443.
+                        // Our WebSocket tunnel is TCP-based; QUIC packets (UDP port 443) that
+                        // enter the TUN cannot be reliably reassembled and forwarded at speed,
+                        // causing TikTok video and WhatsApp calls to stall or drop.
+                        // Excluding these apps forces them to use the host's direct connection
+                        // (same WiFi/data) while still routing all other client traffic through
+                        // the tunnel. Remove any app from this list if you want to force it
+                        // through the tunnel instead.
+                        String[] quicHeavyApps = {
+                            // TikTok family
+                            "com.zhiliaoapp.musically",
+                            "com.ss.android.ugc.trill",
+                            // WhatsApp family
+                            "com.whatsapp",
+                            "com.whatsapp.w4b",
+                            // Instagram (also uses QUIC for Reels/Stories)
+                            "com.instagram.android",
+                            // YouTube (QUIC for video streaming)
+                            "com.google.android.youtube",
+                            // Google Meet / Duo
+                            "com.google.android.apps.meetings",
+                            "com.google.android.apps.tachyon",
+                            // Telegram voice/video
+                            "org.telegram.messenger",
+                            "org.thunderdog.challegram",
+                            // Snapchat
+                            "com.snapchat.android",
+                            // Facebook / Messenger
+                            "com.facebook.katana",
+                            "com.facebook.orca",
+                            // Twitter/X video
+                            "com.twitter.android",
+                            "com.x.android",
+                        };
+                        for (String pkg : quicHeavyApps) {
+                            try { b2.addDisallowedApplication(pkg); }
+                            catch (Exception ignored) {}
+                        }
                         vpnInterface = b2.establish();
                         if (vpnInterface != null) {
                             tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
-                            // FIX-CLIENT-3: Set isRunning only now — relay confirmed,
-                            // TUN is live. onClosed before this point fires vpnError.
-                            isRunning = true;
                             startPacketReadLoop();
                         } else {
                             Log.e(TAG, "JOIN_SUCCESS: failed to rebuild TUN");
