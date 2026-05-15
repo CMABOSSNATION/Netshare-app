@@ -150,11 +150,20 @@ export default function HomeScreen() {
       }, 4000);
     });
 
-    // FIX 2: vpnDisconnected always resets to idle
+    // FIXED: vpnDisconnected triggers reconnect instead of idle
     const unVpnDisconnected = vpnService.on('vpnDisconnected', (reason) => {
-      log(`Disconnected: ${reason || 'connection closed'}`);
+      log(`Disconnected: ${reason || 'connection closed'} — reconnecting...`);
       clearTimers();
-      setIdle();
+      setConnecting();
+    });
+
+    const unReconnectFailed = vpnService.on('reconnectFailed', (msg) => {
+      log(`Reconnect failed: ${msg}`);
+      clearTimers();
+      setError(msg || 'Connection lost');
+      setTimeout(() => {
+        if (useStore.getState().status === 'error') setIdle();
+      }, 4000);
     });
 
     const unClientConnected = vpnService.on('clientConnected', (clientId) => {
@@ -182,6 +191,7 @@ export default function HomeScreen() {
       unJoinError?.();
       unVpnError?.();
       unVpnDisconnected?.();
+      unReconnectFailed?.();
       unClientConnected?.();
       unClientDisconnected?.();
       unHostLeft?.();
