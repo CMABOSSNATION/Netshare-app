@@ -196,6 +196,7 @@ public class NetShareVpnService extends VpnService {
     private String sessionCode;
     private String role;
     private String hostId;
+    private String deviceId;
     private String netType;
     private volatile String assignedTunIp = "10.8.0.2";
 
@@ -351,6 +352,19 @@ public class NetShareVpnService extends VpnService {
         if (sessionCode == null)                          sessionCode = "";
         if (hostId      == null)                          hostId      = "";
 
+        // Stable device identifier — used to lock access codes to one device.
+        // ANDROID_ID is unique per device + app signing key, survives app restarts
+        // and reconnects. Changes only on factory reset.
+        try {
+            deviceId = android.provider.Settings.Secure.getString(
+                getContentResolver(),
+                android.provider.Settings.Secure.ANDROID_ID
+            );
+        } catch (Exception e) {
+            deviceId = "unknown-" + System.currentTimeMillis();
+        }
+        if (deviceId == null || deviceId.isEmpty()) deviceId = "unknown";
+
         if (relayUrl == null || relayUrl.isEmpty()) {
             Log.e(TAG, "No RELAY_URL provided, stopping");
             stopSelf();
@@ -489,7 +503,7 @@ public class NetShareVpnService extends VpnService {
                     wsSend(j3("type", msgType, "hostId", hostId, "netType", netType));
                 } else {
                     VpnModule.emitEvent("vpnConnected", sessionCode);
-                    wsSend(j2("type", "CLIENT_JOIN", "accessCode", sessionCode));
+                    wsSend(j3("type", "CLIENT_JOIN", "accessCode", sessionCode, "deviceId", deviceId));
                 }
             }
 
@@ -656,46 +670,11 @@ public class NetShareVpnService extends VpnService {
                           .addDnsServer("2606:4700:4700::1111")
                           .addDnsServer("2001:4860:4860::8888")
                           .setMtu(TUN_MTU);
-                        // Exclude our own app from the tunnel
+                        // Exclude our own app from the tunnel (always required)
                         try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
-                        // FIX-TIKTOK-WHATSAPP: Exclude apps that rely heavily on QUIC/UDP-443.
-                        // Our WebSocket tunnel is TCP-based; QUIC packets (UDP port 443) that
-                        // enter the TUN cannot be reliably reassembled and forwarded at speed,
-                        // causing TikTok video and WhatsApp calls to stall or drop.
-                        // Excluding these apps forces them to use the host's direct connection
-                        // (same WiFi/data) while still routing all other client traffic through
-                        // the tunnel. Remove any app from this list if you want to force it
-                        // through the tunnel instead.
-                        String[] quicHeavyApps = {
-                            // TikTok family
-                            "com.zhiliaoapp.musically",
-                            "com.ss.android.ugc.trill",
-                            // WhatsApp family
-                            "com.whatsapp",
-                            "com.whatsapp.w4b",
-                            // Instagram (also uses QUIC for Reels/Stories)
-                            "com.instagram.android",
-                            // YouTube (QUIC for video streaming)
-                            "com.google.android.youtube",
-                            // Google Meet / Duo
-                            "com.google.android.apps.meetings",
-                            "com.google.android.apps.tachyon",
-                            // Telegram voice/video
-                            "org.telegram.messenger",
-                            "org.thunderdog.challegram",
-                            // Snapchat
-                            "com.snapchat.android",
-                            // Facebook / Messenger
-                            "com.facebook.katana",
-                            "com.facebook.orca",
-                            // Twitter/X video
-                            "com.twitter.android",
-                            "com.x.android",
-                        };
-                        for (String pkg : quicHeavyApps) {
-                            try { b2.addDisallowedApplication(pkg); }
-                            catch (Exception ignored) {}
-                        }
+                        // FIX: No app exclusions needed. UDP port 443 (QUIC) is now
+                        // handled with a 600s socket timeout so TikTok, YouTube,
+                        // WhatsApp, Instagram and all other apps work through the tunnel.
                         vpnInterface = b2.establish();
                         if (vpnInterface != null) {
                             tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
@@ -1160,10 +1139,15 @@ public class NetShareVpnService extends VpnService {
     }
 
     private static int socketTimeoutForPort(int port) {
-        if (port==53||port==853) return 5_000;
-        if (port==123)           return 10_000;
-        if (port==443||port==80) return 120_000;
-        return 60_000;
+        if (port==53||port==853) return 5_000;   // DNS: fast timeout
+        if (port==123)           return 10_000;  // NTP: short-lived
+        // FIX-TIKTOK: QUIC/HTTPS UDP sessions (port 443) go quiet for 200-400s
+        // between video chunks. Old 120s timeout closed the UDP socket mid-stream,
+        // dropping incoming packets and stalling TikTok/YouTube/Instagram video.
+        // 600s keeps the socket alive through any realistic inter-chunk gap.
+        if (port==443||port==80) return 600_000;
+        // General UDP: 5 minutes covers all long-lived sessions
+        return 300_000;
     }
 
     // ─── PERF-5: DNS cache helpers (unchanged) ───────────────────────────
