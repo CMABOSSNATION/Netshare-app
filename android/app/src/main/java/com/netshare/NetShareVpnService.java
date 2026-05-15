@@ -129,7 +129,7 @@ public class NetShareVpnService extends VpnService {
 
     // QUIC-ANDROID-4: OkHttp ping interval replaces manual keepalive scheduler.
     // 15s matches the relay's QUIC-3 heartbeat interval.
-    private static final long OKHTTP_PING_INTERVAL_MS = 25_000L; // FIX: increased to outlast CF DO alarm
+    private static final long OKHTTP_PING_INTERVAL_MS = 25_000L; /* FIX: increased to outlast CF DO alarm */
 
     // QUIC-ANDROID-2: Singleton OkHttpClient enables connection pool reuse and
     // 0-RTT reconnects after QUIC migration.
@@ -139,9 +139,9 @@ public class NetShareVpnService extends VpnService {
         if (sharedHttpClient == null) {
             OkHttpClient.Builder builder = new OkHttpClient.Builder()
                 .pingInterval(OKHTTP_PING_INTERVAL_MS, TimeUnit.MILLISECONDS)
-                .connectTimeout(30, TimeUnit.SECONDS) // FIX: increased for slow mobile
+                .connectTimeout(30, TimeUnit.SECONDS) /* FIX: increased for slow mobile */
                 .readTimeout(0,  TimeUnit.MILLISECONDS)  // no read timeout for WS
-                .writeTimeout(30, TimeUnit.SECONDS) // FIX: increased for slow mobile;
+                .writeTimeout(30, TimeUnit.SECONDS) /* FIX: increased for slow mobile */;
 
             // QUIC-ANDROID-1: Request HTTP/3 protocol negotiation.
             // OkHttp negotiates via Alt-Svc from Cloudflare's initial HTTP response.
@@ -334,12 +334,12 @@ public class NetShareVpnService extends VpnService {
         if (intent == null) {
             Log.w(TAG, "onStartCommand: null intent, stopping");
             stopSelf();
-            return START_REDELIVER_INTENT;
+            return START_STICKY;
         }
 
         if ("STOP_VPN".equals(intent.getAction())) {
             stopVpnTunnelFromUser();
-            return START_REDELIVER_INTENT;
+            return START_STICKY;
         }
 
         relayUrl    = intent.getStringExtra("RELAY_URL");
