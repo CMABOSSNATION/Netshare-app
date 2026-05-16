@@ -145,7 +145,7 @@ class FacebookVpnService {
     this.hostId = await this.getHostId();
     this.role = 'host'; this.netType = netType;
     this._stopping = false; this.reconnectTries = 0;
-    await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, netType, '', JSON.stringify(FACEBOOK_PACKAGES));
+    await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, netType, '');
   }
 
   async startAsClient(accessCode) {
@@ -157,7 +157,7 @@ class FacebookVpnService {
     const deviceId = await this.getDeviceId();
     this.role = 'client'; this.accessCode = accessCode.toUpperCase();
     this.currentCode = null; this._stopping = false; this.reconnectTries = 0;
-    await VpnModule.startVpn(RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId, JSON.stringify(FACEBOOK_PACKAGES));
+    await VpnModule.startVpn(RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId);
   }
 
   _scheduleReconnect() {
@@ -169,8 +169,8 @@ class FacebookVpnService {
       try {
         if (this._stopping) return;
         const deviceId = await this.getDeviceId();
-        if (this.role === 'host') await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, this.netType, '', JSON.stringify(FACEBOOK_PACKAGES));
-        else if (this.role === 'client' && this.accessCode) await VpnModule.startVpn(RELAY_URL, this.accessCode, 'client', '', '', deviceId, JSON.stringify(FACEBOOK_PACKAGES));
+        if (this.role === 'host') await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, this.netType, '');
+        else if (this.role === 'client' && this.accessCode) await VpnModule.startVpn(RELAY_URL, this.accessCode, 'client', '', '', deviceId);
       } catch (e) { console.warn(`[${APP_NAME}Service] Reconnect failed:`, e?.message); this._scheduleReconnect(); }
     }, delay);
   }

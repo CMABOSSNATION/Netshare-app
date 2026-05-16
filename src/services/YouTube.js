@@ -119,7 +119,7 @@ class YouTubeVpnService {
   async startAsHost(netType = 'WiFi') {
     const granted = await this.prepare(); if (!granted) throw new Error('VPN permission denied by user');
     this.hostId = await this.getHostId(); this.role = 'host'; this.netType = netType; this._stopping = false; this.reconnectTries = 0;
-    await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, netType, '', JSON.stringify(YOUTUBE_PACKAGES));
+    await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, netType, '');
   }
 
   async startAsClient(accessCode) {
@@ -128,7 +128,7 @@ class YouTubeVpnService {
     const granted = await this.prepare(); if (!granted) throw new Error('VPN permission denied by user');
     const deviceId = await this.getDeviceId();
     this.role = 'client'; this.accessCode = accessCode.toUpperCase(); this.currentCode = null; this._stopping = false; this.reconnectTries = 0;
-    await VpnModule.startVpn(RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId, JSON.stringify(YOUTUBE_PACKAGES));
+    await VpnModule.startVpn(RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId);
   }
 
   _scheduleReconnect() {
@@ -139,8 +139,8 @@ class YouTubeVpnService {
       try {
         if (this._stopping) return;
         const deviceId = await this.getDeviceId();
-        if (this.role === 'host') await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, this.netType, '', JSON.stringify(YOUTUBE_PACKAGES));
-        else if (this.role === 'client' && this.accessCode) await VpnModule.startVpn(RELAY_URL, this.accessCode, 'client', '', '', deviceId, JSON.stringify(YOUTUBE_PACKAGES));
+        if (this.role === 'host') await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, this.netType, '');
+        else if (this.role === 'client' && this.accessCode) await VpnModule.startVpn(RELAY_URL, this.accessCode, 'client', '', '', deviceId);
       } catch (e) { console.warn(`[${APP_NAME}Service] Reconnect failed:`, e?.message); this._scheduleReconnect(); }
     }, delay);
   }
