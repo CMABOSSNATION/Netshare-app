@@ -19,7 +19,7 @@
       QUERIES BLOCK — required on Android 11+ (API 30+) for package visibility.
       Without this, PackageManager.getPackageInfo() and addAllowedApplication()
       cannot see these packages, so the VPN builder silently ignores them and
-      ALL traffic gets tunneled instead of only these 7 apps.
+      ALL traffic gets tunneled instead of only these apps.
 
       Each <package> entry matches one of the package names used in
       NetShareVpnService.java's TUNNEL_APPS array.
@@ -69,6 +69,15 @@
         <package android:name="com.twitter.android.lite" />
         <package android:name="com.X.android" />
         <package android:name="com.twitter.tweetdeck" />
+
+        <!-- Chrome — ADDED -->
+        <package android:name="com.android.chrome" />
+        <package android:name="com.chrome.beta" />
+        <package android:name="com.chrome.dev" />
+        <package android:name="com.chrome.canary" />
+
+        <!-- Play Store — ADDED (needed for app update checks while tunneled) -->
+        <package android:name="com.android.vending" />
 
         <!-- System support (WebView + Play Services) -->
         <package android:name="com.google.android.webview" />
