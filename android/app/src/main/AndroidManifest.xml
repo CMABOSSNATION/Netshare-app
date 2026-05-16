@@ -3,11 +3,79 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!--
+      FOREGROUND_SERVICE_DATA_SYNC is required on Android 14+ for foreground
+      services that transfer data (our VPN tunnel). Without it the service is
+      killed immediately on API 34+ devices.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+
+    <!--
+      QUERIES BLOCK — required on Android 11+ (API 30+) for package visibility.
+      Without this, PackageManager.getPackageInfo() and addAllowedApplication()
+      cannot see these packages, so the VPN builder silently ignores them and
+      ALL traffic gets tunneled instead of only these 7 apps.
+
+      Each <package> entry matches one of the package names used in
+      NetShareVpnService.java's TUNNEL_APPS array.
+    -->
+    <queries>
+        <!-- TikTok -->
+        <package android:name="com.zhiliaoapp.musically" />
+        <package android:name="com.ss.android.ugc.trill" />
+        <package android:name="com.ss.android.ugc.trill.go" />
+        <package android:name="com.ss.android.ugc.aweme" />
+        <package android:name="com.bytedance.tiktok" />
+        <package android:name="com.tiktok.android" />
+
+        <!-- WhatsApp -->
+        <package android:name="com.whatsapp" />
+        <package android:name="com.whatsapp.w4b" />
+        <package android:name="com.whatsapp.beta" />
+        <package android:name="com.whatsapp.messenger" />
+
+        <!-- YouTube -->
+        <package android:name="com.google.android.youtube" />
+        <package android:name="com.google.android.apps.youtube.music" />
+        <package android:name="com.google.android.apps.youtube.kids" />
+        <package android:name="com.google.android.apps.youtube.unplugged" />
+
+        <!-- Facebook -->
+        <package android:name="com.facebook.katana" />
+        <package android:name="com.facebook.lite" />
+        <package android:name="com.facebook.android" />
+        <package android:name="com.facebook.mlite" />
+        <package android:name="com.facebook.orca" />
+        <package android:name="com.facebook.work" />
+
+        <!-- Instagram -->
+        <package android:name="com.instagram.android" />
+        <package android:name="com.instagram.lite" />
+        <package android:name="com.burbn.instagram" />
+
+        <!-- Spotify -->
+        <package android:name="com.spotify.music" />
+        <package android:name="com.spotify.lite" />
+        <package android:name="com.spotify.tv.android" />
+        <package android:name="com.spotify.podcasts" />
+
+        <!-- Twitter / X -->
+        <package android:name="com.twitter.android" />
+        <package android:name="com.twitter.android.lite" />
+        <package android:name="com.X.android" />
+        <package android:name="com.twitter.tweetdeck" />
+
+        <!-- System support (WebView + Play Services) -->
+        <package android:name="com.google.android.webview" />
+        <package android:name="com.android.webview" />
+        <package android:name="com.google.android.gms" />
+        <package android:name="com.google.android.gsf" />
+    </queries>
 
     <application
         android:name=".MainApplication"
