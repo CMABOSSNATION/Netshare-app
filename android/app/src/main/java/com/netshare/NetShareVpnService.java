@@ -656,25 +656,118 @@ public class NetShareVpnService extends VpnService {
                         if (tunOut       != null) { try { tunOut.close();       } catch (Exception ignored) {} tunOut       = null; }
                         if (vpnInterface != null) { try { vpnInterface.close(); } catch (Exception ignored) {} vpnInterface = null; }
 
+                        // ═══════════════════════════════════════════════════════════
+                        // ALLOWED APPS — only these apps are routed through the shared
+                        // internet tunnel. Every other app on the device bypasses it
+                        // completely and uses the device's own connection as normal.
+                        //
+                        // This is the most reliable approach for these apps because:
+                        //   • TikTok / YouTube use QUIC (UDP 443) which needs clean
+                        //     end-to-end handling — addAllowedApplication() gives that.
+                        //   • WhatsApp uses DTLS + SRTP for calls — same reason.
+                        //   • Facebook / Instagram use HTTP/2 + QUIC aggressively.
+                        //   • Chrome / Google apps use QUIC by default.
+                        //   • Spotify uses its own UDP CDN layer.
+                        //   • Twitter/X uses HTTP/2 with long-poll connections.
+                        //
+                        // Multiple package names are listed per app to cover all
+                        // regional variants, Lite versions, and alternate distributions.
+                        // Android silently skips any package that is not installed.
+                        // ═══════════════════════════════════════════════════════════
+                        final String[] TUNNEL_APPS = {
+
+                            // ── TikTok (all regions & variants) ──────────────────
+                            "com.zhiliaoapp.musically",          // TikTok global
+                            "com.ss.android.ugc.trill",          // TikTok — SEA / some regions
+                            "com.ss.android.ugc.aweme",          // Douyin (TikTok China)
+                            "com.bytedance.tiktok",              // TikTok alternate
+                            "com.tiktok.android",                // TikTok alternate pkg
+
+                            // ── WhatsApp (all variants) ───────────────────────────
+                            "com.whatsapp",                      // WhatsApp standard
+                            "com.whatsapp.w4b",                  // WhatsApp Business
+                            "com.whatsapp.beta",                 // WhatsApp Beta
+
+                            // ── YouTube (all variants) ────────────────────────────
+                            "com.google.android.youtube",        // YouTube
+                            "com.google.android.apps.youtube.music", // YouTube Music
+                            "com.google.android.apps.youtube.kids",  // YouTube Kids
+                            "com.google.android.apps.youtube.unplugged", // YouTube TV
+
+                            // ── Instagram (all variants) ──────────────────────────
+                            "com.instagram.android",             // Instagram
+                            "com.instagram.lite",                // Instagram Lite
+                            "com.burbn.instagram",               // Instagram alternate
+
+                            // ── Facebook (all variants) ───────────────────────────
+                            "com.facebook.katana",               // Facebook main
+                            "com.facebook.lite",                 // Facebook Lite
+                            "com.facebook.android",              // Facebook alternate
+                            "com.facebook.mlite",                // Messenger Lite
+                            "com.facebook.orca",                 // Messenger
+                            "com.facebook.work",                 // Workplace by Meta
+
+                            // ── Twitter / X (all variants) ───────────────────────
+                            "com.twitter.android",               // Twitter / X
+                            "com.twitter.android.lite",          // Twitter Lite
+                            "com.X.android",                     // X (new package name)
+                            "com.twitter.tweetdeck",             // TweetDeck
+
+                            // ── Spotify (all variants) ────────────────────────────
+                            "com.spotify.music",                 // Spotify
+                            "com.spotify.lite",                  // Spotify Lite
+                            "com.spotify.tv.android",            // Spotify for Android TV
+                            "com.spotify.podcasts",              // Spotify Podcasts
+
+                            // ── Chrome & Google browsers (all variants) ───────────
+                            "com.android.chrome",                // Chrome stable
+                            "com.chrome.beta",                   // Chrome Beta
+                            "com.chrome.dev",                    // Chrome Dev
+                            "com.chrome.canary",                 // Chrome Canary
+                            "com.google.android.apps.chrome",    // Chrome (some OEM builds)
+
+                            // ── Google core services (needed for Chrome & YouTube) ─
+                            "com.google.android.gms",            // Google Play Services
+                            "com.google.android.gsf",            // Google Services Framework
+                            "com.google.android.googlequicksearchbox", // Google Search / Assistant
+                            "com.google.android.gm",             // Gmail (Google login flows)
+                        };
+
                         Builder b2 = new Builder();
                         b2.setSession("NetShare")
                           .addAddress(assignedTunIp, 24)
-                          // Route all IPv4 and IPv6 through TUN
-                          .addRoute("0.0.0.0", 0)
-                          .addRoute("::", 0)
-                          // DNS: Cloudflare primary, Google fallback (both IPv4 + IPv6)
+                          .addRoute("0.0.0.0", 0)         // Route all IPv4
+                          .addRoute("::", 0)               // Route all IPv6
+                          // DNS: Cloudflare DoH primary + Google fallback
                           .addDnsServer("1.1.1.1")
                           .addDnsServer("1.0.0.1")
                           .addDnsServer("8.8.8.8")
                           .addDnsServer("8.8.4.4")
-                          .addDnsServer("2606:4700:4700::1111")
-                          .addDnsServer("2001:4860:4860::8888")
+                          .addDnsServer("2606:4700:4700::1111")  // Cloudflare IPv6
+                          .addDnsServer("2001:4860:4860::8888")  // Google IPv6
                           .setMtu(TUN_MTU);
-                        // Exclude our own app from the tunnel (always required)
+
+                        // Always exclude the NetShare relay app itself — must never
+                        // loop its own traffic through the tunnel it controls.
                         try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
-                        // FIX: No app exclusions needed. UDP port 443 (QUIC) is now
-                        // handled with a 600s socket timeout so TikTok, YouTube,
-                        // WhatsApp, Instagram and all other apps work through the tunnel.
+
+                        // Allow only the listed apps through the tunnel.
+                        // addAllowedApplication() + addRoute(0.0.0.0,0) means:
+                        //   listed apps  → tunnel → host's internet
+                        //   all others   → device's own direct connection
+                        int allowedCount = 0;
+                        for (String pkg : TUNNEL_APPS) {
+                            try {
+                                b2.addAllowedApplication(pkg);
+                                allowedCount++;
+                                Log.d(TAG, "[tunnel] Allowed: " + pkg);
+                            } catch (Exception e) {
+                                // App not installed — safe to skip, no crash
+                                Log.v(TAG, "[tunnel] Not installed (skip): " + pkg);
+                            }
+                        }
+                        Log.i(TAG, "[tunnel] " + allowedCount + " apps routed through shared internet");
+
                         vpnInterface = b2.establish();
                         if (vpnInterface != null) {
                             tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
