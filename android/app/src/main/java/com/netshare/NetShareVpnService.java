@@ -158,6 +158,18 @@ public class NetShareVpnService extends VpnService {
     private String netType;
     private volatile String assignedTunIp = "10.8.0.2";
 
+    // APP_PACKAGES: JSON array of package names sent by the JS service file
+    // (TikTok.js, WhatsApp.js, etc.) via the APP_PACKAGES intent extra.
+    // When present, only those packages are allowed through the tunnel.
+    // When absent (old builds), falls back to the hardcoded TUNNEL_APPS list.
+    private String[] appPackages = null;
+
+    // APP_PORT_TIMEOUTS: JSON object of port→timeout(ms) sent by the JS service.
+    // Each app service defines its own per-port timeouts (e.g. WhatsApp needs
+    // 900s for FCM port 5228, TikTok needs 600s for QUIC port 443).
+    // When absent, the built-in socketTimeoutForPort() defaults apply.
+    private java.util.Map<Integer, Integer> appPortTimeouts = null;
+
     private final Map<String, Socket>         tcpConnections = new ConcurrentHashMap<>();
     private final Map<String, DatagramSocket> udpSockets     = new ConcurrentHashMap<>();
     private final Map<String, java.util.concurrent.atomic.AtomicInteger> quicSrcPorts
@@ -333,6 +345,56 @@ public class NetShareVpnService extends VpnService {
             Log.e(TAG, "No RELAY_URL provided, stopping");
             stopSelf();
             return START_NOT_STICKY;
+        }
+
+        // ── Read dynamic package list from JS service file ────────────────
+        // Each JS service (TikTok.js, WhatsApp.js, etc.) passes a JSON array
+        // of its own package names as the APP_PACKAGES intent extra.
+        // Example: '["com.whatsapp","com.whatsapp.w4b","com.google.android.gms"]'
+        // If absent or malformed, appPackages stays null → fallback to TUNNEL_APPS.
+        String appPackagesJson = intent.getStringExtra("APP_PACKAGES");
+        if (appPackagesJson != null && !appPackagesJson.isEmpty()) {
+            try {
+                org.json.JSONArray arr = new org.json.JSONArray(appPackagesJson);
+                appPackages = new String[arr.length()];
+                for (int pi = 0; pi < arr.length(); pi++) {
+                    appPackages[pi] = arr.getString(pi);
+                }
+                Log.i(TAG, "[APP_PACKAGES] loaded " + appPackages.length + " packages from JS service");
+            } catch (Exception e) {
+                Log.w(TAG, "[APP_PACKAGES] parse failed, using fallback list: " + e.getMessage());
+                appPackages = null;
+            }
+        } else {
+            appPackages = null;
+            Log.d(TAG, "[APP_PACKAGES] not provided — using built-in TUNNEL_APPS fallback");
+        }
+
+        // ── Read dynamic port timeouts from JS service file ───────────────
+        // Each JS service passes its port timeout map as APP_PORT_TIMEOUTS.
+        // Example: '{"443":600000,"5228":900000,"3478":600000,"53":5000}'
+        // Keys are port numbers (as strings), values are timeouts in milliseconds.
+        // Merged with built-in defaults — JS values take priority.
+        String appPortsJson = intent.getStringExtra("APP_PORT_TIMEOUTS");
+        if (appPortsJson != null && !appPortsJson.isEmpty()) {
+            try {
+                org.json.JSONObject obj = new org.json.JSONObject(appPortsJson);
+                appPortTimeouts = new java.util.HashMap<>();
+                java.util.Iterator<String> keys = obj.keys();
+                while (keys.hasNext()) {
+                    String portStr = keys.next();
+                    int portNum    = Integer.parseInt(portStr);
+                    int timeoutMs  = obj.getInt(portStr);
+                    appPortTimeouts.put(portNum, timeoutMs);
+                }
+                Log.i(TAG, "[APP_PORT_TIMEOUTS] loaded " + appPortTimeouts.size() + " port rules from JS service");
+            } catch (Exception e) {
+                Log.w(TAG, "[APP_PORT_TIMEOUTS] parse failed, using built-in timeouts: " + e.getMessage());
+                appPortTimeouts = null;
+            }
+        } else {
+            appPortTimeouts = null;
+            Log.d(TAG, "[APP_PORT_TIMEOUTS] not provided — using built-in socketTimeoutForPort()");
         }
 
         startForegroundNotification();
@@ -604,77 +666,58 @@ public class NetShareVpnService extends VpnService {
                         if (vpnInterface != null) { try { vpnInterface.close(); } catch (Exception ignored) {} vpnInterface = null; }
 
                         // ═══════════════════════════════════════════════════════════
-                        // TUNNEL_APPS — the 7 supported platforms and ALL their known
-                        // package-name variants (regional, OEM, Lite, Beta, Business).
+                        // DYNAMIC PACKAGE LIST — set by the JS service file that
+                        // started this VPN session (TikTok.js, WhatsApp.js, etc.)
+                        // via the APP_PACKAGES intent extra.
                         //
-                        // IMPORTANT: addAllowedApplication() silently skips packages
-                        // that are not installed, so listing every variant is safe —
-                        // only the ones present on the device are actually tunneled.
+                        // If APP_PACKAGES was provided → use only those packages.
+                        // If not (old builds / host mode) → use full TUNNEL_APPS.
                         //
-                        // Also included:
-                        //   • com.google.android.webview / com.android.webview
-                        //     WhatsApp renders link previews inside Android WebView;
-                        //     without this those requests leak outside the tunnel.
-                        //   • com.google.android.gms / com.google.android.gsf
-                        //     YouTube, Instagram, and Facebook all make background
-                        //     auth calls through Google Play Services. Excluding GMS
-                        //     causes silent sign-in failures and video playback errors.
+                        // addAllowedApplication() silently skips packages not
+                        // installed on the device, so listing extras is safe.
                         // ═══════════════════════════════════════════════════════════
-                        final String[] TUNNEL_APPS = {
-
-                            // ── 1. TikTok ─────────────────────────────────────────
-                            "com.zhiliaoapp.musically",      // TikTok global (most devices)
-                            "com.ss.android.ugc.trill",      // TikTok — SEA region
-                            "com.ss.android.ugc.trill.go",   // TikTok Lite (low-end markets)
-                            "com.ss.android.ugc.aweme",      // Douyin / TikTok China
-                            "com.bytedance.tiktok",          // TikTok alternate package
-                            "com.tiktok.android",            // TikTok alternate package
-
-                            // ── 2. WhatsApp ───────────────────────────────────────
-                            "com.whatsapp",                  // WhatsApp standard
-                            "com.whatsapp.w4b",              // WhatsApp Business
-                            "com.whatsapp.beta",             // WhatsApp Beta
-                            "com.whatsapp.messenger",        // WhatsApp on some OEM ROMs
-
-                            // ── 3. YouTube ────────────────────────────────────────
-                            "com.google.android.youtube",           // YouTube main
-                            "com.google.android.apps.youtube.music",// YouTube Music
-                            "com.google.android.apps.youtube.kids", // YouTube Kids
-                            "com.google.android.apps.youtube.unplugged", // YouTube TV
-
-                            // ── 4. Facebook ───────────────────────────────────────
-                            "com.facebook.katana",           // Facebook main
-                            "com.facebook.lite",             // Facebook Lite
-                            "com.facebook.android",          // Facebook alternate
-                            "com.facebook.mlite",            // Messenger Lite
-                            "com.facebook.orca",             // Messenger
-                            "com.facebook.work",             // Workplace by Meta
-
-                            // ── 5. Instagram ──────────────────────────────────────
-                            "com.instagram.android",         // Instagram main
-                            "com.instagram.lite",            // Instagram Lite
-                            "com.burbn.instagram",           // Instagram alternate package
-
-                            // ── 6. Spotify ────────────────────────────────────────
-                            "com.spotify.music",             // Spotify main
-                            "com.spotify.lite",              // Spotify Lite
-                            "com.spotify.tv.android",        // Spotify for Android TV
-                            "com.spotify.podcasts",          // Spotify Podcasts
-
-                            // ── 7. Twitter / X ────────────────────────────────────
-                            "com.twitter.android",           // Twitter / X main
-                            "com.twitter.android.lite",      // Twitter Lite
-                            "com.X.android",                 // X (rebrand package)
-                            "com.twitter.tweetdeck",         // TweetDeck
-
-                            // ── Required system support ───────────────────────────
-                            // WhatsApp link previews render in WebView — must be tunneled
-                            "com.google.android.webview",
-                            "com.android.webview",
-                            // YouTube / Instagram / Facebook auth flows use Play Services
-                            "com.google.android.gms",
-                            "com.google.android.gsf",
+                        final String[] TUNNEL_APPS_FALLBACK = {
+                            // TikTok
+                            "com.zhiliaoapp.musically", "com.ss.android.ugc.trill",
+                            "com.ss.android.ugc.trill.go", "com.ss.android.ugc.aweme",
+                            "com.bytedance.tiktok", "com.tiktok.android",
+                            // WhatsApp
+                            "com.whatsapp", "com.whatsapp.w4b",
+                            "com.whatsapp.beta", "com.whatsapp.messenger",
+                            // YouTube
+                            "com.google.android.youtube",
+                            "com.google.android.apps.youtube.music",
+                            "com.google.android.apps.youtube.kids",
+                            "com.google.android.apps.youtube.unplugged",
+                            // Facebook
+                            "com.facebook.katana", "com.facebook.lite",
+                            "com.facebook.android", "com.facebook.mlite",
+                            "com.facebook.orca", "com.facebook.work",
+                            // Instagram
+                            "com.instagram.android", "com.instagram.lite",
+                            "com.burbn.instagram",
+                            // Spotify
+                            "com.spotify.music", "com.spotify.lite",
+                            "com.spotify.tv.android", "com.spotify.podcasts",
+                            // Twitter / X
+                            "com.twitter.android", "com.twitter.android.lite",
+                            "com.X.android", "com.twitter.tweetdeck",
+                            // System support
+                            "com.google.android.webview", "com.android.webview",
+                            "com.google.android.gms", "com.google.android.gsf",
                         };
+
+                        // Use dynamic list from JS if available, else fallback
+                        final String[] packagesToTunnel =
+                            (appPackages != null && appPackages.length > 0)
+                                ? appPackages
+                                : TUNNEL_APPS_FALLBACK;
+
+                        if (appPackages != null) {
+                            Log.i(TAG, "[tunnel] Using dynamic package list (" + appPackages.length + " packages from JS service)");
+                        } else {
+                            Log.i(TAG, "[tunnel] Using built-in TUNNEL_APPS fallback (" + TUNNEL_APPS_FALLBACK.length + " packages)");
+                        }
 
                         Builder b2 = new Builder();
                         b2.setSession("NetShare")
@@ -692,7 +735,7 @@ public class NetShareVpnService extends VpnService {
                         try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
 
                         int allowedCount = 0;
-                        for (String pkg : TUNNEL_APPS) {
+                        for (String pkg : packagesToTunnel) {
                             try {
                                 b2.addAllowedApplication(pkg);
                                 allowedCount++;
@@ -1179,20 +1222,27 @@ public class NetShareVpnService extends VpnService {
         }
     }
 
-    // FIX-TW-2: Added WhatsApp STUN/TURN ports to 600s timeout bucket.
-    // WhatsApp voice/video calls use UDP 3478 (STUN/TURN), 3479 (TURN alt),
-    // 5349 (TURN TLS), 19302–19309 (Google STUN). Old 300s timeout closed
-    // the UDP socket mid-call, causing WhatsApp calls to drop at ~5 minutes.
-    private static int socketTimeoutForPort(int port) {
+    // socketTimeoutForPort — returns timeout in milliseconds for a given port.
+    // Priority: (1) per-app timeout from JS service file (APP_PORT_TIMEOUTS intent extra)
+    //           (2) built-in defaults below
+    // This means each JS service (TikTok.js, WhatsApp.js, etc.) can define
+    // its own timeouts for ports it needs (e.g. WhatsApp: 900s for FCM port 5228).
+    private int socketTimeoutForPort(int port) {
+        // Check dynamic per-app timeouts from JS service first
+        if (appPortTimeouts != null) {
+            Integer override = appPortTimeouts.get(port);
+            if (override != null) return override;
+        }
+        // Built-in defaults
         if (port == 53  || port == 853) return 5_000;    // DNS: fast timeout
         if (port == 123)                return 10_000;   // NTP: short-lived
-        // QUIC/HTTPS and WhatsApp/TikTok STUN-TURN ports: 600s
-        if (port == 443 || port == 80)  return 600_000;  // QUIC video streams
-        // FIX-TW-2: WhatsApp STUN/TURN UDP ports
+        if (port == 443 || port == 80)  return 600_000;  // QUIC / HTTPS video streams
         if (port == 3478 || port == 3479)             return 600_000;  // STUN/TURN
         if (port == 5349)                             return 600_000;  // TURN TLS
         if (port >= 19302 && port <= 19309)           return 600_000;  // Google STUN
-        return 300_000;  // General UDP: 5 minutes
+        if (port == 5222 || port == 5223)             return 600_000;  // XMPP (WhatsApp chat)
+        if (port == 5228)                             return 900_000;  // FCM push
+        return 300_000;  // General default: 5 minutes
     }
 
     // ─── DNS cache helpers ───────────────────────────────────────────────
