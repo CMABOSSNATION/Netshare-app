@@ -166,7 +166,10 @@ public class NetShareVpnService extends VpnService {
     private final AtomicLong bytesIn  = new AtomicLong(0);
     private final AtomicLong bytesOut = new AtomicLong(0);
 
-    private final ExecutorService icmpExecutor = Executors.newCachedThreadPool();
+    // BUG-FIX: must NOT be final — stopVpnTunnel() calls shutdownNow() so we must
+    // re-create it on each startVpnTunnel() call, otherwise ICMP silently breaks
+    // after the first VPN stop/start cycle.
+    private ExecutorService icmpExecutor;
 
     private static final String[] PREFERRED_CIPHER_SUITES = {
         "TLS_CHACHA20_POLY1305_SHA256",
@@ -333,7 +336,11 @@ public class NetShareVpnService extends VpnService {
         }
 
         startForegroundNotification();
-        executor = Executors.newCachedThreadPool();
+        executor     = Executors.newCachedThreadPool();
+        // BUG-FIX: re-create icmpExecutor on every start — it was final before, so after
+        // the first stopVpnTunnel() → shutdownNow() it was permanently dead and all ICMP
+        // (ping / reachability) silently failed on subsequent connections.
+        icmpExecutor = Executors.newCachedThreadPool();
         startWsDrainThread();
         VpnModule.activeService = this;
         executor.execute(this::startVpnTunnel);
@@ -450,6 +457,11 @@ public class NetShareVpnService extends VpnService {
             @Override
             public void onMessage(WebSocket webSocket, ByteString bytes) {
                 if (!isRunning) return;
+                // BUG-FIX: guard against executor being null if stopVpnTunnel() races
+                // with an in-flight onMessage callback (executor is set to null first
+                // in stopVpnTunnel before shutdownNow, which could cause NPE here).
+                final ExecutorService ex = executor;
+                if (ex == null) return;
                 byte[] packet = bytes.toByteArray();
                 if ("host".equals(role)) {
                     bytesIn.addAndGet(packet.length);
@@ -462,13 +474,13 @@ public class NetShareVpnService extends VpnService {
                         if (isUdp || isIcmp) {
                             forwardPacketToInternet(packet);
                         } else {
-                            executor.execute(() -> forwardPacketToInternet(packet));
+                            ex.execute(() -> forwardPacketToInternet(packet));
                         }
                     } else {
-                        executor.execute(() -> forwardPacketToInternet(packet));
+                        ex.execute(() -> forwardPacketToInternet(packet));
                     }
                 } else {
-                    executor.execute(() -> {
+                    ex.execute(() -> {
                         if (!isRunning || tunOut == null) return;
                         try {
                             if (packet.length >= IP4_HEADER_LEN) {
@@ -517,7 +529,9 @@ public class NetShareVpnService extends VpnService {
     // ─── CLIENT: TUN read loop ────────────────────────────────────────────
 
     private void startPacketReadLoop() {
-        executor.execute(() -> {
+        final ExecutorService ex = executor; // BUG-FIX: capture before possible null race
+        if (ex == null) return;
+        ex.execute(() -> {
             java.nio.channels.FileChannel fc = null;
             try {
                 fc = new java.io.FileInputStream(vpnInterface.getFileDescriptor()).getChannel();
