@@ -22,8 +22,8 @@ export const API_URL   = process.env.API_URL
   || 'https://netshare.cmaraphael90.workers.dev';
 
 const LOCAL_EVENTS        = new Set(['hostFailover']);
-const MAX_RECONNECT_TRIES = 5;
-const RECONNECT_BASE_MS   = 2_000;
+const MAX_RECONNECT_TRIES = 8;    // raised: more retries for unstable connections
+const RECONNECT_BASE_MS   = 1_000;  // faster first retry for TikTok/YT session resumption
 
 class VpnService {
   constructor() {
