@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.Intent;
 import android.net.VpnService;
 import android.os.Build;
+import android.provider.Settings;
 
 import androidx.annotation.NonNull;
 
@@ -17,21 +18,32 @@ import com.facebook.react.modules.core.DeviceEventManagerModule;
 /**
  * VpnModule.java — NetShare Native Module
  *
- * BUGS FIXED:
- * 1. addListener / removeListeners stubs were missing — NativeEventEmitter threw
- *    "addListener is not a function" and NO events ever reached JS.
- * 2. emitEvent() had no null-guard on getJSModule() — NPE crashed service thread
- *    silently, stopping all future event delivery.
- * 3. vpnPermissionPromise was never nulled on RESULT_CANCELED — stale promise
- *    caused "Promise already settled" warnings on activity recreation.
- * 4. stopVpn sent a plain startService() on Android O+ — should use the same
- *    action-based approach so the running foreground service handles STOP_VPN.
+ * BUGS FIXED (TikTok / WhatsApp):
+ *
+ * FIX-TW-A: startVpn() now accepts a 6th parameter: deviceId (String).
+ *   Previously the method signature had 5 args and always forwarded an empty
+ *   deviceId to NetShareVpnService. The relay's CLIENT_JOIN handler requires
+ *   a non-empty deviceId to enforce the one-device lock. Without it the relay
+ *   returned "Device ID missing" and TikTok/WhatsApp clients never joined.
+ *
+ * FIX-TW-B: On first call, Java reads ANDROID_ID and writes it to the app's
+ *   SharedPreferences under the key "netshare_device_id". React Native's
+ *   AsyncStorage on Android uses the same SharedPreferences store, so JS
+ *   (VpnService.js getDeviceId()) reads the exact same value. This ensures
+ *   JS validate-code and Java CLIENT_JOIN always send the same deviceId,
+ *   preventing claimedBy mismatches on reconnect.
+ *
+ * All prior bug fixes (1-4) are retained unchanged.
  */
 public class VpnModule extends ReactContextBaseJavaModule implements ActivityEventListener {
 
     private static final int VPN_REQUEST_CODE = 0x0F;
     private Promise vpnPermissionPromise;
     private static ReactApplicationContext reactContext;
+
+    // Shared prefs file name — AsyncStorage on Android uses this same file
+    private static final String PREFS_NAME = "RCTAsyncLocalStorage_V1";
+    private static final String DEVICE_ID_KEY = "netshare_device_id";
 
     // Reference to the running service — used for sendControlMessage()
     public static NetShareVpnService activeService = null;
@@ -49,8 +61,6 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
     }
 
     // ── FIX 1: Required stubs for NativeEventEmitter ──────────────────────
-    // Without these, React Native throws when JS calls vpnEmitter.addListener()
-    // and NO events will ever be delivered to JS.
 
     @ReactMethod
     public void addListener(String eventName) {
@@ -60,6 +70,41 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
     @ReactMethod
     public void removeListeners(int count) {
         // Required by RN NativeEventEmitter — no-op on the native side.
+    }
+
+    // ── FIX-TW-B: Get stable ANDROID_ID and write to shared prefs ────────
+    // Called once per process. Stores the ID so JS (AsyncStorage) can read it.
+    private String getAndStoreDeviceId() {
+        try {
+            // Try to read existing stored value first
+            android.content.SharedPreferences prefs =
+                reactContext.getSharedPreferences(PREFS_NAME, android.content.Context.MODE_PRIVATE);
+            // AsyncStorage stores values JSON-encoded (quoted strings)
+            String stored = prefs.getString(DEVICE_ID_KEY, null);
+            if (stored != null) {
+                // Strip JSON quotes if present: "\"abc\"" → "abc"
+                if (stored.startsWith("\"") && stored.endsWith("\"") && stored.length() > 2) {
+                    return stored.substring(1, stored.length() - 1);
+                }
+                return stored;
+            }
+
+            // Not stored yet — read ANDROID_ID and save it
+            String androidId = Settings.Secure.getString(
+                reactContext.getContentResolver(),
+                Settings.Secure.ANDROID_ID
+            );
+            if (androidId == null || androidId.isEmpty() || androidId.equals("9774d56d682e549c")) {
+                // Emulator or factory-reset device returns the sentinel value — generate a stable ID
+                androidId = "android-" + System.currentTimeMillis();
+            }
+
+            // Store as JSON-encoded string (matching AsyncStorage format)
+            prefs.edit().putString(DEVICE_ID_KEY, "\"" + androidId + "\"").apply();
+            return androidId;
+        } catch (Exception e) {
+            return "unknown-" + System.currentTimeMillis();
+        }
     }
 
     // ── VPN permission ────────────────────────────────────────────────────
@@ -85,22 +130,33 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
     }
 
     // ── Start VPN service ─────────────────────────────────────────────────
+    // FIX-TW-A: added deviceId (6th parameter).
+    // JS passes the ANDROID_ID via VpnService.js startAsClient(); if empty,
+    // Java reads it directly so CLIENT_JOIN always has a valid deviceId.
 
     @ReactMethod
     public void startVpn(String relayUrl, String sessionCode, String role,
-                         String hostId, String netType, Promise promise) {
+                         String hostId, String netType, String deviceId, Promise promise) {
         try {
             Activity activity = getCurrentActivity();
             if (activity == null) {
                 promise.reject("NO_ACTIVITY", "No current activity");
                 return;
             }
+
+            // FIX-TW-B: ensure device ID is stored for JS to read, and use it
+            // if JS didn't supply one (empty string = old JS build calling us).
+            String resolvedDeviceId = (deviceId != null && !deviceId.isEmpty())
+                ? deviceId
+                : getAndStoreDeviceId();
+
             Intent serviceIntent = new Intent(activity, NetShareVpnService.class);
-            serviceIntent.putExtra("RELAY_URL",     relayUrl);
-            serviceIntent.putExtra("SESSION_CODE",  sessionCode != null ? sessionCode : "");
-            serviceIntent.putExtra("ROLE",           role);
-            serviceIntent.putExtra("HOST_ID",        hostId != null ? hostId : "");
-            serviceIntent.putExtra("NET_TYPE",       netType != null ? netType : "WiFi");
+            serviceIntent.putExtra("RELAY_URL",    relayUrl);
+            serviceIntent.putExtra("SESSION_CODE", sessionCode != null ? sessionCode : "");
+            serviceIntent.putExtra("ROLE",         role);
+            serviceIntent.putExtra("HOST_ID",      hostId  != null ? hostId  : "");
+            serviceIntent.putExtra("NET_TYPE",     netType != null ? netType : "WiFi");
+            serviceIntent.putExtra("DEVICE_ID",    resolvedDeviceId);  // FIX-TW-A
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 activity.startForegroundService(serviceIntent);
@@ -114,17 +170,13 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
     }
 
     // ── Stop VPN service ──────────────────────────────────────────────────
-    // FIX 4: Send STOP_VPN action intent. The running NetShareVpnService handles
-    // this in onStartCommand and calls stopVpnTunnelFromUser(). Using startService
-    // (not startForegroundService) for the stop signal is correct — we're just
-    // delivering a command to an already-running foreground service.
+    // FIX 4: Send STOP_VPN action intent.
 
     @ReactMethod
     public void stopVpn(Promise promise) {
         try {
             Activity activity = getCurrentActivity();
             if (activity == null) {
-                // No activity? Try application context as fallback.
                 if (reactContext != null) {
                     Intent serviceIntent = new Intent(reactContext, NetShareVpnService.class);
                     serviceIntent.setAction("STOP_VPN");
@@ -154,8 +206,7 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
     }
 
     // ── Emit event to JS ──────────────────────────────────────────────────
-    // FIX 2: null-guard on the emitter so a crash during shutdown doesn't
-    // propagate and kill the service thread.
+    // FIX 2: null-guard on the emitter.
 
     public static void emitEvent(String eventName, String data) {
         if (reactContext == null) return;
@@ -177,8 +228,7 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
                                   int resultCode, Intent data) {
         if (requestCode == VPN_REQUEST_CODE && vpnPermissionPromise != null) {
             vpnPermissionPromise.resolve(resultCode == Activity.RESULT_OK);
-            // FIX 3: always null the promise so stale references don't cause
-            // "Promise already settled" errors on activity recreation.
+            // FIX 3: always null the promise
             vpnPermissionPromise = null;
         }
     }
