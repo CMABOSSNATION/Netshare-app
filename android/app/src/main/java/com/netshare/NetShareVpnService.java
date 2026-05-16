@@ -117,11 +117,13 @@ public class NetShareVpnService extends VpnService {
     private static final byte PROTO_ICMP      = 1;
 
     private static final int QUIC_PORT_HTTPS = 443;
-    private static final int QUIC_PORT_HTTP  = 80;
+    // Port 80 is NOT QUIC. QUIC = UDP 443 only.
 
     // PERF-1: Reduced MTU to prevent fragmentation over relay
-    private static final int TUN_MTU   = 1300;
-    private static final int MSS_CLAMP = 1260;
+    // MTU 1400: fits WebSocket overhead, keeps QUIC datagrams intact.
+    // 1300 caused IP fragmentation of QUIC packets — QUIC drops fragments.
+    private static final int TUN_MTU   = 1400;
+    private static final int MSS_CLAMP = 1360;
 
     private static final int TCP_SOCKET_BUFFER  = 2 * 1024 * 1024;
     private static final int UDP_SOCKET_BUFFER  = 4 * 1024 * 1024;
@@ -202,6 +204,9 @@ public class NetShareVpnService extends VpnService {
 
     private final Map<String, Socket>         tcpConnections = new ConcurrentHashMap<>();
     private final Map<String, DatagramSocket> udpSockets     = new ConcurrentHashMap<>();
+    // Tracks latest QUIC srcPort per session for correct reply routing
+    private final Map<String, java.util.concurrent.atomic.AtomicInteger> quicSrcPorts
+            = new ConcurrentHashMap<>();
 
     private final AtomicLong bytesIn  = new AtomicLong(0);
     private final AtomicLong bytesOut = new AtomicLong(0);
@@ -449,35 +454,31 @@ public class NetShareVpnService extends VpnService {
         // SocketFactory that calls protect() on each created socket.
         OkHttpClient protectedClient = client.newBuilder()
             .socketFactory(new javax.net.SocketFactory() {
+                // CRITICAL: protect() is ALWAYS called — no vpnInterface guard.
+                // Client calls connectToRelay() before vpnInterface exists (TUN is
+                // built only after JOIN_SUCCESS). Without protect(), the relay socket
+                // is routed into the TUN, loops, and dies. Nothing works at all.
                 @Override public Socket createSocket() throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket();
-                    // BUG1 FIX: only protect() when a VPN interface is active.
-                    // HOST mode has no vpnInterface; calling protect() without one
-                    // silently blackholes the socket on API 29+.
-                    if (vpnInterface != null) self.protect(s);
-                    return s;
+                    self.protect(s); return s;
                 }
                 @Override public Socket createSocket(String h, int p) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(h, p);
-                    if (vpnInterface != null) self.protect(s);
-                    return s;
+                    self.protect(s); return s;
                 }
                 @Override public Socket createSocket(String h, int p,
                         InetAddress la, int lp) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(h, p, la, lp);
-                    if (vpnInterface != null) self.protect(s);
-                    return s;
+                    self.protect(s); return s;
                 }
                 @Override public Socket createSocket(InetAddress h, int p) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(h, p);
-                    if (vpnInterface != null) self.protect(s);
-                    return s;
+                    self.protect(s); return s;
                 }
                 @Override public Socket createSocket(InetAddress a, int p,
                         InetAddress la, int lp) throws IOException {
                     Socket s = javax.net.SocketFactory.getDefault().createSocket(a, p, la, lp);
-                    if (vpnInterface != null) self.protect(s);
-                    return s;
+                    self.protect(s); return s;
                 }
             })
             .build();
@@ -954,21 +955,34 @@ public class NetShareVpnService extends VpnService {
             int pLen    = pkt.length - pOff;
             if (pLen <= 0) return;
 
-            String key = srcIp + ":" + srcPort + "-" + dst.getHostAddress() + ":" + dstPort;
+            // QUIC (port 443) rotates source ports — key WITHOUT srcPort
+            // so all QUIC flows to same server share one stable socket.
+            boolean isQuic = (dstPort == QUIC_PORT_HTTPS);
+            String key = isQuic
+                ? srcIp + "-" + dst.getHostAddress() + ":" + dstPort
+                : srcIp + ":" + srcPort + "-" + dst.getHostAddress() + ":" + dstPort;
+
+            // Always update latest srcPort so replies go to current QUIC port
+            if (isQuic) {
+                quicSrcPorts.computeIfAbsent(key,
+                    k -> new java.util.concurrent.atomic.AtomicInteger(srcPort)).set(srcPort);
+            }
 
             DatagramSocket existing = udpSockets.get(key);
-            if (existing != null && existing.isClosed()) { udpSockets.remove(key); existing = null; }
+            if (existing != null && existing.isClosed()) {
+                udpSockets.remove(key); quicSrcPorts.remove(key); existing = null;
+            }
 
             if (existing == null) {
                 DatagramSocket udpSock = new DatagramSocket();
                 protect(udpSock);
-                boolean isQuic = (dstPort == QUIC_PORT_HTTPS || dstPort == QUIC_PORT_HTTP);
                 int bufSize = isQuic ? QUIC_SOCKET_BUFFER : UDP_SOCKET_BUFFER;
                 try { udpSock.setReceiveBufferSize(bufSize); udpSock.setSendBufferSize(bufSize); } catch (Exception ignored) {}
                 udpSockets.put(key, udpSock);
-                final byte[] fci = clientIpBytes; final int fsp = srcPort;
+                final byte[] fci = clientIpBytes;
                 final int fdp = dstPort; final String fk = key;
-                executor.execute(() -> readUdpResponses(udpSock, fk, fci, fsp, fdp));
+                final boolean fIsQuic = isQuic;
+                executor.execute(() -> readUdpResponses(udpSock, fk, fci, fdp, fIsQuic));
             }
 
             DatagramSocket udpSock = udpSockets.get(key);
@@ -1092,19 +1106,21 @@ public class NetShareVpnService extends VpnService {
     }
 
     private void readUdpResponses(DatagramSocket udpSock, String key,
-                                   byte[] clientIpBytes, int clientSrcPort, int remoteDstPort) {
+                                   byte[] clientIpBytes, int remoteDstPort, boolean isQuic) {
         try {
             byte[]         buf = new byte[65535 - IP4_HEADER_LEN - UDP_HEADER_LEN];
             DatagramPacket dp  = new DatagramPacket(buf, buf.length);
-            udpSock.setSoTimeout(socketTimeoutForPort(remoteDstPort));
+            final int soTimeout = socketTimeoutForPort(remoteDstPort);
             while (isRunning && !udpSock.isClosed()) {
+                // setSoTimeout INSIDE loop: Android resets SO_TIMEOUT to 0
+                // after SocketTimeoutException, causing infinite block.
+                try { udpSock.setSoTimeout(soTimeout); } catch (Exception ignored) {}
                 try { udpSock.receive(dp); }
                 catch (java.net.SocketTimeoutException ste) {
-                    if (socketTimeoutForPort(remoteDstPort) <= 10_000) break;
+                    if (soTimeout <= 10_000) break;
                     continue;
                 }
                 byte[] remoteIpBytes = dp.getAddress().getAddress();
-                // PERF-5: Cache DNS responses
                 if (remoteDstPort == 53 || dp.getPort() == 53) {
                     if (dp.getLength() >= 12) {
                         byte[] dnsResp = new byte[dp.getLength()];
@@ -1114,7 +1130,14 @@ public class NetShareVpnService extends VpnService {
                 }
                 if (wsClient != null) {
                     bytesOut.addAndGet(dp.getLength());
-                    ByteBuffer pkt = buildIpUdpPacket(remoteIpBytes, clientIpBytes, dp.getPort(), clientSrcPort, dp.getData(), 0, dp.getLength());
+                    // For QUIC: reply to the LATEST srcPort (may have rotated).
+                    // For non-QUIC: use fixed srcPort from first packet.
+                    int replyPort = isQuic
+                        ? quicSrcPorts.getOrDefault(key,
+                              new java.util.concurrent.atomic.AtomicInteger(dp.getPort())).get()
+                        : dp.getPort();
+                    ByteBuffer pkt = buildIpUdpPacket(remoteIpBytes, clientIpBytes,
+                            dp.getPort(), replyPort, dp.getData(), 0, dp.getLength());
                     wsSend(pkt);
                 }
             }
@@ -1122,6 +1145,7 @@ public class NetShareVpnService extends VpnService {
             if (isRunning) Log.w(TAG, "UDP resp [" + key + "]: " + e.getMessage());
         } finally {
             udpSockets.remove(key);
+            quicSrcPorts.remove(key);
             try { udpSock.close(); } catch (Exception ignored) {}
         }
     }
@@ -1334,6 +1358,7 @@ public class NetShareVpnService extends VpnService {
         for (DatagramSocket s : udpSockets.values())     try { s.close(); } catch (Exception ignored) {}
         tcpConnections.clear();
         udpSockets.clear();
+        quicSrcPorts.clear();
 
         dnsCache.clear();
 
