@@ -153,8 +153,7 @@ class TikTokVpnService {
     this._stopping      = false;
     this.reconnectTries = 0;
     await VpnModule.startVpn(
-      RELAY_URL, '', 'host', this.hostId, netType, '',
-      JSON.stringify(TIKTOK_PACKAGES),
+      RELAY_URL, '', 'host', this.hostId, netType, ''
     );
   }
 
@@ -174,8 +173,7 @@ class TikTokVpnService {
     this._stopping      = false;
     this.reconnectTries = 0;
     await VpnModule.startVpn(
-      RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId,
-      JSON.stringify(TIKTOK_PACKAGES),
+      RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId
     );
   }
 
