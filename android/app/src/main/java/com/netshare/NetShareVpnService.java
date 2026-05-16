@@ -604,77 +604,76 @@ public class NetShareVpnService extends VpnService {
                         if (vpnInterface != null) { try { vpnInterface.close(); } catch (Exception ignored) {} vpnInterface = null; }
 
                         // ═══════════════════════════════════════════════════════════
-                        // ALLOWED APPS — only these are routed through the shared tunnel.
+                        // TUNNEL_APPS — the 7 supported platforms and ALL their known
+                        // package-name variants (regional, OEM, Lite, Beta, Business).
                         //
-                        // FIX-TW-3: Added missing TikTok Lite, WhatsApp alternate,
-                        // Android WebView (used by WhatsApp link previews), and Play Store.
+                        // IMPORTANT: addAllowedApplication() silently skips packages
+                        // that are not installed, so listing every variant is safe —
+                        // only the ones present on the device are actually tunneled.
+                        //
+                        // Also included:
+                        //   • com.google.android.webview / com.android.webview
+                        //     WhatsApp renders link previews inside Android WebView;
+                        //     without this those requests leak outside the tunnel.
+                        //   • com.google.android.gms / com.google.android.gsf
+                        //     YouTube, Instagram, and Facebook all make background
+                        //     auth calls through Google Play Services. Excluding GMS
+                        //     causes silent sign-in failures and video playback errors.
                         // ═══════════════════════════════════════════════════════════
                         final String[] TUNNEL_APPS = {
 
-                            // ── TikTok (all regions & variants) ──────────────────
-                            "com.zhiliaoapp.musically",          // TikTok global
-                            "com.ss.android.ugc.trill",          // TikTok — SEA / some regions
-                            "com.ss.android.ugc.trill.go",       // FIX-TW-3: TikTok Lite (some markets)
-                            "com.ss.android.ugc.aweme",          // Douyin (TikTok China)
-                            "com.bytedance.tiktok",              // TikTok alternate
-                            "com.tiktok.android",                // TikTok alternate pkg
+                            // ── 1. TikTok ─────────────────────────────────────────
+                            "com.zhiliaoapp.musically",      // TikTok global (most devices)
+                            "com.ss.android.ugc.trill",      // TikTok — SEA region
+                            "com.ss.android.ugc.trill.go",   // TikTok Lite (low-end markets)
+                            "com.ss.android.ugc.aweme",      // Douyin / TikTok China
+                            "com.bytedance.tiktok",          // TikTok alternate package
+                            "com.tiktok.android",            // TikTok alternate package
 
-                            // ── WhatsApp (all variants) ───────────────────────────
-                            "com.whatsapp",                      // WhatsApp standard
-                            "com.whatsapp.w4b",                  // WhatsApp Business
-                            "com.whatsapp.beta",                 // WhatsApp Beta
-                            "com.whatsapp.messenger",            // FIX-TW-3: WhatsApp on some OEMs
+                            // ── 2. WhatsApp ───────────────────────────────────────
+                            "com.whatsapp",                  // WhatsApp standard
+                            "com.whatsapp.w4b",              // WhatsApp Business
+                            "com.whatsapp.beta",             // WhatsApp Beta
+                            "com.whatsapp.messenger",        // WhatsApp on some OEM ROMs
 
-                            // ── YouTube (all variants) ────────────────────────────
-                            "com.google.android.youtube",
-                            "com.google.android.apps.youtube.music",
-                            "com.google.android.apps.youtube.kids",
-                            "com.google.android.apps.youtube.unplugged",
+                            // ── 3. YouTube ────────────────────────────────────────
+                            "com.google.android.youtube",           // YouTube main
+                            "com.google.android.apps.youtube.music",// YouTube Music
+                            "com.google.android.apps.youtube.kids", // YouTube Kids
+                            "com.google.android.apps.youtube.unplugged", // YouTube TV
 
-                            // ── Instagram (all variants) ──────────────────────────
-                            "com.instagram.android",
-                            "com.instagram.lite",
-                            "com.burbn.instagram",
+                            // ── 4. Facebook ───────────────────────────────────────
+                            "com.facebook.katana",           // Facebook main
+                            "com.facebook.lite",             // Facebook Lite
+                            "com.facebook.android",          // Facebook alternate
+                            "com.facebook.mlite",            // Messenger Lite
+                            "com.facebook.orca",             // Messenger
+                            "com.facebook.work",             // Workplace by Meta
 
-                            // ── Facebook (all variants) ───────────────────────────
-                            "com.facebook.katana",
-                            "com.facebook.lite",
-                            "com.facebook.android",
-                            "com.facebook.mlite",
-                            "com.facebook.orca",
-                            "com.facebook.work",
+                            // ── 5. Instagram ──────────────────────────────────────
+                            "com.instagram.android",         // Instagram main
+                            "com.instagram.lite",            // Instagram Lite
+                            "com.burbn.instagram",           // Instagram alternate package
 
-                            // ── Twitter / X (all variants) ───────────────────────
-                            "com.twitter.android",
-                            "com.twitter.android.lite",
-                            "com.X.android",
-                            "com.twitter.tweetdeck",
+                            // ── 6. Spotify ────────────────────────────────────────
+                            "com.spotify.music",             // Spotify main
+                            "com.spotify.lite",              // Spotify Lite
+                            "com.spotify.tv.android",        // Spotify for Android TV
+                            "com.spotify.podcasts",          // Spotify Podcasts
 
-                            // ── Spotify (all variants) ────────────────────────────
-                            "com.spotify.music",
-                            "com.spotify.lite",
-                            "com.spotify.tv.android",
-                            "com.spotify.podcasts",
+                            // ── 7. Twitter / X ────────────────────────────────────
+                            "com.twitter.android",           // Twitter / X main
+                            "com.twitter.android.lite",      // Twitter Lite
+                            "com.X.android",                 // X (rebrand package)
+                            "com.twitter.tweetdeck",         // TweetDeck
 
-                            // ── Chrome & Google browsers ──────────────────────────
-                            "com.android.chrome",
-                            "com.chrome.beta",
-                            "com.chrome.dev",
-                            "com.chrome.canary",
-                            "com.google.android.apps.chrome",
-
-                            // ── Google core services ──────────────────────────────
-                            "com.google.android.gms",
-                            "com.google.android.gsf",
-                            "com.google.android.googlequicksearchbox",
-                            "com.google.android.gm",
-
-                            // ── FIX-TW-3: Android WebView (WhatsApp link previews) ─
+                            // ── Required system support ───────────────────────────
+                            // WhatsApp link previews render in WebView — must be tunneled
                             "com.google.android.webview",
                             "com.android.webview",
-
-                            // ── FIX-TW-3: Play Store (app update flows) ───────────
-                            "com.android.vending",
+                            // YouTube / Instagram / Facebook auth flows use Play Services
+                            "com.google.android.gms",
+                            "com.google.android.gsf",
                         };
 
                         Builder b2 = new Builder();
