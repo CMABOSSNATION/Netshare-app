@@ -136,7 +136,9 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
 
     @ReactMethod
     public void startVpn(String relayUrl, String sessionCode, String role,
-                         String hostId, String netType, String deviceId, Promise promise) {
+                         String hostId, String netType, String deviceId,
+                         String appPackagesJson, String appPortTimeoutsJson,
+                         Promise promise) {
         try {
             Activity activity = getCurrentActivity();
             if (activity == null) {
@@ -151,12 +153,18 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
                 : getAndStoreDeviceId();
 
             Intent serviceIntent = new Intent(activity, NetShareVpnService.class);
-            serviceIntent.putExtra("RELAY_URL",    relayUrl);
-            serviceIntent.putExtra("SESSION_CODE", sessionCode != null ? sessionCode : "");
-            serviceIntent.putExtra("ROLE",         role);
-            serviceIntent.putExtra("HOST_ID",      hostId  != null ? hostId  : "");
-            serviceIntent.putExtra("NET_TYPE",     netType != null ? netType : "WiFi");
-            serviceIntent.putExtra("DEVICE_ID",    resolvedDeviceId);  // FIX-TW-A
+            serviceIntent.putExtra("RELAY_URL",         relayUrl);
+            serviceIntent.putExtra("SESSION_CODE",      sessionCode != null ? sessionCode : "");
+            serviceIntent.putExtra("ROLE",              role);
+            serviceIntent.putExtra("HOST_ID",           hostId  != null ? hostId  : "");
+            serviceIntent.putExtra("NET_TYPE",          netType != null ? netType : "WiFi");
+            serviceIntent.putExtra("DEVICE_ID",         resolvedDeviceId);  // FIX-TW-A
+            // WhatsApp FIX: forward per-app package list and port timeouts
+            // from JS service files (WhatsApp.js, TikTok.js, etc.)
+            if (appPackagesJson != null && !appPackagesJson.isEmpty())
+                serviceIntent.putExtra("APP_PACKAGES",      appPackagesJson);
+            if (appPortTimeoutsJson != null && !appPortTimeoutsJson.isEmpty())
+                serviceIntent.putExtra("APP_PORT_TIMEOUTS", appPortTimeoutsJson);
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 activity.startForegroundService(serviceIntent);

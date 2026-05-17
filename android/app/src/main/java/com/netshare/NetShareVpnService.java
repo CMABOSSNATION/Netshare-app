@@ -909,8 +909,22 @@ public class NetShareVpnService extends VpnService {
                 }
             }
             if (isFin) {
-                Socket s = tcpConnections.remove(key);
-                if (s != null) try { s.close(); } catch (Exception ignored) {}
+                // WhatsApp FIX: XMPP uses TCP half-close — client sends FIN but
+                // server may still send pending messages. Use shutdownOutput()
+                // to close only the write side, keeping the read side open so
+                // readTcpResponses() can drain any remaining server data.
+                // Full socket close happens in readTcpResponses() when server
+                // also closes or returns EOF.
+                Socket s = tcpConnections.get(key);
+                if (s != null && !s.isClosed()) {
+                    try {
+                        s.shutdownOutput(); // half-close: stop sending, keep receiving
+                    } catch (Exception ignored) {
+                        // If shutdownOutput fails (e.g. already closed), full close
+                        tcpConnections.remove(key);
+                        try { s.close(); } catch (Exception ignored2) {}
+                    }
+                }
             }
         } catch (Exception e) {
             Log.w(TAG, "handleTcpForward: " + e.getMessage());
@@ -1058,7 +1072,17 @@ public class NetShareVpnService extends VpnService {
             while (isRunning && !sock.isClosed()) {
                 try { len = in.read(buf); }
                 catch (java.net.SocketTimeoutException ste) {
-                    if (socketTimeoutForPort(remoteDstPort) <= 10_000) break;
+                    // WhatsApp FIX: for long-lived ports (XMPP 5222/5223, FCM 5228)
+                    // a read timeout just means no data yet — keep the socket alive.
+                    // Only break for genuinely short-lived ports (DNS 53, NTP 123).
+                    // Previously: break if timeout <= 10_000 (correct), but continue
+                    // otherwise. That was right BUT the condition was wrong — it used
+                    // socketTimeoutForPort() which returns the CONFIGURED timeout, not
+                    // the elapsed time. We need to simply continue for all long-lived
+                    // ports and only break for short-lived ones.
+                    if (socketTimeoutForPort(remoteDstPort) <= 10_000) break; // DNS/NTP
+                    // For all other ports (including WhatsApp XMPP 5222, FCM 5228):
+                    // timeout just means quiet period — continue reading
                     continue;
                 }
                 if (len <= 0) break;
@@ -1132,7 +1156,12 @@ public class NetShareVpnService extends VpnService {
         int t=IP4_HEADER_LEN;
         b[t]=(byte)(srcPort>>8); b[t+1]=(byte)(srcPort);
         b[t+2]=(byte)(dstPort>>8); b[t+3]=(byte)(dstPort);
-        b[t+12]=(byte)(TCP_HEADER_LEN<<2); b[t+13]=0x18;
+        b[t+12]=(byte)(TCP_HEADER_LEN<<2);
+        // WhatsApp FIX: use PSH+ACK only when there is payload data.
+        // Pure ACK (0x10) for zero-length segments (keepalives, window updates).
+        // Previously always 0x18 (PSH+ACK) — this confused WhatsApp XMPP which
+        // uses ACK-only keepalive frames to hold the long-lived session open.
+        b[t+13] = (pLen > 0) ? (byte)0x18 : (byte)0x10;
         b[t+14]=(byte)0xFF; b[t+15]=(byte)0xFF;
         System.arraycopy(payload, pOff, b, IP4_HEADER_LEN + TCP_HEADER_LEN, pLen);
         int tcpLen=TCP_HEADER_LEN+pLen;
