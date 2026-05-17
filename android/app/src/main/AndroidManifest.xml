@@ -1,96 +1,43 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<!--
+  AndroidManifest.xml — NetShare HTTP Proxy Edition
 
+  Key changes from VPN edition:
+  - REMOVED: android.permission.BIND_VPN_SERVICE (no VPN needed)
+  - REMOVED: VpnService intent-filter
+  - ADDED:   INTERNET permission (already present)
+  - ADDED:   ProxyService as a foreground service
+  - ADDED:   FOREGROUND_SERVICE_NETWORK_ACCESS type (Android 14+)
+  - ADDED:   CHANGE_WIFI_STATE / ACCESS_WIFI_STATE for IP detection
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.netshare">
+
+    <!-- ── Permissions ───────────────────────────────────────────────────── -->
+
+    <!-- Basic internet access -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!--
-      FOREGROUND_SERVICE_DATA_SYNC is required on Android 14+ for foreground
-      services that transfer data (our VPN tunnel). Without it the service is
-      killed immediately on API 34+ devices.
-    -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Wi-Fi IP detection (for showing host IP to share with clients) -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
-    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-    <!--
-      QUERIES BLOCK — required on Android 11+ (API 30+) for package visibility.
-      Without this, PackageManager.getPackageInfo() and addAllowedApplication()
-      cannot see these packages, so the VPN builder silently ignores them and
-      ALL traffic gets tunneled instead of only these apps.
+    <!-- Foreground service (keeps proxy alive when app is backgrounded) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
-      Each <package> entry matches one of the package names used in
-      NetShareVpnService.java's TUNNEL_APPS array.
-    -->
-    <queries>
-        <!-- TikTok -->
-        <package android:name="com.zhiliaoapp.musically" />
-        <package android:name="com.ss.android.ugc.trill" />
-        <package android:name="com.ss.android.ugc.trill.go" />
-        <package android:name="com.ss.android.ugc.aweme" />
-        <package android:name="com.bytedance.tiktok" />
-        <package android:name="com.tiktok.android" />
+    <!-- Android 14+: declare the foreground service type -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_NETWORK" />
 
-        <!-- WhatsApp -->
-        <package android:name="com.whatsapp" />
-        <package android:name="com.whatsapp.w4b" />
-        <package android:name="com.whatsapp.beta" />
-        <package android:name="com.whatsapp.messenger" />
+    <!-- Wake lock — prevents proxy from dying when screen is off -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
-        <!-- YouTube -->
-        <package android:name="com.google.android.youtube" />
-        <package android:name="com.google.android.apps.youtube.music" />
-        <package android:name="com.google.android.apps.youtube.kids" />
-        <package android:name="com.google.android.apps.youtube.unplugged" />
-
-        <!-- Facebook -->
-        <package android:name="com.facebook.katana" />
-        <package android:name="com.facebook.lite" />
-        <package android:name="com.facebook.android" />
-        <package android:name="com.facebook.mlite" />
-        <package android:name="com.facebook.orca" />
-        <package android:name="com.facebook.work" />
-
-        <!-- Instagram -->
-        <package android:name="com.instagram.android" />
-        <package android:name="com.instagram.lite" />
-        <package android:name="com.burbn.instagram" />
-
-        <!-- Spotify -->
-        <package android:name="com.spotify.music" />
-        <package android:name="com.spotify.lite" />
-        <package android:name="com.spotify.tv.android" />
-        <package android:name="com.spotify.podcasts" />
-
-        <!-- Twitter / X -->
-        <package android:name="com.twitter.android" />
-        <package android:name="com.twitter.android.lite" />
-        <package android:name="com.X.android" />
-        <package android:name="com.twitter.tweetdeck" />
-
-        <!-- Chrome — ADDED -->
-        <package android:name="com.android.chrome" />
-        <package android:name="com.chrome.beta" />
-        <package android:name="com.chrome.dev" />
-        <package android:name="com.chrome.canary" />
-
-        <!-- Play Store — ADDED (needed for app update checks while tunneled) -->
-        <package android:name="com.android.vending" />
-
-        <!-- System support (WebView + Play Services) -->
-        <package android:name="com.google.android.webview" />
-        <package android:name="com.android.webview" />
-        <package android:name="com.google.android.gms" />
-        <package android:name="com.google.android.gsf" />
-    </queries>
+    <!-- ── Application ───────────────────────────────────────────────────── -->
 
     <application
         android:name=".MainApplication"
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
-        android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
@@ -98,7 +45,7 @@
         <activity
             android:name=".MainActivity"
             android:label="@string/app_name"
-            android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|uiMode"
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize"
             android:exported="true">
@@ -109,26 +56,18 @@
         </activity>
 
         <!--
-          VPN Service rules:
-          1. android:permission="BIND_VPN_SERVICE" is REQUIRED — Android only
-             allows the system to bind it, not other apps.
-          2. foregroundServiceType must NOT be set for VPN services on Android 14+.
-             VpnService is exempt from the foreground service type requirement.
-             Setting foregroundServiceType="connectedDevice" causes Android to
-             immediately kill the service because the app hasn't declared
-             FOREGROUND_SERVICE_CONNECTED_DEVICE correctly in all API levels,
-             producing the connect→disconnect loop visible in the screenshot.
-          3. Use relative name ".NetShareVpnService" so it resolves correctly
-             against whatever applicationId the build uses.
+          ProxyService — the HTTP CONNECT proxy server.
+
+          android:foregroundServiceType="network" is required on Android 14+
+          to allow network access from a foreground service.
+
+          exported="false" — only our app can start/stop it.
         -->
         <service
-            android:name=".NetShareVpnService"
-            android:permission="android.permission.BIND_VPN_SERVICE"
-            android:exported="false">
-            <intent-filter>
-                <action android:name="android.net.VpnService" />
-            </intent-filter>
-        </service>
+            android:name=".ProxyService"
+            android:exported="false"
+            android:foregroundServiceType="network"
+            android:stopWithTask="false" />
 
     </application>
 
