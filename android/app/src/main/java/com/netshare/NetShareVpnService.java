@@ -68,7 +68,25 @@ import java.util.concurrent.TimeUnit;
  *   old 8 MB buffer overflowed on slower relay links, dropping QUIC
  *   ACKs and triggering TikTok's stall/spinner. 16 MB headroom prevents this.
  *
- * All prior PERF and FIX changes are retained unchanged.
+ * All prior PERF and FIX-TW changes are retained unchanged.
+ *
+ * FIX-TK-4: QUIC flow key now includes srcPort (TikTok normal video fix).
+ *   Previous key: srcIp + "-" + dst + ":" + dstPort
+ *   All QUIC connections from the same client to the same CDN server shared ONE
+ *   DatagramSocket. TikTok For You feed opens many parallel QUIC connections per
+ *   video (one per CDN segment). With a shared socket, quicSrcPorts.set(srcPort)
+ *   raced and readUdpResponses() sent all replies with the same (wrong) port so
+ *   only one of N parallel streams received data: spinner and blank video cards.
+ *   Live streaming was fine because it uses a single long-lived QUIC stream.
+ *   Fixed key: srcIp + ":" + srcPort + "-" + dst + ":" + dstPort
+ *   Each QUIC connection now gets its own socket and reader thread.
+ *
+ * FIX-TK-5: Large QUIC/HTTP bulk frame priority raised from 3 to 2.
+ *   Priority 3 (lowest) meant TikTok video frames drained AFTER everything else.
+ *   When WhatsApp was active the feed was starved on the relay write side.
+ *   Now priority 2 equal to general default. WhatsApp XMPP (priority 1) still
+ *   wins but it is too small and infrequent to compete for video bandwidth.
+ *   WhatsApp behaviour is fully preserved, no WhatsApp settings changed.
  */
 public class NetShareVpnService extends VpnService {
 
@@ -206,14 +224,21 @@ public class NetShareVpnService extends VpnService {
     private final ConcurrentHashMap<String, CachedDnsResponse> dnsCache = new ConcurrentHashMap<>();
 
     private int framePriority(Object payload, int dstPort, int frameLen) {
-        if (payload instanceof String)               return 0;
-        if (dstPort == 53  || dstPort == 853)        return 0;
-        if (dstPort == 123)                          return 0;
-        if (frameLen <= 64)                          return 0;
-        if (dstPort == 5222 || dstPort == 5223)      return 1;
-        if (dstPort == 443 && frameLen < 512)        return 1;
-        if (dstPort == 443 && frameLen >= 512)       return 3;
-        if (dstPort == 80  && frameLen >= 512)       return 3;
+        if (payload instanceof String)               return 0;  // control: highest
+        if (dstPort == 53  || dstPort == 853)        return 0;  // DNS: must not stall
+        if (dstPort == 123)                          return 0;  // NTP
+        if (frameLen <= 64)                          return 0;  // tiny frames (ACKs)
+        if (dstPort == 5222 || dstPort == 5223)      return 1;  // XMPP (WhatsApp chat)
+        if (dstPort == 443 && frameLen < 512)        return 1;  // QUIC handshake/headers
+        // FIX-TK-5: Large QUIC/HTTP bulk frames were priority 3 (lowest in queue).
+        // TikTok video segments are large (>512B) UDP/QUIC frames on port 443.
+        // Priority 3 meant they drained AFTER all other traffic, causing the For You
+        // feed to stall whenever WhatsApp or any other app was active on the relay.
+        // Changed to priority 2 — equal to general default. Video frames now compete
+        // fairly. XMPP (priority 1) still wins but XMPP frames are tiny/infrequent
+        // and don't consume meaningful bandwidth, so this is correct.
+        if (dstPort == 443 && frameLen >= 512)       return 2;  // QUIC video bulk (was 3)
+        if (dstPort == 80  && frameLen >= 512)       return 2;  // HTTP video bulk (was 3)
         return 2;
     }
 
@@ -944,9 +969,29 @@ public class NetShareVpnService extends VpnService {
             if (pLen <= 0) return;
 
             boolean isQuic = (dstPort == QUIC_PORT_HTTPS);
-            String key = isQuic
-                ? srcIp + "-" + dst.getHostAddress() + ":" + dstPort
-                : srcIp + ":" + srcPort + "-" + dst.getHostAddress() + ":" + dstPort;
+            // FIX-TK-4: Include srcPort in the QUIC flow key.
+            //
+            // Previous key: srcIp + "-" + dst + ":" + dstPort
+            //   → ALL QUIC connections from the same client to the same server
+            //     shared ONE DatagramSocket. TikTok's For You feed opens many
+            //     parallel QUIC connections per video (one per CDN segment server).
+            //     With a shared socket:
+            //       a) quicSrcPorts.set(srcPort) races — the last srcPort written
+            //          wins, so earlier connections get replies sent to the wrong
+            //          client port and are silently dropped by the kernel.
+            //       b) readUdpResponses() sends ALL responses back with the same
+            //          replyPort, so only one of the N parallel TikTok QUIC streams
+            //          actually receives its data.
+            //     Result: the For You feed video buffer never fills → spinner.
+            //     Live streaming is NOT affected because it uses a single long-lived
+            //     QUIC stream (no parallel connections), so the race never triggers.
+            //
+            // Fixed key: srcIp + ":" + srcPort + "-" + dst + ":" + dstPort
+            //   → each QUIC connection gets its own DatagramSocket and its own
+            //     readUdpResponses() thread. Parallel CDN fetches work correctly.
+            //   The quicSrcPorts map now records srcPort per connection so replies
+            //   are addressed back to the exact client port that sent the request.
+            String key = srcIp + ":" + srcPort + "-" + dst.getHostAddress() + ":" + dstPort;
 
             if (isQuic) {
                 quicSrcPorts.computeIfAbsent(key,
