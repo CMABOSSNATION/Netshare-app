@@ -718,9 +718,11 @@ public class NetShareVpnService extends VpnService {
                             "com.facebook.katana", "com.facebook.lite",
                             "com.facebook.android", "com.facebook.mlite",
                             "com.facebook.orca", "com.facebook.work",
+                            "com.facebook.pages.app",
                             // Instagram
                             "com.instagram.android", "com.instagram.lite",
                             "com.burbn.instagram",
+                            "com.instagram.barcelona",
                             // Spotify
                             "com.spotify.music", "com.spotify.lite",
                             "com.spotify.tv.android", "com.spotify.podcasts",
