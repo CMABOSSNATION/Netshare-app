@@ -158,8 +158,16 @@ class WhatsAppVpnService {
     this.netType = netType;
     this._stopping      = false;
     this.reconnectTries = 0;
+    // WhatsApp FIX: pass APP_PACKAGES and APP_PORT_TIMEOUTS so the Java
+    // layer uses WhatsApp-specific package list and port timeouts (XMPP 5222,
+    // FCM 5228, STUN/TURN 3478-5349) instead of the generic fallback list.
+    const packagesJson  = JSON.stringify(WHATSAPP_PACKAGES);
+    const portMapJson   = JSON.stringify(
+      Object.fromEntries(Object.entries(WHATSAPP_PORTS).map(([k, v]) => [String(k), v]))
+    );
     await VpnModule.startVpn(
-      RELAY_URL, '', 'host', this.hostId, netType, ''
+      RELAY_URL, '', 'host', this.hostId, netType, '',
+      packagesJson, portMapJson
     );
   }
 
@@ -176,8 +184,14 @@ class WhatsAppVpnService {
     this.currentCode = null;
     this._stopping      = false;
     this.reconnectTries = 0;
+    // WhatsApp FIX: pass APP_PACKAGES and APP_PORT_TIMEOUTS
+    const packagesJson = JSON.stringify(WHATSAPP_PACKAGES);
+    const portMapJson  = JSON.stringify(
+      Object.fromEntries(Object.entries(WHATSAPP_PORTS).map(([k, v]) => [String(k), v]))
+    );
     await VpnModule.startVpn(
-      RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId
+      RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId,
+      packagesJson, portMapJson
     );
   }
 
