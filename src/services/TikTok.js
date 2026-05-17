@@ -17,12 +17,52 @@
  *   com.google.android.gms     — Play Services (auth / push)
  *   com.google.android.gsf     — Google Services Framework
  *   com.android.vending         — Play Store (update checks)
+ *   com.google.android.webview  — System WebView (in-app browser)
+ *   com.android.webview         — AOSP WebView fallback
  *
  * Special network handling:
- *   Port 443 UDP — QUIC/HTTP3 (TikTok video streams), 600s socket timeout,
- *                  16 MB receive buffer to handle 4K burst traffic
+ *   Port 443 UDP — QUIC/HTTP3 (TikTok For You feed video streams), 600s socket
+ *                  timeout, 16 MB receive buffer to handle 4K burst traffic.
+ *                  Each QUIC connection now gets its own DatagramSocket so
+ *                  parallel CDN segment fetches don't collide (see FIX-TK-4).
+ *   Port 443 TCP — HTTPS/2 fallback for search, comments, live chat, 600s
  *   Port 80  TCP — HTTP fallback, 600s
  *   Port 53       — DNS, 5s fast timeout
+ *
+ * ══════════════════════════════════════════════════════════════════
+ * FIXES IN THIS VERSION
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * FIX-TK-1 (CRITICAL — normal video not loading):
+ *   startAsHost() and startAsClient() were calling VpnModule.startVpn()
+ *   with only 6 arguments. VpnModule.java now expects 9 (the last two being
+ *   appPackagesJson and appPortTimeoutsJson). The argument mismatch caused
+ *   React Native's bridge to throw, or fall through with null extras, so:
+ *     • APP_PACKAGES was never forwarded → Java fell back to the generic
+ *       TUNNEL_APPS_FALLBACK list. On some devices this list doesn't include
+ *       the installed TikTok package variant, so TikTok traffic bypassed the VPN.
+ *     • APP_PORT_TIMEOUTS was never forwarded → Java used the built-in defaults,
+ *       which set the QUIC UDP socket buffer to UDP_SOCKET_BUFFER (4 MB) instead
+ *       of QUIC_SOCKET_BUFFER (16 MB). TikTok's For You feed sends video in
+ *       large parallel bursts that overflow a 4 MB buffer, dropping QUIC ACKs
+ *       and causing the feed spinner / blank video cards.
+ *   FIX: Pass JSON.stringify(TIKTOK_PACKAGES) and JSON.stringify(TIKTOK_PORTS)
+ *   as the 8th and 9th arguments to every VpnModule.startVpn() call.
+ *
+ * FIX-TK-2 (normal video stalls after reconnect):
+ *   _scheduleReconnect() had the same 6-arg call as above, so any reconnect
+ *   after a dropped relay connection re-introduced the buffer undersize and
+ *   missing package filter, causing video to stall again after recovery.
+ *   FIX: Pass PACKAGES_JSON and PORTS_JSON in the reconnect call too.
+ *
+ * FIX-TK-3 (com.google.android.webview missing):
+ *   TikTok's in-app browser (used when tapping profile links, hashtag pages,
+ *   and ads) renders in Android System WebView. Without WebView in the tunnel
+ *   those pages loaded outside the VPN on the real interface, causing mixed-
+ *   content errors and broken previews.
+ *   FIX: Added com.google.android.webview and com.android.webview to TIKTOK_PACKAGES.
+ *
+ * NOTE: WhatsApp settings are intentionally untouched in this file.
  */
 
 import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
@@ -50,18 +90,28 @@ export const TIKTOK_PACKAGES = [
   'com.google.android.gms',
   'com.google.android.gsf',
   'com.android.vending',
+  // FIX-TK-3: WebView — TikTok in-app browser for links, hashtag pages, ads
+  'com.google.android.webview',
+  'com.android.webview',
 ];
 
 // Ports TikTok uses and their required socket timeouts (milliseconds).
-// The Java layer reads TIKTOK_PORTS via the APP_PORTS intent extra and
-// applies per-port timeouts in socketTimeoutForPort().
+// Forwarded to Java via APP_PORT_TIMEOUTS intent extra so socketTimeoutForPort()
+// uses these values instead of built-in defaults.
+// Most importantly: port 443 at 600s ensures the QUIC socket stays alive for
+// the full duration of a For You feed video segment (some are 60 s+).
 export const TIKTOK_PORTS = {
-  443:  600_000,  // QUIC/HTTP3 — primary video delivery
+  443:  600_000,  // QUIC/HTTP3 — primary For You feed video delivery
   80:   600_000,  // HTTP fallback
   53:   5_000,    // DNS
   853:  5_000,    // DNS-over-TLS
   123:  10_000,   // NTP
 };
+
+// Serialised once — reused on every startVpn() and reconnect call.
+// FIX-TK-1: these must be passed as args 8 and 9 to VpnModule.startVpn().
+const PACKAGES_JSON = JSON.stringify(TIKTOK_PACKAGES);
+const PORTS_JSON    = JSON.stringify(TIKTOK_PORTS);
 
 const LOCAL_EVENTS        = new Set(['hostFailover']);
 const MAX_RECONNECT_TRIES = 8;
@@ -152,8 +202,11 @@ class TikTokVpnService {
     this.netType = netType;
     this._stopping      = false;
     this.reconnectTries = 0;
+    // FIX-TK-1: pass PACKAGES_JSON and PORTS_JSON so Java applies the
+    // correct 16 MB QUIC buffer and TikTok-only package filter.
     await VpnModule.startVpn(
-      RELAY_URL, '', 'host', this.hostId, netType, ''
+      RELAY_URL, '', 'host', this.hostId, netType, '',
+      PACKAGES_JSON, PORTS_JSON
     );
   }
 
@@ -172,8 +225,10 @@ class TikTokVpnService {
     this.currentCode = null;
     this._stopping      = false;
     this.reconnectTries = 0;
+    // FIX-TK-1: pass PACKAGES_JSON and PORTS_JSON.
     await VpnModule.startVpn(
-      RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId
+      RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId,
+      PACKAGES_JSON, PORTS_JSON
     );
   }
 
@@ -191,9 +246,17 @@ class TikTokVpnService {
         if (this._stopping) return;
         const deviceId = await this.getDeviceId();
         if (this.role === 'host') {
-          await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, this.netType, '');
+          // FIX-TK-2: include PACKAGES_JSON and PORTS_JSON on reconnect too.
+          await VpnModule.startVpn(
+            RELAY_URL, '', 'host', this.hostId, this.netType, '',
+            PACKAGES_JSON, PORTS_JSON
+          );
         } else if (this.role === 'client' && this.accessCode) {
-          await VpnModule.startVpn(RELAY_URL, this.accessCode, 'client', '', '', deviceId);
+          // FIX-TK-2: include PACKAGES_JSON and PORTS_JSON on reconnect too.
+          await VpnModule.startVpn(
+            RELAY_URL, this.accessCode, 'client', '', '', deviceId,
+            PACKAGES_JSON, PORTS_JSON
+          );
         }
       } catch (e) {
         console.warn(`[${APP_NAME}Service] Reconnect failed:`, e?.message);
