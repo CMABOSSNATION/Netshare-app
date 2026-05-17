@@ -45,6 +45,7 @@ export const FACEBOOK_PACKAGES = [
   'com.facebook.mlite',
   'com.facebook.orca',
   'com.facebook.work',
+  'com.facebook.pages.app',   // Facebook Pages Manager
   // System support
   'com.google.android.gms',
   'com.google.android.gsf',
@@ -53,15 +54,16 @@ export const FACEBOOK_PACKAGES = [
 ];
 
 export const FACEBOOK_PORTS = {
-  443:  600_000,
-  80:   600_000,
-  5228: 900_000,  // FCM push — Messenger notifications
-  3478: 600_000,  // STUN — Messenger voice/video
-  3479: 600_000,
-  5349: 600_000,
-  53:   5_000,
-  853:  5_000,
-  123:  10_000,
+  443:   600_000,
+  80:    600_000,
+  5228:  900_000,  // FCM push — Messenger notifications
+  3478:  600_000,  // STUN — Messenger voice/video
+  3479:  600_000,
+  5349:  600_000,
+  19302: 600_000,  // Google STUN — Messenger video calls fallback
+  53:    5_000,
+  853:   5_000,
+  123:   10_000,
 };
 
 const LOCAL_EVENTS        = new Set(['hostFailover']);
@@ -165,14 +167,6 @@ class FacebookVpnService {
     if (this.reconnectTries >= MAX_RECONNECT_TRIES) { this._fireLocalEvent('reconnectFailed', 'Max reconnect attempts reached'); return; }
     const delay = RECONNECT_BASE_MS * Math.pow(2, this.reconnectTries);
     this.reconnectTries++;
-    this.reconnectTimer = setTimeout(async () => {
-      try {
-        if (this._stopping) return;
-        const deviceId = await this.getDeviceId();
-        if (this.role === 'host') await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, this.netType, '');
-        else if (this.role === 'client' && this.accessCode) await VpnModule.startVpn(RELAY_URL, this.accessCode, 'client', '', '', deviceId);
-      } catch (e) { console.warn(`[${APP_NAME}Service] Reconnect failed:`, e?.message); this._scheduleReconnect(); }
-    }, delay);
   }
 
   _handleFailover(code) { this.currentCode = code; this._failoverBackoffMs = 200; this._fireLocalEvent('hostFailover', code); }

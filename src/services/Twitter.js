@@ -44,12 +44,13 @@ export const TWITTER_PACKAGES = [
 ];
 
 export const TWITTER_PORTS = {
-  443:  600_000,
-  80:   600_000,
-  5228: 900_000,  // FCM push
-  53:   5_000,
-  853:  5_000,
-  123:  10_000,
+  443:   600_000,
+  80:    600_000,
+  5228:  900_000,  // FCM push
+  19302: 600_000,  // Google STUN — Twitter Spaces / voice
+  53:    5_000,
+  853:   5_000,
+  123:   10_000,
 };
 
 const LOCAL_EVENTS        = new Set(['hostFailover']);
@@ -118,7 +119,8 @@ class TwitterVpnService {
   _scheduleReconnect() {
     if (this._stopping) return;
     if (this.reconnectTries >= MAX_RECONNECT_TRIES) { this._fireLocalEvent('reconnectFailed', 'Max reconnect attempts reached'); return; }
-    const delay = RECONNECT_BASE_MS * Math.pow(2, this.reconnectTries++);
+    const delay = RECONNECT_BASE_MS * Math.pow(2, this.reconnectTries);
+    this.reconnectTries++;
     this.reconnectTimer = setTimeout(async () => {
       try {
         if (this._stopping) return;

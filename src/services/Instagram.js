@@ -39,6 +39,7 @@ export const INSTAGRAM_PACKAGES = [
   'com.instagram.android',
   'com.instagram.lite',
   'com.burbn.instagram',
+  'com.instagram.barcelona',  // Threads — shares Instagram auth/session
   // System support
   'com.google.android.gms',
   'com.google.android.gsf',
@@ -47,14 +48,15 @@ export const INSTAGRAM_PACKAGES = [
 ];
 
 export const INSTAGRAM_PORTS = {
-  443:  600_000,  // HTTPS/QUIC — Reels, feed, Stories
-  80:   600_000,  // HTTP fallback
-  3478: 600_000,  // STUN — Instagram Live / video calls
-  3479: 600_000,
-  5228: 900_000,  // FCM push — DM notifications
-  53:   5_000,
-  853:  5_000,
-  123:  10_000,
+  443:   600_000,  // HTTPS/QUIC — Reels, feed, Stories
+  80:    600_000,  // HTTP fallback
+  3478:  600_000,  // STUN — Instagram Live / video calls
+  3479:  600_000,
+  19302: 600_000,  // Google STUN — Instagram Live fallback
+  5228:  900_000,  // FCM push — DM notifications
+  53:    5_000,
+  853:   5_000,
+  123:   10_000,
 };
 
 const LOCAL_EVENTS        = new Set(['hostFailover']);
@@ -123,7 +125,8 @@ class InstagramVpnService {
   _scheduleReconnect() {
     if (this._stopping) return;
     if (this.reconnectTries >= MAX_RECONNECT_TRIES) { this._fireLocalEvent('reconnectFailed', 'Max reconnect attempts reached'); return; }
-    const delay = RECONNECT_BASE_MS * Math.pow(2, this.reconnectTries++);
+    const delay = RECONNECT_BASE_MS * Math.pow(2, this.reconnectTries);
+    this.reconnectTries++;
     this.reconnectTimer = setTimeout(async () => {
       try {
         if (this._stopping) return;
