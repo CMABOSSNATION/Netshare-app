@@ -1,27 +1,26 @@
 /**
- * HomeScreen.jsx — NetShare HTTP/HTTPS Transparent Proxy
+ * HomeScreen.jsx — NetShare Global Tunnel Mode (Remote Only)
  *
  * HOST flow:
  *   1. Tap "Share My Internet"
- *   2. App starts local proxy on :8899, opens WS tunnel to Cloudflare DO, gets a code
+ *   2. App starts proxy on :8899, opens WS tunnel to Cloudflare, gets a code
  *   3. Show session code — clients anywhere in the world can connect
  *
  * CLIENT flow:
  *   1. Tap "Connect to Host"
- *   2. Enter session code
- *   3. App connects to relay DO, starts local tunnel proxy on :8899
- *   4. App requests VPN permission (once) and activates background-data blocker
- *   5. Shows Wi-Fi proxy setup instructions (point to 127.0.0.1:8899)
- *   6. "Test Connection" verifies proxy works
- *   7. All apps (TikTok, WhatsApp, etc.) now use host's internet automatically
- *      Background data from other apps is blocked by the VPN
+ *   2. Enter 4-char session code
+ *   3. App activates VPN → ALL traffic (WiFi + mobile data) routes via host
+ *   4. No manual setup needed — it just works
+ *
+ * LAN / same-WiFi mode has been removed entirely.
+ * Manual proxy setup guide has been removed entirely.
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   View, Text, TouchableOpacity, TextInput, StyleSheet,
-  ScrollView, ActivityIndicator, Alert, Platform,
-  StatusBar, SafeAreaView, Linking, Clipboard,
+  ScrollView, ActivityIndicator, Alert,
+  StatusBar, SafeAreaView, Clipboard,
 } from 'react-native';
 import { useStore } from '../store';
 import proxyService from '../services/ProxyService';
@@ -56,15 +55,11 @@ export default function HomeScreen() {
     tickBandwidth, addClient, removeClient, getSessionDurationMs,
   } = useStore();
 
-  const [codeInput,    setCodeInput]    = useState('');
-  const [proxyInfo,    setProxyInfo]    = useState(null);   // { ip, port, tunnelMode }
-  const [testResult,   setTestResult]   = useState(null);   // 'ok' | 'fail' | null
-  const [testing,      setTesting]      = useState(false);
-  const [showSetup,    setShowSetup]    = useState(false);
-  const [copied,       setCopied]       = useState(false);
-  const [tunnelReady,  setTunnelReady]  = useState(false);  // DO WS paired
-  const [tunnelMode,   setTunnelMode]   = useState(true);   // default on
-  const [vpnStatus,    setVpnStatus]    = useState('idle'); // 'idle'|'active'|'denied'|'error'|'revoked'
+  const [codeInput,   setCodeInput]   = useState('');
+  const [proxyInfo,   setProxyInfo]   = useState(null);
+  const [copied,      setCopied]      = useState(false);
+  const [tunnelReady, setTunnelReady] = useState(false);
+  const [vpnStatus,   setVpnStatus]   = useState('idle'); // 'idle'|'active'|'denied'|'error'|'revoked'
 
   const timerRef = useRef(null);
   const unsubs   = useRef([]);
@@ -79,16 +74,13 @@ export default function HomeScreen() {
       else if (s === 'idle')     setIdle();
     });
 
-    const u2 = proxyService.on('session', ({ code, ip, port, tunnelMode: tm }) => {
+    const u2 = proxyService.on('session', ({ code, ip, port }) => {
       setConnected(code);
-      setProxyInfo({ ip, port, tunnelMode: tm });
-      setTunnelMode(tm);
+      setProxyInfo({ ip, port });
     });
 
-    const u3 = proxyService.on('proxy', ({ ip, port, tunnelMode: tm }) => {
-      setProxyInfo({ ip, port, tunnelMode: tm });
-      setTunnelMode(!!tm);
-      setShowSetup(true);
+    const u3 = proxyService.on('proxy', ({ ip, port }) => {
+      setProxyInfo({ ip, port });
     });
 
     const u4 = proxyService.on('stats', ({ bytesUp: up, bytesDown: down }) => {
@@ -105,20 +97,19 @@ export default function HomeScreen() {
       if (event === 'disconnected') removeClient();
     });
 
-    // VPN status events — only relevant for clients
-    const u7 = proxyService.on('vpn', ({ status: vs, message }) => {
+    const u7 = proxyService.on('vpn', ({ status: vs }) => {
       setVpnStatus(vs);
       if (vs === 'denied') {
         Alert.alert(
           'VPN Permission Denied',
-          'Background data from other apps may still use your mobile data.\n\nYou can re-enable VPN blocking in the connection settings.',
+          'Without VPN, your mobile data is NOT blocked. Other apps can still use your own data in the background.\n\nReconnect and allow VPN for full protection.',
           [{ text: 'OK' }]
         );
       }
       if (vs === 'revoked') {
         Alert.alert(
           'VPN Disconnected',
-          'The VPN was turned off. Background apps can now use your data again.',
+          'The VPN was turned off. Your own data can now be used by background apps.',
           [{ text: 'OK' }]
         );
       }
@@ -132,7 +123,7 @@ export default function HomeScreen() {
 
   useEffect(() => {
     if (status === 'connected') {
-      timerRef.current = setInterval(() => { /* forces re-render */ }, 1000);
+      timerRef.current = setInterval(() => {}, 1000);
     } else {
       clearInterval(timerRef.current);
     }
@@ -144,11 +135,11 @@ export default function HomeScreen() {
   const handleHostStart = useCallback(async () => {
     setRole('host');
     try {
-      await proxyService.startAsHost({ tunnelMode });
+      await proxyService.startAsHost({ tunnelMode: true });
     } catch (err) {
       Alert.alert('Error', err.message);
     }
-  }, [tunnelMode]);
+  }, []);
 
   const handleClientConnect = useCallback(async () => {
     const code = codeInput.trim().toUpperCase();
@@ -160,18 +151,6 @@ export default function HomeScreen() {
     try {
       const info = await proxyService.startAsClient(code);
       setProxyInfo(info);
-      setShowSetup(true);
-
-      // FIX (Bug 3): The client inherits tunnelMode from the relay session —
-      // the host controls it, not the client. If the host started in LAN mode,
-      // warn the user so they understand why it only works on the same Wi-Fi.
-      if (!info.tunnelMode) {
-        Alert.alert(
-          '⚠️ LAN Mode Only',
-          'The host started this session in LAN mode. You must be on the same Wi-Fi network as the host for this to work.\n\nAsk the host to restart with "Global Tunnel" enabled for long-distance use.',
-          [{ text: 'OK' }]
-        );
-      }
     } catch (err) {
       Alert.alert('Connection failed', err.message);
     }
@@ -180,43 +159,10 @@ export default function HomeScreen() {
   const handleStop = useCallback(async () => {
     await proxyService.stop();
     setProxyInfo(null);
-    setShowSetup(false);
-    setTestResult(null);
     setTunnelReady(false);
     setVpnStatus('idle');
     setCodeInput('');
   }, []);
-
-  const handleTestConnection = useCallback(async () => {
-    setTesting(true);
-    setTestResult(null);
-    const info = proxyService.getProxyInfo();
-    if (!info) { setTesting(false); setTestResult('fail'); return; }
-
-    try {
-      const res = await fetch(
-        `${proxyService.RELAY_URL}/probe`,
-        {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ ip: info.ip, port: info.port }),
-        }
-      );
-      const data = await res.json();
-      setTestResult(data.ok !== false ? 'ok' : 'fail');
-    } catch {
-      try {
-        const r = await fetch(`http://${info.ip}:${info.port}`, {
-          signal: AbortSignal.timeout(4000),
-        });
-        setTestResult(r.status < 500 ? 'ok' : 'fail');
-      } catch {
-        setTestResult(tunnelReady ? 'ok' : 'fail');
-      }
-    } finally {
-      setTesting(false);
-    }
-  }, [tunnelReady]);
 
   const copyCode = useCallback(() => {
     const code = proxyService.getSessionCode();
@@ -227,12 +173,6 @@ export default function HomeScreen() {
     }
   }, []);
 
-  const openWifiSettings = () => {
-    Linking.sendIntent('android.settings.WIFI_SETTINGS').catch(() =>
-      Linking.openSettings()
-    );
-  };
-
   // ── Derived state ───────────────────────────────────────────────────────────
 
   const isConnected  = status === 'connected';
@@ -240,116 +180,22 @@ export default function HomeScreen() {
   const isHost       = role === 'host';
   const isClient     = role === 'client';
   const hostCode     = proxyService.getSessionCode();
-  const isTunnel     = proxyService.getTunnelMode();
   const vpnBlocking  = vpnStatus === 'active';
 
-  // ── VPN status pill ─────────────────────────────────────────────────────────
+  // ── VPN status banner ───────────────────────────────────────────────────────
 
-  function renderVpnPill() {
+  function renderVpnBanner() {
     if (vpnStatus === 'idle') return null;
-
     const configs = {
-      active:  { bg: '#14532d', text: '🔒 VPN active — background data blocked' },
-      denied:  { bg: '#78350f', text: '⚠️ VPN denied — background apps may use your data' },
-      error:   { bg: '#7f1d1d', text: '⚠️ VPN error — background apps may use your data' },
-      revoked: { bg: '#7f1d1d', text: '⚠️ VPN off — background apps can use your data' },
+      active:  { bg: '#14532d', text: '🔒 VPN active — all traffic via host' },
+      denied:  { bg: '#78350f', text: '⚠️ VPN denied — your data is NOT fully blocked' },
+      error:   { bg: '#7f1d1d', text: '⚠️ VPN error — your data may still be used' },
+      revoked: { bg: '#7f1d1d', text: '⚠️ VPN off — reconnect for full protection' },
     };
     const cfg = configs[vpnStatus] || configs.error;
-
     return (
-      <View style={[s.vpnPill, { backgroundColor: cfg.bg }]}>
-        <Text style={s.vpnPillText}>{cfg.text}</Text>
-      </View>
-    );
-  }
-
-  // ── Client setup guide ──────────────────────────────────────────────────────
-
-  function renderSetupGuide() {
-    if (!proxyInfo) return null;
-    const { ip, port } = proxyInfo;
-
-    return (
-      <View style={s.setupBox}>
-        <Text style={s.setupTitle}>📡 Configure Wi-Fi Proxy</Text>
-
-        {isTunnel && (
-          <View style={s.tunnelBadge}>
-            <Text style={s.tunnelBadgeText}>
-              🌐 Tunnel Mode — works over any distance
-            </Text>
-          </View>
-        )}
-
-        {/* VPN blocking status */}
-        {renderVpnPill()}
-
-        <Text style={s.setupDesc}>
-          All your apps (TikTok, WhatsApp, Instagram, etc.) will automatically
-          use the host's internet once you set this up.
-          {vpnBlocking
-            ? '\n\n🔒 Background apps are blocked from using your own data.'
-            : ''}
-        </Text>
-
-        <View style={s.stepList}>
-          {[
-            'Open Android Settings',
-            'Tap Wi-Fi',
-            'Long-press your connected network',
-            'Tap "Modify network"',
-            'Expand "Advanced options"',
-            'Set Proxy to "Manual"',
-            `Set Proxy hostname to:  ${ip}`,
-            `Set Proxy port to:  ${port}`,
-            'Tap Save',
-          ].map((step, i) => (
-            <View key={i} style={s.step}>
-              <View style={s.stepNum}><Text style={s.stepNumText}>{i + 1}</Text></View>
-              <Text style={s.stepText}>{step}</Text>
-            </View>
-          ))}
-        </View>
-
-        <TouchableOpacity style={s.wifiBtn} onPress={openWifiSettings}>
-          <Text style={s.wifiBtnText}>Open Wi-Fi Settings →</Text>
-        </TouchableOpacity>
-
-        <View style={s.proxyRow}>
-          <Text style={s.proxyLabel}>Proxy Host:</Text>
-          <Text style={s.proxyValue}>{ip}</Text>
-        </View>
-        <View style={s.proxyRow}>
-          <Text style={s.proxyLabel}>Port:</Text>
-          <Text style={s.proxyValue}>{port}</Text>
-        </View>
-
-        {/* Tunnel status pill */}
-        {isTunnel && (
-          <View style={[s.tunnelStatus, tunnelReady ? s.tunnelOk : s.tunnelWaiting]}>
-            <Text style={s.tunnelStatusText}>
-              {tunnelReady ? '🟢 Tunnel connected to host' : '⏳ Waiting for tunnel…'}
-            </Text>
-          </View>
-        )}
-
-        <TouchableOpacity
-          style={[s.testBtn,
-            testResult === 'ok'   && s.testBtnOk,
-            testResult === 'fail' && s.testBtnFail,
-          ]}
-          onPress={handleTestConnection}
-          disabled={testing || (isTunnel && !tunnelReady)}
-        >
-          {testing
-            ? <ActivityIndicator color="#fff" />
-            : <Text style={s.testBtnText}>
-                {testResult === 'ok'   ? '✓ Proxy is working!'
-                : testResult === 'fail' ? '✗ Not reachable — check settings'
-                : '🔍 Test Connection'}
-              </Text>
-          }
-        </TouchableOpacity>
+      <View style={[s.vpnBanner, { backgroundColor: cfg.bg }]}>
+        <Text style={s.vpnBannerText}>{cfg.text}</Text>
       </View>
     );
   }
@@ -364,9 +210,7 @@ export default function HomeScreen() {
         {/* Header */}
         <View style={s.header}>
           <Text style={s.headerTitle}>NetShare</Text>
-          <Text style={s.headerSub}>
-            {isTunnel ? '🌐 Global Tunnel Mode' : '📶 LAN Mode'}
-          </Text>
+          <Text style={s.headerSub}>🌐 Global Tunnel Mode</Text>
         </View>
 
         {/* Status badge */}
@@ -381,7 +225,7 @@ export default function HomeScreen() {
             )}
             <Text style={s.badgeText}>
               {isConnecting ? 'Connecting…'
-              : isConnected  ? (isHost ? '🟢 Sharing internet' : '🟢 Connected via proxy')
+              : isConnected  ? (isHost ? '🟢 Sharing internet' : '🟢 Connected to host')
               : `⚠ ${errorMessage || 'Error'}`}
             </Text>
           </View>
@@ -390,43 +234,25 @@ export default function HomeScreen() {
         {/* ── Idle screen ── */}
         {status === 'idle' && (
           <>
-            <Text style={s.sectionLabel}>I want to…</Text>
-
-            {/* Tunnel mode toggle */}
-            <View style={s.toggleRow}>
-              <Text style={s.toggleLabel}>
-                🌐 Global Tunnel (works over 300km+)
-              </Text>
-              <TouchableOpacity
-                style={[s.toggle, tunnelMode && s.toggleOn]}
-                onPress={() => setTunnelMode(v => !v)}
-              >
-                <View style={[s.toggleThumb, tunnelMode && s.toggleThumbOn]} />
-              </TouchableOpacity>
-            </View>
-            {!tunnelMode && (
-              <Text style={s.toggleHint}>⚠ LAN mode only works on the same Wi-Fi network</Text>
-            )}
-
+            {/* Host card */}
             <TouchableOpacity style={s.roleCard} onPress={handleHostStart}>
               <Text style={s.roleIcon}>📡</Text>
               <View style={s.roleText}>
                 <Text style={s.roleTitle}>Share My Internet</Text>
                 <Text style={s.roleDesc}>
-                  {tunnelMode
-                    ? 'Start a tunnel proxy. Anyone worldwide can connect with your session code.'
-                    : 'Start a proxy server. Others on the same Wi-Fi can use your internet.'}
+                  Start a global tunnel. Anyone anywhere can use your internet with your session code.
                 </Text>
               </View>
             </TouchableOpacity>
 
             <View style={s.divider}><Text style={s.dividerText}>or</Text></View>
 
+            {/* Client box */}
             <View style={s.clientBox}>
               <Text style={s.sectionLabel}>Connect to a host</Text>
               <TextInput
                 style={s.codeInput}
-                placeholder="Enter session code (e.g. AB3F)"
+                placeholder="Enter session code (e.g. HQRQ)"
                 placeholderTextColor="#64748b"
                 value={codeInput}
                 onChangeText={t => setCodeInput(t.toUpperCase())}
@@ -437,7 +263,7 @@ export default function HomeScreen() {
                 <Text style={s.connectBtnText}>Connect</Text>
               </TouchableOpacity>
               <Text style={s.vpnNote}>
-                🔒 A VPN will be activated to block background data from other apps
+                🔒 VPN activates automatically — all apps use host's internet, your data is blocked
               </Text>
             </View>
           </>
@@ -448,7 +274,7 @@ export default function HomeScreen() {
           <View style={s.center}>
             <ActivityIndicator size="large" color="#38bdf8" />
             <Text style={s.centerText}>
-              {isHost ? 'Starting proxy & tunnel…' : 'Connecting & activating VPN…'}
+              {isHost ? 'Starting tunnel…' : 'Connecting & activating VPN…'}
             </Text>
           </View>
         )}
@@ -466,29 +292,23 @@ export default function HomeScreen() {
             </View>
 
             {/* Tunnel status */}
-            {isTunnel && (
-              <View style={[s.tunnelStatus, tunnelReady ? s.tunnelOk : s.tunnelWaiting]}>
-                <Text style={s.tunnelStatusText}>
-                  {tunnelReady
-                    ? '🟢 Cloudflare tunnel active — global range'
-                    : '⏳ Opening tunnel to Cloudflare…'}
-                </Text>
-              </View>
-            )}
+            <View style={[s.tunnelStatus, tunnelReady ? s.tunnelOk : s.tunnelWaiting]}>
+              <Text style={s.tunnelStatusText}>
+                {tunnelReady
+                  ? '🟢 Cloudflare tunnel active — global range'
+                  : '⏳ Opening tunnel to Cloudflare…'}
+              </Text>
+            </View>
 
-            {/* Proxy info */}
+            {/* Tunnel proxy info */}
             {proxyInfo && (
               <View style={s.infoBox}>
-                <Text style={s.infoLabel}>
-                  {isTunnel ? 'Tunnel Proxy' : 'Proxy Address'}
-                </Text>
+                <Text style={s.infoLabel}>Tunnel Proxy</Text>
                 <Text style={s.infoValue}>
-                  {isTunnel ? `Via Cloudflare DO → ${proxyInfo.ip}:${proxyInfo.port}` : `${proxyInfo.ip}:${proxyInfo.port}`}
+                  Via Cloudflare DO →{'\n'}{proxyInfo.ip}:{proxyInfo.port}
                 </Text>
                 <Text style={s.infoDesc}>
-                  {isTunnel
-                    ? 'Clients anywhere can connect using the session code above. Traffic is relayed through Cloudflare.'
-                    : 'Clients on the same Wi-Fi must set this as their proxy.'}
+                  Clients anywhere can connect using the session code above. Traffic is relayed through Cloudflare.
                 </Text>
               </View>
             )}
@@ -523,28 +343,39 @@ export default function HomeScreen() {
         {/* ── Connected: CLIENT ── */}
         {isConnected && isClient && (
           <>
-            {/* VPN blocking status — shown prominently for clients */}
-            {renderVpnPill()}
+            {/* VPN banner — most important info for client */}
+            {renderVpnBanner()}
 
-            {showSetup ? renderSetupGuide() : (
-              <View style={s.center}>
-                <ActivityIndicator color="#38bdf8" />
-                <Text style={s.centerText}>Connecting to host tunnel…</Text>
-              </View>
-            )}
+            {/* Connection confirmed */}
+            <View style={s.connectedBox}>
+              <Text style={s.connectedTitle}>
+                {tunnelReady ? '🟢 Connected to host' : '⏳ Waiting for host tunnel…'}
+              </Text>
+              <Text style={s.connectedDesc}>
+                {vpnBlocking
+                  ? 'All your apps are now using the host\'s internet. Your own mobile data is blocked.'
+                  : 'Connected via tunnel. Enable VPN for full data blocking.'}
+              </Text>
+            </View>
 
-            {testResult === 'ok' && (
-              <View style={s.statsRow}>
-                <View style={s.stat}>
-                  <Text style={s.statVal}>{formatBytes(bytesDown)}</Text>
-                  <Text style={s.statLabel}>↓ Received</Text>
-                </View>
-                <View style={s.stat}>
-                  <Text style={s.statVal}>{formatDuration(getSessionDurationMs())}</Text>
-                  <Text style={s.statLabel}>Duration</Text>
-                </View>
+            {/* Tunnel status */}
+            <View style={[s.tunnelStatus, tunnelReady ? s.tunnelOk : s.tunnelWaiting]}>
+              <Text style={s.tunnelStatusText}>
+                {tunnelReady ? '🟢 Tunnel connected to host' : '⏳ Waiting for tunnel…'}
+              </Text>
+            </View>
+
+            {/* Stats */}
+            <View style={s.statsRow}>
+              <View style={s.stat}>
+                <Text style={s.statVal}>{formatBytes(bytesDown)}</Text>
+                <Text style={s.statLabel}>↓ Received</Text>
               </View>
-            )}
+              <View style={s.stat}>
+                <Text style={s.statVal}>{formatDuration(getSessionDurationMs())}</Text>
+                <Text style={s.statLabel}>Duration</Text>
+              </View>
+            </View>
 
             <TouchableOpacity style={s.stopBtn} onPress={handleStop}>
               <Text style={s.stopBtnText}>Disconnect</Text>
@@ -575,7 +406,7 @@ const s = StyleSheet.create({
 
   header:           { alignItems: 'center', marginBottom: 28 },
   headerTitle:      { fontSize: 32, fontWeight: '800', color: '#f1f5f9', letterSpacing: 1 },
-  headerSub:        { fontSize: 13, color: '#64748b', marginTop: 4 },
+  headerSub:        { fontSize: 13, color: '#38bdf8', marginTop: 4 },
 
   badge:            { flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
                       borderRadius: 24, paddingVertical: 10, paddingHorizontal: 18, marginBottom: 20 },
@@ -586,17 +417,6 @@ const s = StyleSheet.create({
 
   sectionLabel:     { color: '#94a3b8', fontSize: 13, fontWeight: '600',
                       textTransform: 'uppercase', letterSpacing: 1, marginBottom: 12 },
-
-  // Tunnel toggle
-  toggleRow:        { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-                      backgroundColor: '#1e293b', borderRadius: 12, padding: 14, marginBottom: 8 },
-  toggleLabel:      { color: '#cbd5e1', fontSize: 13, flex: 1 },
-  toggle:           { width: 44, height: 24, borderRadius: 12, backgroundColor: '#334155',
-                      padding: 2, justifyContent: 'center' },
-  toggleOn:         { backgroundColor: '#0ea5e9' },
-  toggleThumb:      { width: 20, height: 20, borderRadius: 10, backgroundColor: '#94a3b8' },
-  toggleThumbOn:    { backgroundColor: '#fff', alignSelf: 'flex-end' },
-  toggleHint:       { color: '#f59e0b', fontSize: 12, marginBottom: 12, textAlign: 'center' },
 
   roleCard:         { flexDirection: 'row', backgroundColor: '#1e293b', borderRadius: 16,
                       padding: 18, marginBottom: 12, alignItems: 'center' },
@@ -632,7 +452,7 @@ const s = StyleSheet.create({
   infoBox:          { backgroundColor: '#1e293b', borderRadius: 14, padding: 16, marginBottom: 16 },
   infoLabel:        { color: '#64748b', fontSize: 12, fontWeight: '600',
                       textTransform: 'uppercase', letterSpacing: 1, marginBottom: 4 },
-  infoValue:        { color: '#38bdf8', fontSize: 16, fontWeight: '700', fontFamily: 'monospace' },
+  infoValue:        { color: '#38bdf8', fontSize: 15, fontWeight: '700', fontFamily: 'monospace' },
   infoDesc:         { color: '#64748b', fontSize: 12, marginTop: 8, lineHeight: 17 },
 
   statsRow:         { flexDirection: 'row', justifyContent: 'space-around',
@@ -648,40 +468,15 @@ const s = StyleSheet.create({
                       alignItems: 'center', marginTop: 8 },
   stopBtnText:      { color: '#fca5a5', fontWeight: '700', fontSize: 16 },
 
-  // Tunnel status pill
   tunnelStatus:     { borderRadius: 10, padding: 10, alignItems: 'center', marginBottom: 12 },
   tunnelOk:         { backgroundColor: '#14532d' },
   tunnelWaiting:    { backgroundColor: '#1e3a5f' },
   tunnelStatusText: { color: '#f1f5f9', fontSize: 13, fontWeight: '600' },
 
-  tunnelBadge:      { backgroundColor: '#0c4a6e', borderRadius: 8, padding: 8,
-                      alignItems: 'center', marginBottom: 12 },
-  tunnelBadgeText:  { color: '#7dd3fc', fontSize: 12, fontWeight: '600' },
+  vpnBanner:        { borderRadius: 10, padding: 12, alignItems: 'center', marginBottom: 14 },
+  vpnBannerText:    { color: '#f1f5f9', fontSize: 13, fontWeight: '600', textAlign: 'center' },
 
-  // VPN status pill
-  vpnPill:          { borderRadius: 10, padding: 10, alignItems: 'center', marginBottom: 12 },
-  vpnPillText:      { color: '#f1f5f9', fontSize: 13, fontWeight: '600' },
-
-  // Client setup guide
-  setupBox:         { backgroundColor: '#1e293b', borderRadius: 16, padding: 18, marginBottom: 16 },
-  setupTitle:       { color: '#f1f5f9', fontSize: 17, fontWeight: '700', marginBottom: 8 },
-  setupDesc:        { color: '#64748b', fontSize: 13, lineHeight: 19, marginBottom: 16 },
-  stepList:         { marginBottom: 16 },
-  step:             { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 10 },
-  stepNum:          { width: 24, height: 24, borderRadius: 12, backgroundColor: '#0ea5e9',
-                      alignItems: 'center', justifyContent: 'center', marginRight: 10, marginTop: 1 },
-  stepNumText:      { color: '#fff', fontSize: 12, fontWeight: '700' },
-  stepText:         { color: '#cbd5e1', fontSize: 13, flex: 1, lineHeight: 19 },
-  wifiBtn:          { backgroundColor: '#0ea5e9', borderRadius: 10, padding: 12,
-                      alignItems: 'center', marginBottom: 16 },
-  wifiBtnText:      { color: '#fff', fontWeight: '700' },
-  proxyRow:         { flexDirection: 'row', justifyContent: 'space-between',
-                      paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#334155' },
-  proxyLabel:       { color: '#64748b', fontSize: 13 },
-  proxyValue:       { color: '#38bdf8', fontSize: 13, fontFamily: 'monospace', fontWeight: '700' },
-  testBtn:          { backgroundColor: '#334155', borderRadius: 10, padding: 14,
-                      alignItems: 'center', marginTop: 14 },
-  testBtnOk:        { backgroundColor: '#14532d' },
-  testBtnFail:      { backgroundColor: '#7f1d1d' },
-  testBtnText:      { color: '#f1f5f9', fontWeight: '600' },
+  connectedBox:     { backgroundColor: '#1e293b', borderRadius: 14, padding: 18, marginBottom: 14 },
+  connectedTitle:   { color: '#f1f5f9', fontSize: 17, fontWeight: '700', marginBottom: 6 },
+  connectedDesc:    { color: '#64748b', fontSize: 13, lineHeight: 19 },
 });
