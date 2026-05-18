@@ -8,39 +8,47 @@
  *   Android Wi-Fi proxy settings. Traffic is direct host ↔ client.
  *   Range: same Wi-Fi network only (~100m).
  *
- * MODE 2: WebSocket Tunnel (tunnelMode = true)  ← NEW — fixes 300km problem
- *   Host opens WebSocket to relay /ws/host/:code
- *   Client opens WebSocket to relay /ws/client/:code
- *   Relay (Durable Object) pipes bytes between both WebSockets.
- *   Client side: a local proxy server on :8899 bridges the WS tunnel.
- *   Traffic flows: Client app → localhost:8899 → WS → Relay DO → WS → Host
- *   Range: anywhere in the world (through Cloudflare edge).
+ * MODE 2: WebSocket Tunnel via Cloudflare Durable Object (tunnelMode = true)
+ *   Host opens WebSocket to relay /ws/host/:code  (Durable Object)
+ *   Client opens WebSocket to relay /ws/client/:code (same DO instance)
+ *   DO pipes binary frames between both WebSockets.
  *
- * The host decides which mode based on whether a public IP is available.
- * The UI can also let the user pick.
+ *   Host side:
+ *     ProxyModule (Java) starts local proxy on :8899.
+ *     ProxyModule.startTunnelBridge(wsUrl) — Java opens its OWN WS to the DO,
+ *     intercepts every CONNECT request, and pipes raw TCP bytes over WS frames.
+ *
+ *   Client side:
+ *     ProxyModule.startProxy() starts local proxy on :8899.
+ *     ProxyModule.startClientTunnel(wsUrl) — Java opens its OWN WS to the DO,
+ *     bridges localhost:8899 HTTP CONNECT traffic through the WS tunnel.
+ *
+ *   Result: Client app → localhost:8899 → WS → DO → WS → Host → Internet
+ *   Range: anywhere in the world (Cloudflare edge).
  */
 
-import { NativeModules } from 'react-native';
+import { NativeModules, NativeEventEmitter } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const { ProxyModule } = NativeModules;
+const proxyEmitter = new NativeEventEmitter(ProxyModule);
 
 export const RELAY_URL = process.env.RELAY_URL
   || 'https://netshare.cmaraphael90.workers.dev';
 
-// WebSocket URL (wss:// version of the relay)
+// WebSocket base URL (wss://)
 const RELAY_WS_URL = RELAY_URL.replace(/^https?:\/\//, 'wss://');
 
 // ── Internal state ────────────────────────────────────────────────────────────
 
-let _listeners      = {};
-let _sessionCode    = null;
-let _role           = null;      // 'host' | 'client'
-let _statsInterval  = null;
-let _pingInterval   = null;
-let _proxyInfo      = null;      // { ip, port, proxyUrl, tunnelMode }
-let _tunnelWs       = null;      // WebSocket for tunnel mode
-let _tunnelMode     = false;
+let _listeners     = {};
+let _sessionCode   = null;
+let _role          = null;      // 'host' | 'client'
+let _statsInterval = null;
+let _pingInterval  = null;
+let _proxyInfo     = null;      // { ip, port, tunnelMode }
+let _tunnelMode    = false;
+let _nativeSubList = [];        // NativeEventEmitter unsub functions
 
 // ── Event emitter ─────────────────────────────────────────────────────────────
 
@@ -60,43 +68,27 @@ export function on(event, cb) {
 
 /**
  * startAsHost(options)
- *   options.tunnelMode = true  → use WebSocket relay (works over 300km+)
- *   options.tunnelMode = false → use LAN mode (same Wi-Fi only)
+ *   options.tunnelMode = true  → Durable Object WS relay (works anywhere)
+ *   options.tunnelMode = false → LAN mode (same Wi-Fi only)
  *
- * If tunnelMode is not specified, we auto-detect:
- *   - If Wi-Fi IP is a private IP (192.168.x.x), default to tunnel mode
- *     so clients outside the LAN can connect.
+ *   Defaults to tunnelMode = true so 300km+ sharing works out of the box.
  */
 export async function startAsHost(options = {}) {
   _role = 'host';
   emit('status', { status: 'connecting' });
 
   try {
-    // 1. Start the local HTTP CONNECT proxy server
-    _proxyInfo = await ProxyModule.startProxy();
-    const { ip, port } = _proxyInfo;
+    // 1. Start local HTTP CONNECT proxy on :8899
+    const proxyResult = await ProxyModule.startProxy();
+    const { ip, port } = proxyResult;
 
-    // Auto-detect tunnel mode if not specified
-    const isLanIp = ip && (
-      ip.startsWith('192.168.') ||
-      ip.startsWith('10.')      ||
-      ip.startsWith('172.')
-    );
-    // Default to tunnel mode for long-distance sharing
     _tunnelMode = options.tunnelMode !== undefined ? options.tunnelMode : true;
 
-    // 2. Register with relay
-    const body = {
-      ip,
-      port,
-      type:       'http-proxy',
-      tunnelMode: _tunnelMode,
-    };
-
+    // 2. Register with relay → get session code
     const res = await fetch(`${RELAY_URL}/register`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(body),
+      body:    JSON.stringify({ ip, port, type: 'http-proxy', tunnelMode: _tunnelMode }),
     });
 
     if (!res.ok) throw new Error(`Relay register failed: ${res.status}`);
@@ -105,16 +97,24 @@ export async function startAsHost(options = {}) {
     _sessionCode = code;
     await AsyncStorage.setItem('netshare_session_id', sessionId);
 
-    // 3. If tunnel mode: open WS to relay so traffic can flow
+    // 3. Tunnel mode: tell Java to open its own WS to the DO and bridge traffic
     if (_tunnelMode) {
-      await _openHostTunnel(code, sessionId);
+      const wsUrl = `${RELAY_WS_URL}/ws/host/${code}`;
+      // Java opens WS, accepts local CONNECT requests,
+      // wraps each request as a binary WS frame, receives response frames back.
+      await ProxyModule.startTunnelBridge(wsUrl);
     }
 
-    // 4. Start bandwidth polling
+    // 4. Listen for native events (client count, tunnel status, errors)
+    _subscribeNativeEvents();
+
+    // 5. Stats poll
     _startStatsPoll();
 
-    // 5. Keep session alive with periodic pings
+    // 6. Keep-alive pings every 30s
     _pingInterval = setInterval(() => _keepAlive(sessionId), 30_000);
+
+    _proxyInfo = { ip, port, tunnelMode: _tunnelMode };
 
     emit('status',  { status: 'connected' });
     emit('session', { code, ip, port, tunnelMode: _tunnelMode });
@@ -133,7 +133,7 @@ export async function startAsClient(code) {
   emit('status', { status: 'connecting' });
 
   try {
-    // 1. Look up session code on relay
+    // 1. Look up session on relay
     const res = await fetch(`${RELAY_URL}/join/${code.toUpperCase().trim()}`);
     if (!res.ok) {
       if (res.status === 404) throw new Error('Session code not found or expired');
@@ -145,40 +145,39 @@ export async function startAsClient(code) {
     await AsyncStorage.setItem('netshare_session_id', sessionId);
 
     if (_tunnelMode) {
-      // ── Tunnel mode: connect to relay WS, start local proxy bridge ──────
-      // The local ProxyModule still listens on :8899.
-      // The Java proxy now forwards each CONNECT to the WS tunnel instead of
-      // directly opening a TCP socket to the remote host.
-      //
-      // We open the WS tunnel here; ProxyModule.startTunnelProxy() starts
-      // a local proxy that bridges Android's HTTP CONNECT into this WS.
-      await _openClientTunnel(code);
+      // ── Tunnel mode ───────────────────────────────────────────────────────
+      // Java starts a local proxy on :8899 that speaks HTTP CONNECT.
+      // Java also opens a WS to the DO client endpoint.
+      // Every CONNECT request on :8899 is wrapped in a binary WS frame,
+      // forwarded to the DO, which forwards it to the host WS.
+      // Responses come back the same way.
 
-      _proxyInfo = {
-        ip:         '127.0.0.1',
-        port:       8899,
-        proxyUrl:   '127.0.0.1:8899',
-        tunnelMode: true,
-      };
+      await ProxyModule.startProxy();                           // local :8899
+      const wsUrl = `${RELAY_WS_URL}/ws/client/${code.toUpperCase().trim()}`;
+      await ProxyModule.startClientTunnel(wsUrl);              // bridge WS
 
+      _proxyInfo = { ip: '127.0.0.1', port: 8899, tunnelMode: true };
+      _subscribeNativeEvents();
       _startStatsPoll();
+
       emit('status', { status: 'connected' });
-      emit('proxy',  { ip: '127.0.0.1', port: 8899, proxyUrl: '127.0.0.1:8899', tunnelMode: true });
+      emit('proxy',  { ip: '127.0.0.1', port: 8899, tunnelMode: true });
       return { ip: '127.0.0.1', port: 8899, tunnelMode: true };
 
     } else {
-      // ── LAN mode: check reachability then show setup guide ───────────────
+      // ── LAN mode ──────────────────────────────────────────────────────────
+      // Just hand the host IP:port to the client for manual proxy config.
       const reachable = await _testProxy(ip, port);
       if (!reachable) {
-        // Don't hard-fail — warn the user but let them try
-        console.warn(`[ProxyService] Probe failed for ${ip}:${port} — may still work on LAN`);
+        console.warn(`[ProxyService] LAN probe failed for ${ip}:${port} — proceeding anyway`);
       }
 
-      _proxyInfo = { ip, port, proxyUrl: `${ip}:${port}`, tunnelMode: false };
+      _proxyInfo = { ip, port, tunnelMode: false };
+      _subscribeNativeEvents();
       _startStatsPoll();
 
       emit('status', { status: 'connected' });
-      emit('proxy',  { ip, port, proxyUrl: `${ip}:${port}`, tunnelMode: false });
+      emit('proxy',  { ip, port, tunnelMode: false });
       return { ip, port, tunnelMode: false };
     }
   } catch (err) {
@@ -195,14 +194,13 @@ export async function stop() {
   _statsInterval = null;
   _pingInterval  = null;
 
-  // Close tunnel WebSocket
-  if (_tunnelWs) {
-    try { _tunnelWs.close(); } catch (_) {}
-    _tunnelWs = null;
-  }
+  // Unsubscribe native events
+  _nativeSubList.forEach(sub => { try { sub.remove(); } catch (_) {} });
+  _nativeSubList = [];
 
   if (_role === 'host') {
     try { await ProxyModule.stopProxy(); } catch (_) {}
+    try { await ProxyModule.stopTunnelBridge(); } catch (_) {}
 
     const sessionId = await AsyncStorage.getItem('netshare_session_id');
     if (sessionId) {
@@ -213,7 +211,13 @@ export async function stop() {
           body:    JSON.stringify({ sessionId }),
         });
       } catch (_) {}
+      await AsyncStorage.removeItem('netshare_session_id');
     }
+  }
+
+  if (_role === 'client') {
+    try { await ProxyModule.stopProxy(); } catch (_) {}
+    try { await ProxyModule.stopClientTunnel(); } catch (_) {}
   }
 
   _sessionCode = null;
@@ -221,6 +225,7 @@ export async function stop() {
   _proxyInfo   = null;
   _tunnelMode  = false;
   _listeners   = {};
+
   emit('status', { status: 'idle' });
 }
 
@@ -231,96 +236,34 @@ export function getSessionCode() { return _sessionCode; }
 export function getRole()        { return _role; }
 export function getTunnelMode()  { return _tunnelMode; }
 
-// ── Tunnel helpers ────────────────────────────────────────────────────────────
+// ── Native event subscriptions ────────────────────────────────────────────────
 
 /**
- * Host opens WS to relay. The relay DO will pair this with the client WS.
- * The Java ProxyModule handles actual TCP→WS bridging on the host side.
+ * Subscribe to events emitted by ProxyModule (Java → JS).
+ * Java calls ProxyModule.emitEvent(name, data) for:
+ *   'ProxyClientConnected'   → a new client connected to the tunnel
+ *   'ProxyClientDisconnected'→ a client disconnected
+ *   'ProxyTunnelError'       → fatal tunnel error (string message)
+ *   'ProxyTunnelReady'       → tunnel WS fully paired with peer
  */
-async function _openHostTunnel(code, sessionId) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`${RELAY_WS_URL}/ws/host/${code}`);
-    _tunnelWs = ws;
+function _subscribeNativeEvents() {
+  _nativeSubList.forEach(s => { try { s.remove(); } catch (_) {} });
+  _nativeSubList = [];
 
-    const timeout = setTimeout(() => {
-      reject(new Error('Host tunnel connection timed out'));
-    }, 10_000);
-
-    ws.onopen = () => {
-      console.log('[ProxyService] Host tunnel WS open');
-      clearTimeout(timeout);
-      // Notify ProxyModule to use this WS for piping traffic
-      // ProxyModule.attachTunnel(ws) — implement in Java if needed
-      resolve();
-    };
-
-    ws.onmessage = (evt) => {
-      try {
-        const msg = JSON.parse(evt.data);
-        if (msg.type === 'paired') {
-          emit('tunnel', { status: 'client_connected' });
-        }
-      } catch (_) {
-        // Binary frame — raw traffic bytes (handled by ProxyModule on Java side)
-      }
-    };
-
-    ws.onerror = (e) => {
-      clearTimeout(timeout);
-      console.error('[ProxyService] Host tunnel WS error', e);
-      reject(new Error('Tunnel connection failed'));
-    };
-
-    ws.onclose = () => {
-      console.log('[ProxyService] Host tunnel WS closed');
-      emit('tunnel', { status: 'disconnected' });
-    };
-  });
-}
-
-/**
- * Client opens WS to relay. The relay DO pairs it with the host WS.
- * Raw traffic from the client's local proxy (localhost:8899) flows through here.
- */
-async function _openClientTunnel(code) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`${RELAY_WS_URL}/ws/client/${code}`);
-    _tunnelWs = ws;
-
-    const timeout = setTimeout(() => {
-      reject(new Error('Client tunnel connection timed out'));
-    }, 10_000);
-
-    ws.onopen = () => {
-      console.log('[ProxyService] Client tunnel WS open');
-      clearTimeout(timeout);
-      resolve();
-    };
-
-    ws.onmessage = (evt) => {
-      try {
-        const msg = JSON.parse(evt.data);
-        if (msg.type === 'paired') {
-          emit('tunnel', { status: 'host_connected' });
-        } else if (msg.type === 'waiting_for_host') {
-          emit('tunnel', { status: 'waiting_for_host' });
-        }
-      } catch (_) {
-        // Binary frame — raw traffic bytes
-      }
-    };
-
-    ws.onerror = (e) => {
-      clearTimeout(timeout);
-      console.error('[ProxyService] Client tunnel WS error', e);
-      reject(new Error('Tunnel connection failed'));
-    };
-
-    ws.onclose = () => {
-      console.log('[ProxyService] Client tunnel WS closed');
-      emit('tunnel', { status: 'disconnected' });
-    };
-  });
+  _nativeSubList.push(
+    proxyEmitter.addListener('ProxyClientConnected', () => {
+      emit('client', { event: 'connected' });
+    }),
+    proxyEmitter.addListener('ProxyClientDisconnected', () => {
+      emit('client', { event: 'disconnected' });
+    }),
+    proxyEmitter.addListener('ProxyTunnelReady', (data) => {
+      emit('tunnel', { status: 'ready', ...data });
+    }),
+    proxyEmitter.addListener('ProxyTunnelError', (msg) => {
+      emit('status', { status: 'error', message: msg });
+    }),
+  );
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -329,7 +272,7 @@ function _startStatsPoll() {
   _statsInterval = setInterval(async () => {
     try {
       const stats = await ProxyModule.getStats();
-      emit('stats', stats);
+      emit('stats', { bytesUp: stats.up, bytesDown: stats.down });
     } catch (_) {}
   }, 1000);
 }
@@ -345,35 +288,32 @@ async function _keepAlive(sessionId) {
 }
 
 /**
- * _testProxy — server-side probe via relay /probe endpoint.
- * NOTE: This fails for private IPs (192.168.x.x) from Cloudflare's side.
- * In tunnel mode we skip this entirely. In LAN mode we return true optimistically
- * for private IPs since the client is expected to be on the same network.
+ * _testProxy — only meaningful for public IPs in LAN mode.
+ * Private IPs (192.168.x.x) can't be probed from Cloudflare, so we skip.
  */
 async function _testProxy(ip, port) {
-  // Private/LAN IPs can't be probed from Cloudflare — assume reachable
   if (
     ip.startsWith('192.168.') ||
     ip.startsWith('10.')      ||
     ip.startsWith('172.')
   ) {
-    return true;
+    return true; // assume reachable on LAN
   }
 
   try {
     const controller = new AbortController();
-    const timeout    = setTimeout(() => controller.abort(), 5000);
+    const timer = setTimeout(() => controller.abort(), 5000);
     const res = await fetch(`${RELAY_URL}/probe`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ ip, port }),
       signal:  controller.signal,
     });
-    clearTimeout(timeout);
+    clearTimeout(timer);
     const data = await res.json();
     return data.ok !== false;
   } catch (_) {
-    return true; // Let the user try anyway
+    return true; // let the user try anyway
   }
 }
 
@@ -386,4 +326,5 @@ export default {
   getSessionCode,
   getRole,
   getTunnelMode,
+  RELAY_URL,
 };
