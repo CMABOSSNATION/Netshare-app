@@ -1,30 +1,20 @@
 /**
- * src/services/ProxyService.js — NetShare HTTP/HTTPS Proxy
+ * src/services/ProxyService.js — NetShare Global Tunnel Only
  *
- * ── Two connection modes ───────────────────────────────────────────────────────
+ * LAN / same-WiFi mode removed entirely.
+ * Manual proxy setup guide removed entirely.
  *
- * MODE 1: LAN / Same-WiFi  (tunnelMode = false)
- *   Host runs proxy on :8899, relay stores IP:port, client configures
- *   Android Wi-Fi proxy settings. Traffic is direct host ↔ client.
- *   Range: same Wi-Fi network only (~100m).
+ * HOST flow:
+ *   1. startProxy()        — local HTTP CONNECT proxy on :8899
+ *   2. POST /register      — get session code from relay
+ *   3. startTunnelBridge() — open WS to Cloudflare /ws/host/:code
  *
- * MODE 2: WebSocket Tunnel via Cloudflare Durable Object (tunnelMode = true)
- *   Host opens WebSocket to relay /ws/host/:code  (Durable Object)
- *   Client opens WebSocket to relay /ws/client/:code (same DO instance)
- *   DO pipes binary frames between both WebSockets.
- *
- * ── VPN background-data blocking (CLIENT ONLY) ────────────────────────────────
- *
- *   When a client connects, we also start NetShareVpnService (via ProxyModule).
- *   This creates a TUN interface that captures ALL outbound packets and only
- *   allows packets destined for 127.0.0.1:8899 (our proxy) through.
- *   Everything else — background apps, ads, trackers, other network traffic —
- *   is silently dropped at the OS level.
- *
- *   Flow:
- *     1. prepareVpn()     — shows Android VPN permission dialog (once ever)
- *     2. startClientVpn() — activates TUN packet filter
- *     3. stopClientVpn()  — removes TUN, restores normal routing on disconnect
+ * CLIENT flow:
+ *   1. GET /join/:code      — look up session on relay
+ *   2. startVpn(wsUrl)      — activates VPN TUN interface
+ *                             ALL traffic (WiFi + mobile data) captured
+ *                             routed via host through Cloudflare
+ *   3. No manual proxy setup needed — works automatically
  */
 
 import { NativeModules, NativeEventEmitter } from 'react-native';
@@ -36,20 +26,18 @@ const proxyEmitter = new NativeEventEmitter(ProxyModule);
 export const RELAY_URL = process.env.RELAY_URL
   || 'https://netshare.cmaraphael90.workers.dev';
 
-// WebSocket base URL (wss://)
 const RELAY_WS_URL = RELAY_URL.replace(/^https?:\/\//, 'wss://');
 
 // ── Internal state ────────────────────────────────────────────────────────────
 
 let _listeners     = {};
 let _sessionCode   = null;
-let _role          = null;      // 'host' | 'client'
+let _role          = null;
 let _statsInterval = null;
 let _pingInterval  = null;
-let _proxyInfo     = null;      // { ip, port, tunnelMode }
-let _tunnelMode    = false;
-let _nativeSubList = [];        // NativeEventEmitter unsub functions
-let _vpnActive     = false;     // true while VPN is blocking background data
+let _proxyInfo     = null;
+let _nativeSubList = [];
+let _vpnActive     = false;
 
 // ── Event emitter ─────────────────────────────────────────────────────────────
 
@@ -65,7 +53,7 @@ export function on(event, cb) {
   };
 }
 
-// ── Host: start proxy + register session ──────────────────────────────────────
+// ── Host ──────────────────────────────────────────────────────────────────────
 
 export async function startAsHost(options = {}) {
   _role = 'host';
@@ -76,57 +64,48 @@ export async function startAsHost(options = {}) {
     let proxyResult;
     try {
       proxyResult = await ProxyModule.startProxy();
-    } catch (proxyErr) {
-      const msg = proxyErr.message || '';
-      if (!msg.toLowerCase().includes('wifi')) throw proxyErr;
-      console.warn('[ProxyService] Host startProxy WiFi bypass:', msg);
+    } catch (err) {
+      const msg = err.message || '';
+      if (!msg.toLowerCase().includes('wifi')) throw err;
+      console.warn('[ProxyService] Host WiFi bypass:', msg);
       proxyResult = { ip: '127.0.0.1', port: 8899 };
     }
     const { ip, port } = proxyResult;
 
-    _tunnelMode = options.tunnelMode !== undefined ? options.tunnelMode : true;
-
-    // 2. Register with relay → get session code
+    // 2. Register with relay
     const res = await fetch(`${RELAY_URL}/register`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ ip, port, type: 'http-proxy', tunnelMode: _tunnelMode }),
+      body:    JSON.stringify({ ip, port, type: 'http-proxy', tunnelMode: true }),
     });
-
     if (!res.ok) throw new Error(`Relay register failed: ${res.status}`);
     const { code, sessionId } = await res.json();
 
     _sessionCode = code;
     await AsyncStorage.setItem('netshare_session_id', sessionId);
 
-    // 3. Tunnel mode: open WS bridge to Cloudflare DO
-    if (_tunnelMode) {
-      const wsUrl = `${RELAY_WS_URL}/ws/host/${code}`;
-      await ProxyModule.startTunnelBridge(wsUrl);
-    }
+    // 3. Open WebSocket bridge to Cloudflare DO
+    const wsUrl = `${RELAY_WS_URL}/ws/host/${code}`;
+    await ProxyModule.startTunnelBridge(wsUrl);
 
-    // 4. Listen for native events
     _subscribeNativeEvents();
-
-    // 5. Stats poll
     _startStatsPoll();
-
-    // 6. Keep-alive pings every 30s
     _pingInterval = setInterval(() => _keepAlive(sessionId), 30_000);
 
-    _proxyInfo = { ip, port, tunnelMode: _tunnelMode };
+    _proxyInfo = { ip, port };
 
     emit('status',  { status: 'connected' });
-    emit('session', { code, ip, port, tunnelMode: _tunnelMode });
+    emit('session', { code, ip, port, tunnelMode: true });
 
-    return { code, ip, port, tunnelMode: _tunnelMode };
+    return { code, ip, port, tunnelMode: true };
+
   } catch (err) {
     emit('status', { status: 'error', message: err.message });
     throw err;
   }
 }
 
-// ── Client: look up session + connect + activate VPN ─────────────────────────
+// ── Client ────────────────────────────────────────────────────────────────────
 
 export async function startAsClient(code) {
   _role = 'client';
@@ -139,68 +118,32 @@ export async function startAsClient(code) {
       if (res.status === 404) throw new Error('Session code not found or expired');
       throw new Error(`Relay error: ${res.status}`);
     }
-
-    const { ip, port, sessionId, tunnelMode } = await res.json();
-    _tunnelMode = !!tunnelMode;
+    const { sessionId } = await res.json();
     await AsyncStorage.setItem('netshare_session_id', sessionId);
 
-    if (_tunnelMode) {
-      // 2. Tunnel mode: skip startProxy entirely — the tunnel bridge
-      //    creates its own local listener on :8899. Starting the proxy
-      //    here would race with the bridge and trigger the WiFi-check
-      //    guard inside ProxyModule unnecessarily.
+    // 2. Start VPN — TUN interface captures ALL traffic and tunnels via host
+    const wsUrl = `${RELAY_WS_URL}/ws/client/${code.toUpperCase().trim()}`;
+    await _startVpn(wsUrl);
 
-      // 3. Open WS bridge to the Cloudflare DO
-      const wsUrl = `${RELAY_WS_URL}/ws/client/${code.toUpperCase().trim()}`;
-      await ProxyModule.startClientTunnel(wsUrl);
-      _proxyInfo = { ip: '127.0.0.1', port: 8899, tunnelMode: true };
-    } else {
-      // 2. LAN mode: start local proxy first, then verify reachability.
-      //    We must call startProxy here (not skipped) so the local HTTP
-      //    CONNECT proxy is actually running before we test the host.
-      await ProxyModule.startProxy();
-
-      // 3. Verify the host is actually reachable on the LAN.
-      //    _testProxy no longer short-circuits on private IPs — it does
-      //    a real connectivity check so we catch same-WiFi-only failures.
-      const reachable = await _testProxy(ip, port);
-      if (!reachable) {
-        // Surface a real error instead of silently proceeding. The user is
-        // on a different network from the host — LAN mode cannot work.
-        throw new Error(
-          `Cannot reach host at ${ip}:${port}. ` +
-          'You are not on the same Wi-Fi network. ' +
-          'Ask the host to enable Global Tunnel mode and share a new code.'
-        );
-      }
-      _proxyInfo = { ip, port, tunnelMode: false };
-    }
-
-    // 4. Start VPN to block all background data on this client device.
-    //    prepareVpn() shows the Android permission dialog on first run only.
-    //    If user denies, we continue without VPN (proxy still works, but
-    //    background apps can still use client's own data).
-    await _startVpn();
+    _proxyInfo = { ip: '127.0.0.1', port: 8899 };
 
     _subscribeNativeEvents();
     _startStatsPoll();
 
     emit('status', { status: 'connected' });
-    emit('proxy',  { ..._proxyInfo });
+    emit('proxy',  { ..._proxyInfo, tunnelMode: true });
 
-    return _proxyInfo;
+    return { ..._proxyInfo, tunnelMode: true };
 
   } catch (err) {
-    // Clean up partial start
-    try { await ProxyModule.stopProxy(); } catch (_) {}
-    try { await ProxyModule.stopClientTunnel(); } catch (_) {}
-    await _stopVpn();
+    try { await ProxyModule.stopVpn(); }            catch (_) {}
+    try { await ProxyModule.stopClientTunnel(); }   catch (_) {}
     emit('status', { status: 'error', message: err.message });
     throw err;
   }
 }
 
-// ── Stop (both roles) ─────────────────────────────────────────────────────────
+// ── Stop ──────────────────────────────────────────────────────────────────────
 
 export async function stop() {
   clearInterval(_statsInterval);
@@ -212,7 +155,7 @@ export async function stop() {
   _nativeSubList = [];
 
   if (_role === 'host') {
-    try { await ProxyModule.stopProxy(); } catch (_) {}
+    try { await ProxyModule.stopProxy(); }        catch (_) {}
     try { await ProxyModule.stopTunnelBridge(); } catch (_) {}
 
     const sessionId = await AsyncStorage.getItem('netshare_session_id');
@@ -229,16 +172,14 @@ export async function stop() {
   }
 
   if (_role === 'client') {
-    // Stop VPN FIRST — restores normal routing before we kill the proxy
     await _stopVpn();
-    try { await ProxyModule.stopProxy(); } catch (_) {}
     try { await ProxyModule.stopClientTunnel(); } catch (_) {}
   }
 
   _sessionCode = null;
   _role        = null;
   _proxyInfo   = null;
-  _tunnelMode  = false;
+  _vpnActive   = false;
   _listeners   = {};
 
   emit('status', { status: 'idle' });
@@ -249,84 +190,54 @@ export async function stop() {
 export function getProxyInfo()   { return _proxyInfo; }
 export function getSessionCode() { return _sessionCode; }
 export function getRole()        { return _role; }
-export function getTunnelMode()  { return _tunnelMode; }
+export function getTunnelMode()  { return true; }
 export function isVpnActive()    { return _vpnActive; }
 
-// ── VPN helpers ───────────────────────────────────────────────────────────────
+// ── VPN ───────────────────────────────────────────────────────────────────────
 
-/**
- * _startVpn — requests permission then starts the VPN service.
- * Emits 'vpn' events so the UI can show VPN status.
- * Non-fatal: if permission denied or error, we log and continue.
- */
-async function _startVpn() {
+async function _startVpn(wsUrl) {
   try {
-    const { granted } = await ProxyModule.prepareVpn();
-    if (!granted) {
-      console.warn('[ProxyService] VPN permission denied — background data not blocked');
-      emit('vpn', { status: 'denied' });
-      return;
-    }
-    await ProxyModule.startClientVpn();
+    await ProxyModule.startVpn(wsUrl);
     _vpnActive = true;
     emit('vpn', { status: 'active' });
-    console.log('[ProxyService] VPN active — background data blocked');
   } catch (err) {
-    console.warn('[ProxyService] VPN start failed (non-fatal):', err.message);
-    emit('vpn', { status: 'error', message: err.message });
-    _vpnActive = false;
+    const msg = err.message || '';
+    if (msg.toLowerCase().includes('denied')) {
+      emit('vpn', { status: 'denied' });
+      // Non-fatal fallback — tunnel without full VPN
+      try { await ProxyModule.startClientTunnel(wsUrl); }
+      catch (e) { throw new Error('Connection failed: ' + e.message); }
+    } else {
+      emit('vpn', { status: 'error', message: msg });
+      throw err;
+    }
   }
 }
 
 async function _stopVpn() {
   if (!_vpnActive) return;
-  try {
-    await ProxyModule.stopClientVpn();
-    console.log('[ProxyService] VPN stopped — normal routing restored');
-  } catch (err) {
-    console.warn('[ProxyService] VPN stop error:', err.message);
-  } finally {
-    _vpnActive = false;
-    emit('vpn', { status: 'idle' });
-  }
+  try { await ProxyModule.stopVpn(); } catch (_) {}
+  _vpnActive = false;
+  emit('vpn', { status: 'idle' });
 }
 
-// ── Native event subscriptions ────────────────────────────────────────────────
+// ── Native events ─────────────────────────────────────────────────────────────
 
 function _subscribeNativeEvents() {
   _nativeSubList.forEach(s => { try { s.remove(); } catch (_) {} });
   _nativeSubList = [];
-
   _nativeSubList.push(
-    proxyEmitter.addListener('ProxyClientConnected', () => {
-      emit('client', { event: 'connected' });
-    }),
-    proxyEmitter.addListener('ProxyClientDisconnected', () => {
-      emit('client', { event: 'disconnected' });
-    }),
-    proxyEmitter.addListener('ProxyTunnelReady', (data) => {
-      emit('tunnel', { status: 'ready', ...data });
-    }),
-    proxyEmitter.addListener('ProxyTunnelError', (msg) => {
-      emit('status', { status: 'error', message: msg });
-    }),
-    // VPN events from NetShareVpnService
-    proxyEmitter.addListener('ProxyVpnStarted', () => {
-      _vpnActive = true;
-      emit('vpn', { status: 'active' });
-    }),
-    proxyEmitter.addListener('ProxyVpnRevoked', () => {
-      _vpnActive = false;
-      emit('vpn', { status: 'revoked' });
-    }),
-    proxyEmitter.addListener('ProxyVpnError', (msg) => {
-      _vpnActive = false;
-      emit('vpn', { status: 'error', message: msg });
-    }),
+    proxyEmitter.addListener('ProxyClientConnected',    () => emit('client', { event: 'connected' })),
+    proxyEmitter.addListener('ProxyClientDisconnected', () => emit('client', { event: 'disconnected' })),
+    proxyEmitter.addListener('ProxyTunnelReady',        () => emit('tunnel', { status: 'ready' })),
+    proxyEmitter.addListener('ProxyTunnelError',       (m) => emit('status', { status: 'error', message: m })),
+    proxyEmitter.addListener('ProxyVpnStarted',         () => { _vpnActive = true;  emit('vpn', { status: 'active' }); }),
+    proxyEmitter.addListener('ProxyVpnRevoked',         () => { _vpnActive = false; emit('vpn', { status: 'revoked' }); }),
+    proxyEmitter.addListener('ProxyVpnError',          (m) => { _vpnActive = false; emit('vpn', { status: 'error', message: m }); }),
   );
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _startStatsPoll() {
   _statsInterval = setInterval(async () => {
@@ -347,49 +258,8 @@ async function _keepAlive(sessionId) {
   } catch (_) {}
 }
 
-async function _testProxy(ip, port) {
-  // FIX (Bug 1): The old code returned true immediately for any private IP
-  // (192.168.x, 10.x, 172.x) without actually checking reachability.
-  // This caused LAN-mode sessions to silently "succeed" even when the
-  // client was 300km away and couldn't reach the host at all.
-  // Now we always do a real probe — private IPs are only reachable from the
-  // same LAN, so if the probe fails we surface the failure instead of hiding it.
-
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(`${RELAY_URL}/probe`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ ip, port }),
-      signal:  controller.signal,
-    });
-    clearTimeout(timer);
-    const data = await res.json();
-    return data.ok !== false;
-  } catch (_) {
-    // Relay probe failed — fall back to a direct TCP-level check.
-    // This will only succeed if the client is actually on the same LAN.
-    try {
-      const r = await fetch(`http://${ip}:${port}`, {
-        signal: AbortSignal.timeout(4000),
-      });
-      return r.status < 600; // any response means we reached the host
-    } catch {
-      return false; // genuinely unreachable
-    }
-  }
-}
-
 export default {
-  startAsHost,
-  startAsClient,
-  stop,
-  on,
-  getProxyInfo,
-  getSessionCode,
-  getRole,
-  getTunnelMode,
-  isVpnActive,
+  startAsHost, startAsClient, stop, on,
+  getProxyInfo, getSessionCode, getRole, getTunnelMode, isVpnActive,
   RELAY_URL,
 };
