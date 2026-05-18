@@ -14,11 +14,13 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!--
-      NO VPN permissions needed.
-      NO BIND_VPN_SERVICE needed.
-      The proxy runs as a plain TCP server on the WiFi interface.
-      The tunnel runs as an OkHttp WebSocket to Cloudflare Durable Object.
+      VPN permission — lets NetShareVpnService create a TUN interface on the
+      CLIENT device.  This is what intercepts ALL outbound packets and routes
+      ONLY our proxy traffic (127.0.0.1:8899) to the internet; everything else
+      (background app data, ads, trackers) is silently dropped.
+      The user sees a single system "VPN connection request" dialog on first run.
     -->
+    <uses-permission android:name="android.permission.BIND_VPN_SERVICE" />
 
     <application
         android:name=".MainApplication"
@@ -41,6 +43,21 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          NetShareVpnService — CLIENT-SIDE only.
+          Creates a TUN interface that captures all outbound traffic.
+          Routes only 127.0.0.1:8899 (our proxy) through; drops the rest.
+          Must declare android:permission so only the system can bind it.
+        -->
+        <service
+            android:name=".NetShareVpnService"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+        </service>
 
     </application>
 
