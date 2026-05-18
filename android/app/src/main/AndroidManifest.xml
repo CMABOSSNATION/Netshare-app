@@ -1,43 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!--
-  AndroidManifest.xml — NetShare HTTP Proxy Edition
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-  Key changes from VPN edition:
-  - REMOVED: android.permission.BIND_VPN_SERVICE (no VPN needed)
-  - REMOVED: VpnService intent-filter
-  - ADDED:   INTERNET permission (already present)
-  - ADDED:   ProxyService as a foreground service
-  - ADDED:   FOREGROUND_SERVICE_NETWORK_ACCESS type (Android 14+)
-  - ADDED:   CHANGE_WIFI_STATE / ACCESS_WIFI_STATE for IP detection
--->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.netshare">
-
-    <!-- ── Permissions ───────────────────────────────────────────────────── -->
-
-    <!-- Basic internet access -->
     <uses-permission android:name="android.permission.INTERNET" />
-
-    <!-- Wi-Fi IP detection (for showing host IP to share with clients) -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Required to get the device WiFi IP address -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
-    <!-- Foreground service (keeps proxy alive when app is backgrounded) -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-
-    <!-- Android 14+: declare the foreground service type -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_NETWORK" />
-
-    <!-- Wake lock — prevents proxy from dying when screen is off -->
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
-
-    <!-- ── Application ───────────────────────────────────────────────────── -->
+    <!--
+      NO VPN permissions needed.
+      NO BIND_VPN_SERVICE needed.
+      The proxy runs as a plain TCP server on the WiFi interface.
+    -->
 
     <application
         android:name=".MainApplication"
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
         android:theme="@style/AppTheme"
         android:usesCleartextTraffic="true">
@@ -45,7 +26,7 @@
         <activity
             android:name=".MainActivity"
             android:label="@string/app_name"
-            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|uiMode"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize"
             android:exported="true">
@@ -54,20 +35,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-
-        <!--
-          ProxyService — the HTTP CONNECT proxy server.
-
-          android:foregroundServiceType="network" is required on Android 14+
-          to allow network access from a foreground service.
-
-          exported="false" — only our app can start/stop it.
-        -->
-        <service
-            android:name=".ProxyService"
-            android:exported="false"
-            android:foregroundServiceType="network"
-            android:stopWithTask="false" />
 
     </application>
 
