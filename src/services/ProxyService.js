@@ -13,18 +13,18 @@
  *   Client opens WebSocket to relay /ws/client/:code (same DO instance)
  *   DO pipes binary frames between both WebSockets.
  *
- *   Host side:
- *     ProxyModule (Java) starts local proxy on :8899.
- *     ProxyModule.startTunnelBridge(wsUrl) — Java opens its OWN WS to the DO,
- *     intercepts every CONNECT request, and pipes raw TCP bytes over WS frames.
+ * ── VPN background-data blocking (CLIENT ONLY) ────────────────────────────────
  *
- *   Client side:
- *     ProxyModule.startProxy() starts local proxy on :8899.
- *     ProxyModule.startClientTunnel(wsUrl) — Java opens its OWN WS to the DO,
- *     bridges localhost:8899 HTTP CONNECT traffic through the WS tunnel.
+ *   When a client connects, we also start NetShareVpnService (via ProxyModule).
+ *   This creates a TUN interface that captures ALL outbound packets and only
+ *   allows packets destined for 127.0.0.1:8899 (our proxy) through.
+ *   Everything else — background apps, ads, trackers, other network traffic —
+ *   is silently dropped at the OS level.
  *
- *   Result: Client app → localhost:8899 → WS → DO → WS → Host → Internet
- *   Range: anywhere in the world (Cloudflare edge).
+ *   Flow:
+ *     1. prepareVpn()     — shows Android VPN permission dialog (once ever)
+ *     2. startClientVpn() — activates TUN packet filter
+ *     3. stopClientVpn()  — removes TUN, restores normal routing on disconnect
  */
 
 import { NativeModules, NativeEventEmitter } from 'react-native';
@@ -49,6 +49,7 @@ let _pingInterval  = null;
 let _proxyInfo     = null;      // { ip, port, tunnelMode }
 let _tunnelMode    = false;
 let _nativeSubList = [];        // NativeEventEmitter unsub functions
+let _vpnActive     = false;     // true while VPN is blocking background data
 
 // ── Event emitter ─────────────────────────────────────────────────────────────
 
@@ -66,27 +67,18 @@ export function on(event, cb) {
 
 // ── Host: start proxy + register session ──────────────────────────────────────
 
-/**
- * startAsHost(options)
- *   options.tunnelMode = true  → Durable Object WS relay (works anywhere)
- *   options.tunnelMode = false → LAN mode (same Wi-Fi only)
- *
- *   Defaults to tunnelMode = true so 300km+ sharing works out of the box.
- */
 export async function startAsHost(options = {}) {
   _role = 'host';
   emit('status', { status: 'connecting' });
 
   try {
     // 1. Start local HTTP CONNECT proxy on :8899
-    // In tunnel mode, WiFi is not required — bypass WiFi check errors
     let proxyResult;
     try {
       proxyResult = await ProxyModule.startProxy();
     } catch (proxyErr) {
       const msg = proxyErr.message || '';
       if (!msg.toLowerCase().includes('wifi')) throw proxyErr;
-      // WiFi check failed in tunnel mode — use fallback IP
       console.warn('[ProxyService] Host startProxy WiFi bypass:', msg);
       proxyResult = { ip: '127.0.0.1', port: 8899 };
     }
@@ -107,15 +99,13 @@ export async function startAsHost(options = {}) {
     _sessionCode = code;
     await AsyncStorage.setItem('netshare_session_id', sessionId);
 
-    // 3. Tunnel mode: tell Java to open its own WS to the DO and bridge traffic
+    // 3. Tunnel mode: open WS bridge to Cloudflare DO
     if (_tunnelMode) {
       const wsUrl = `${RELAY_WS_URL}/ws/host/${code}`;
-      // Java opens WS, accepts local CONNECT requests,
-      // wraps each request as a binary WS frame, receives response frames back.
       await ProxyModule.startTunnelBridge(wsUrl);
     }
 
-    // 4. Listen for native events (client count, tunnel status, errors)
+    // 4. Listen for native events
     _subscribeNativeEvents();
 
     // 5. Stats poll
@@ -136,7 +126,7 @@ export async function startAsHost(options = {}) {
   }
 }
 
-// ── Client: look up session + connect ─────────────────────────────────────────
+// ── Client: look up session + connect + activate VPN ─────────────────────────
 
 export async function startAsClient(code) {
   _role = 'client';
@@ -154,53 +144,49 @@ export async function startAsClient(code) {
     _tunnelMode = !!tunnelMode;
     await AsyncStorage.setItem('netshare_session_id', sessionId);
 
-    if (_tunnelMode) {
-      // ── Tunnel mode ───────────────────────────────────────────────────────
-      // Java starts a local proxy on :8899 that speaks HTTP CONNECT.
-      // Java also opens a WS to the DO client endpoint.
-      // Every CONNECT request on :8899 is wrapped in a binary WS frame,
-      // forwarded to the DO, which forwards it to the host WS.
-      // Responses come back the same way.
-
-      // startProxy() may throw a WiFi check error on the client side —
-      // tunnel mode only needs mobile data/any internet, so we ignore it.
-      try {
-        await ProxyModule.startProxy();                         // local :8899
-      } catch (proxyErr) {
-        if (!proxyErr.message || !proxyErr.message.toLowerCase().includes('wifi')) {
-          throw proxyErr; // real error, re-throw
-        }
-        // WiFi check failed but we're in tunnel mode — safe to continue
-        console.warn('[ProxyService] startProxy WiFi check bypassed for tunnel mode:', proxyErr.message);
+    // 2. Start local proxy
+    try {
+      await ProxyModule.startProxy();
+    } catch (proxyErr) {
+      if (!proxyErr.message || !proxyErr.message.toLowerCase().includes('wifi')) {
+        throw proxyErr;
       }
+      console.warn('[ProxyService] startProxy WiFi check bypassed for tunnel mode:', proxyErr.message);
+    }
+
+    if (_tunnelMode) {
+      // 3a. Tunnel mode: open WS bridge to DO
       const wsUrl = `${RELAY_WS_URL}/ws/client/${code.toUpperCase().trim()}`;
-      await ProxyModule.startClientTunnel(wsUrl);              // bridge WS
-
+      await ProxyModule.startClientTunnel(wsUrl);
       _proxyInfo = { ip: '127.0.0.1', port: 8899, tunnelMode: true };
-      _subscribeNativeEvents();
-      _startStatsPoll();
-
-      emit('status', { status: 'connected' });
-      emit('proxy',  { ip: '127.0.0.1', port: 8899, tunnelMode: true });
-      return { ip: '127.0.0.1', port: 8899, tunnelMode: true };
-
     } else {
-      // ── LAN mode ──────────────────────────────────────────────────────────
-      // Just hand the host IP:port to the client for manual proxy config.
+      // 3b. LAN mode: use host IP directly
       const reachable = await _testProxy(ip, port);
       if (!reachable) {
         console.warn(`[ProxyService] LAN probe failed for ${ip}:${port} — proceeding anyway`);
       }
-
       _proxyInfo = { ip, port, tunnelMode: false };
-      _subscribeNativeEvents();
-      _startStatsPoll();
-
-      emit('status', { status: 'connected' });
-      emit('proxy',  { ip, port, tunnelMode: false });
-      return { ip, port, tunnelMode: false };
     }
+
+    // 4. Start VPN to block all background data on this client device.
+    //    prepareVpn() shows the Android permission dialog on first run only.
+    //    If user denies, we continue without VPN (proxy still works, but
+    //    background apps can still use client's own data).
+    await _startVpn();
+
+    _subscribeNativeEvents();
+    _startStatsPoll();
+
+    emit('status', { status: 'connected' });
+    emit('proxy',  { ..._proxyInfo });
+
+    return _proxyInfo;
+
   } catch (err) {
+    // Clean up partial start
+    try { await ProxyModule.stopProxy(); } catch (_) {}
+    try { await ProxyModule.stopClientTunnel(); } catch (_) {}
+    await _stopVpn();
     emit('status', { status: 'error', message: err.message });
     throw err;
   }
@@ -214,7 +200,6 @@ export async function stop() {
   _statsInterval = null;
   _pingInterval  = null;
 
-  // Unsubscribe native events
   _nativeSubList.forEach(sub => { try { sub.remove(); } catch (_) {} });
   _nativeSubList = [];
 
@@ -236,6 +221,8 @@ export async function stop() {
   }
 
   if (_role === 'client') {
+    // Stop VPN FIRST — restores normal routing before we kill the proxy
+    await _stopVpn();
     try { await ProxyModule.stopProxy(); } catch (_) {}
     try { await ProxyModule.stopClientTunnel(); } catch (_) {}
   }
@@ -255,17 +242,49 @@ export function getProxyInfo()   { return _proxyInfo; }
 export function getSessionCode() { return _sessionCode; }
 export function getRole()        { return _role; }
 export function getTunnelMode()  { return _tunnelMode; }
+export function isVpnActive()    { return _vpnActive; }
+
+// ── VPN helpers ───────────────────────────────────────────────────────────────
+
+/**
+ * _startVpn — requests permission then starts the VPN service.
+ * Emits 'vpn' events so the UI can show VPN status.
+ * Non-fatal: if permission denied or error, we log and continue.
+ */
+async function _startVpn() {
+  try {
+    const { granted } = await ProxyModule.prepareVpn();
+    if (!granted) {
+      console.warn('[ProxyService] VPN permission denied — background data not blocked');
+      emit('vpn', { status: 'denied' });
+      return;
+    }
+    await ProxyModule.startClientVpn();
+    _vpnActive = true;
+    emit('vpn', { status: 'active' });
+    console.log('[ProxyService] VPN active — background data blocked');
+  } catch (err) {
+    console.warn('[ProxyService] VPN start failed (non-fatal):', err.message);
+    emit('vpn', { status: 'error', message: err.message });
+    _vpnActive = false;
+  }
+}
+
+async function _stopVpn() {
+  if (!_vpnActive) return;
+  try {
+    await ProxyModule.stopClientVpn();
+    console.log('[ProxyService] VPN stopped — normal routing restored');
+  } catch (err) {
+    console.warn('[ProxyService] VPN stop error:', err.message);
+  } finally {
+    _vpnActive = false;
+    emit('vpn', { status: 'idle' });
+  }
+}
 
 // ── Native event subscriptions ────────────────────────────────────────────────
 
-/**
- * Subscribe to events emitted by ProxyModule (Java → JS).
- * Java calls ProxyModule.emitEvent(name, data) for:
- *   'ProxyClientConnected'   → a new client connected to the tunnel
- *   'ProxyClientDisconnected'→ a client disconnected
- *   'ProxyTunnelError'       → fatal tunnel error (string message)
- *   'ProxyTunnelReady'       → tunnel WS fully paired with peer
- */
 function _subscribeNativeEvents() {
   _nativeSubList.forEach(s => { try { s.remove(); } catch (_) {} });
   _nativeSubList = [];
@@ -282,6 +301,19 @@ function _subscribeNativeEvents() {
     }),
     proxyEmitter.addListener('ProxyTunnelError', (msg) => {
       emit('status', { status: 'error', message: msg });
+    }),
+    // VPN events from NetShareVpnService
+    proxyEmitter.addListener('ProxyVpnStarted', () => {
+      _vpnActive = true;
+      emit('vpn', { status: 'active' });
+    }),
+    proxyEmitter.addListener('ProxyVpnRevoked', () => {
+      _vpnActive = false;
+      emit('vpn', { status: 'revoked' });
+    }),
+    proxyEmitter.addListener('ProxyVpnError', (msg) => {
+      _vpnActive = false;
+      emit('vpn', { status: 'error', message: msg });
     }),
   );
 }
@@ -307,17 +339,13 @@ async function _keepAlive(sessionId) {
   } catch (_) {}
 }
 
-/**
- * _testProxy — only meaningful for public IPs in LAN mode.
- * Private IPs (192.168.x.x) can't be probed from Cloudflare, so we skip.
- */
 async function _testProxy(ip, port) {
   if (
     ip.startsWith('192.168.') ||
     ip.startsWith('10.')      ||
     ip.startsWith('172.')
   ) {
-    return true; // assume reachable on LAN
+    return true;
   }
 
   try {
@@ -333,7 +361,7 @@ async function _testProxy(ip, port) {
     const data = await res.json();
     return data.ok !== false;
   } catch (_) {
-    return true; // let the user try anyway
+    return true;
   }
 }
 
@@ -346,5 +374,6 @@ export default {
   getSessionCode,
   getRole,
   getTunnelMode,
+  isVpnActive,
   RELAY_URL,
 };
