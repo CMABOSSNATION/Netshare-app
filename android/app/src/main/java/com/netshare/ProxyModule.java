@@ -1,9 +1,14 @@
 package com.netshare;
 
+import android.app.Activity;
+import android.content.Intent;
+import android.net.VpnService;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
 
+import com.facebook.react.bridge.ActivityEventListener;
+import com.facebook.react.bridge.BaseActivityEventListener;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
@@ -46,44 +51,34 @@ import okio.ByteString;
  *   stopTunnelBridge()          → HOST: close tunnel WS
  *   startClientTunnel(wsUrl)    → CLIENT: open WS to DO, bridge local :8899 through it
  *   stopClientTunnel()          → CLIENT: close tunnel WS
+ *   prepareVpn()                → CLIENT: request Android VPN permission (shows system dialog)
+ *   startClientVpn()            → CLIENT: start VPN that blocks all non-proxy traffic
+ *   stopClientVpn()             → CLIENT: stop VPN
+ *
+ * VPN flow (client side):
+ *   1. JS calls prepareVpn()    — shows Android "VPN connection request" dialog
+ *   2. User accepts             — promise resolves with { granted: true }
+ *   3. JS calls startClientVpn()— starts NetShareVpnService
+ *   4. TUN interface captures ALL outbound packets
+ *   5. Only packets to 127.0.0.1:8899 pass; everything else is dropped
+ *   6. Client's background apps (ads, trackers, other apps) are blocked
  *
  * Tunnel protocol (binary frames over WebSocket):
- *
- *   Each logical TCP connection is given a 4-byte connection ID (big-endian int).
- *
- *   Frame layout:
- *     [4 bytes: connId][1 byte: frameType][N bytes: payload]
- *
+ *   Frame layout: [4 bytes: connId][1 byte: frameType][N bytes: payload]
  *   Frame types:
- *     0x01  OPEN    payload = "host:port" UTF-8   (client→host: open TCP to target)
- *     0x02  DATA    payload = raw bytes            (bidirectional)
- *     0x03  CLOSE   payload = empty                (either side closes connection)
- *     0x04  READY   payload = empty                (DO signals tunnel paired)
- *
- * How tunnel mode works end-to-end:
- *
- *   CLIENT SIDE:
- *     1. Client app sets Android Wi-Fi proxy to 127.0.0.1:8899.
- *     2. App traffic hits local ProxyModule proxy.
- *     3. ProxyModule reads the CONNECT request (e.g. "CONNECT api.tiktok.com:443").
- *     4. Instead of opening a real TCP socket, it assigns a connId and sends
- *        a WS OPEN frame to the Durable Object.
- *     5. DO forwards the OPEN frame to the host WS.
- *     6. Subsequent DATA frames carry raw bytes both ways.
- *     7. CLOSE frame ends the connection.
- *
- *   HOST SIDE:
- *     1. Host WS is connected to the same DO instance.
- *     2. On receiving OPEN frame: opens a real TCP socket to the target host:port.
- *     3. On receiving DATA frame: writes bytes to that TCP socket.
- *     4. Reads bytes from TCP socket, sends DATA frames back to DO → client.
- *     5. On CLOSE frame or TCP EOF: sends CLOSE frame back, closes socket.
+ *     0x01  OPEN    payload = "host:port" UTF-8
+ *     0x02  DATA    payload = raw bytes
+ *     0x03  CLOSE   payload = empty
+ *     0x04  READY   payload = empty
  */
 public class ProxyModule extends ReactContextBaseJavaModule {
 
     private static final String TAG        = "NetShareProxy";
     private static final int    PROXY_PORT = 8899;
     private static final int    PIPE_BUF   = 32 * 1024;
+
+    // VPN permission request code
+    private static final int VPN_REQUEST_CODE = 0x0F00;
 
     // Frame type constants
     private static final byte FT_OPEN  = 0x01;
@@ -108,11 +103,35 @@ public class ProxyModule extends ReactContextBaseJavaModule {
     private AtomicBoolean   tunnelRunning = new AtomicBoolean(false);
 
     // Host side: connId → open TCP Socket to remote target
-    private final ConcurrentHashMap<Integer, Socket> hostConns = new ConcurrentHashMap<>();
-    // Client side: connId → pending/active client socket + output stream
+    private final ConcurrentHashMap<Integer, Socket> hostConns   = new ConcurrentHashMap<>();
+    // Client side: connId → client app socket
     private final ConcurrentHashMap<Integer, Socket> clientConns = new ConcurrentHashMap<>();
 
     private final AtomicInteger connIdCounter = new AtomicInteger(1);
+
+    // ── VPN permission callback ───────────────────────────────────────────────
+    private Promise vpnPermissionPromise;
+
+    private final ActivityEventListener vpnActivityListener = new BaseActivityEventListener() {
+        @Override
+        public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
+            if (requestCode == VPN_REQUEST_CODE) {
+                Promise p = vpnPermissionPromise;
+                vpnPermissionPromise = null;
+                if (p == null) return;
+
+                if (resultCode == Activity.RESULT_OK) {
+                    WritableMap m = new WritableNativeMap();
+                    m.putBoolean("granted", true);
+                    p.resolve(m);
+                } else {
+                    WritableMap m = new WritableNativeMap();
+                    m.putBoolean("granted", false);
+                    p.resolve(m);
+                }
+            }
+        }
+    };
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -122,6 +141,7 @@ public class ProxyModule extends ReactContextBaseJavaModule {
         httpClient = new OkHttpClient.Builder()
             .pingInterval(20, java.util.concurrent.TimeUnit.SECONDS)
             .build();
+        context.addActivityEventListener(vpnActivityListener);
     }
 
     @NonNull
@@ -144,12 +164,9 @@ public class ProxyModule extends ReactContextBaseJavaModule {
         }
 
         try {
-            // Get best available IP — WiFi preferred, falls back to mobile data IP
-            // or 127.0.0.1. We never reject just because WiFi is off; tunnel mode
-            // works over any internet connection.
             String ip = getWifiIp();
             if (ip == null || ip.equals("0.0.0.0")) {
-                ip = "127.0.0.1"; // tunnel mode uses localhost anyway
+                ip = "127.0.0.1";
             }
 
             serverSocket = new ServerSocket();
@@ -198,14 +215,97 @@ public class ProxyModule extends ReactContextBaseJavaModule {
         promise.resolve(m);
     }
 
-    // ── startTunnelBridge (HOST) ──────────────────────────────────────────────
+    // ── prepareVpn ────────────────────────────────────────────────────────────
 
     /**
-     * Host calls this after startProxy().
-     * Opens a WebSocket to the Durable Object at wsUrl.
-     * From then on, every OPEN frame received from the DO causes us to open
-     * a real TCP socket to the target and pipe DATA frames both ways.
+     * Shows the Android system "VPN connection request" dialog.
+     * Must be called before startClientVpn().
+     * Resolves with { granted: true } if user accepts, { granted: false } if denied.
+     *
+     * Only needs to be called ONCE — Android remembers the grant.
+     * On subsequent app launches, VpnService.prepare() returns null immediately.
      */
+    @ReactMethod
+    public void prepareVpn(Promise promise) {
+        try {
+            Activity activity = getCurrentActivity();
+            if (activity == null) {
+                promise.reject("NO_ACTIVITY", "No activity available");
+                return;
+            }
+
+            Intent intent = VpnService.prepare(activity);
+            if (intent == null) {
+                // Already granted — no dialog needed
+                WritableMap m = new WritableNativeMap();
+                m.putBoolean("granted", true);
+                promise.resolve(m);
+                return;
+            }
+
+            // Store promise — result comes back via vpnActivityListener
+            vpnPermissionPromise = promise;
+            activity.startActivityForResult(intent, VPN_REQUEST_CODE);
+
+        } catch (Exception e) {
+            promise.reject("VPN_PREPARE_ERROR", e.getMessage());
+        }
+    }
+
+    // ── startClientVpn ────────────────────────────────────────────────────────
+
+    /**
+     * Starts NetShareVpnService on the client device.
+     * This creates a TUN interface and begins dropping all non-proxy traffic.
+     *
+     * Call AFTER prepareVpn() has resolved with { granted: true }.
+     * Call AFTER startProxy() and startClientTunnel() so the proxy is ready.
+     */
+    @ReactMethod
+    public void startClientVpn(Promise promise) {
+        try {
+            android.content.Context ctx = reactCtx.getApplicationContext();
+            Intent intent = new Intent(ctx, NetShareVpnService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ctx.startForegroundService(intent);
+            } else {
+                ctx.startService(intent);
+            }
+            Log.i(TAG, "NetShareVpnService start requested");
+            promise.resolve(true);
+        } catch (Exception e) {
+            Log.e(TAG, "startClientVpn: " + e.getMessage());
+            promise.reject("VPN_START_ERROR", e.getMessage());
+        }
+    }
+
+    // ── stopClientVpn ─────────────────────────────────────────────────────────
+
+    /**
+     * Stops NetShareVpnService — restores normal network routing on the client.
+     * Call this when the client disconnects from NetShare.
+     */
+    @ReactMethod
+    public void stopClientVpn(Promise promise) {
+        try {
+            NetShareVpnService svc = NetShareVpnService.instance;
+            if (svc != null) {
+                svc.stopVpn();
+            } else {
+                // Service not running — stop via Intent just in case
+                android.content.Context ctx = reactCtx.getApplicationContext();
+                ctx.stopService(new Intent(ctx, NetShareVpnService.class));
+            }
+            Log.i(TAG, "NetShareVpnService stopped");
+            promise.resolve(true);
+        } catch (Exception e) {
+            Log.e(TAG, "stopClientVpn: " + e.getMessage());
+            promise.reject("VPN_STOP_ERROR", e.getMessage());
+        }
+    }
+
+    // ── startTunnelBridge (HOST) ──────────────────────────────────────────────
+
     @ReactMethod
     public void startTunnelBridge(String wsUrl, Promise promise) {
         if (tunnelRunning.get()) {
@@ -231,7 +331,6 @@ public class ProxyModule extends ReactContextBaseJavaModule {
 
             @Override
             public void onMessage(WebSocket ws, String text) {
-                // JSON control frames (e.g. {"type":"paired"}) — ignore or log
                 Log.d(TAG, "[Host] text frame: " + text);
             }
 
@@ -260,7 +359,6 @@ public class ProxyModule extends ReactContextBaseJavaModule {
             tunnelWs = null;
         }
         tunnelRunning.set(false);
-        // Close all open host connections
         for (Socket s : hostConns.values()) close(s);
         hostConns.clear();
         promise.resolve(true);
@@ -268,12 +366,6 @@ public class ProxyModule extends ReactContextBaseJavaModule {
 
     // ── startClientTunnel (CLIENT) ────────────────────────────────────────────
 
-    /**
-     * Client calls this after startProxy().
-     * Opens a WebSocket to the Durable Object at wsUrl.
-     * The local proxy (acceptLoop) now intercepts CONNECT requests and sends
-     * OPEN frames over this WS instead of opening direct TCP sockets.
-     */
     @ReactMethod
     public void startClientTunnel(String wsUrl, Promise promise) {
         if (tunnelRunning.get()) {
@@ -341,9 +433,9 @@ public class ProxyModule extends ReactContextBaseJavaModule {
                 client.setSoTimeout(120_000);
                 executor.execute(() -> {
                     if (tunnelRunning.get() && tunnelWs != null) {
-                        handleConnectViaTunnel(client);   // tunnel mode
+                        handleConnectViaTunnel(client);
                     } else {
-                        handleConnectDirect(client);       // LAN mode
+                        handleConnectDirect(client);
                     }
                 });
             } catch (Exception e) {
@@ -354,10 +446,6 @@ public class ProxyModule extends ReactContextBaseJavaModule {
 
     // ── Tunnel mode: client-side CONNECT handler ──────────────────────────────
 
-    /**
-     * Reads the HTTP CONNECT request from the client app, assigns a connId,
-     * sends an OPEN frame to the DO, then bridges DATA frames both ways.
-     */
     private void handleConnectViaTunnel(Socket clientSock) {
         try {
             InputStream  cIn  = clientSock.getInputStream();
@@ -372,7 +460,6 @@ public class ProxyModule extends ReactContextBaseJavaModule {
                 target = parts.length >= 2 ? parts[1] : null;
                 drainHeaders(cIn);
             } else {
-                // Plain HTTP — extract host:80 from URL
                 String[] parts = firstLine.split(" ");
                 if (parts.length < 2) { close(clientSock); return; }
                 try {
@@ -388,19 +475,16 @@ public class ProxyModule extends ReactContextBaseJavaModule {
             int connId = connIdCounter.getAndIncrement();
             clientConns.put(connId, clientSock);
 
-            // Send OPEN frame: [connId(4)][FT_OPEN(1)][target UTF-8]
             byte[] targetBytes = target.getBytes(StandardCharsets.UTF_8);
             byte[] openFrame   = buildFrame(connId, FT_OPEN, targetBytes);
             tunnelWs.send(ByteString.of(openFrame));
 
-            // Tell client the tunnel is open (for CONNECT)
             if (firstLine.toUpperCase().startsWith("CONNECT ")) {
                 cOut.write("HTTP/1.1 200 Connection established\r\n\r\n"
                     .getBytes(StandardCharsets.US_ASCII));
                 cOut.flush();
             }
 
-            // Read from client app → send DATA frames to DO
             byte[] buf = new byte[PIPE_BUF];
             int len;
             while ((len = cIn.read(buf)) != -1) {
@@ -410,7 +494,6 @@ public class ProxyModule extends ReactContextBaseJavaModule {
                 bytesUp.addAndGet(len);
             }
 
-            // Send CLOSE frame
             if (tunnelWs != null) {
                 tunnelWs.send(ByteString.of(buildFrame(connId, FT_CLOSE, new byte[0])));
             }
@@ -424,10 +507,6 @@ public class ProxyModule extends ReactContextBaseJavaModule {
 
     // ── Tunnel mode: host-side incoming frame handler ─────────────────────────
 
-    /**
-     * Called on host when a binary WS frame arrives from the DO.
-     * Dispatches by frame type.
-     */
     private void handleHostFrame(byte[] raw) {
         if (raw.length < 5) return;
         int  connId    = ByteBuffer.wrap(raw, 0, 4).getInt();
@@ -438,10 +517,9 @@ public class ProxyModule extends ReactContextBaseJavaModule {
         switch (frameType) {
 
             case FT_OPEN: {
-                // payload = "host:port"
-                String target = new String(payload, StandardCharsets.UTF_8);
+                String target  = new String(payload, StandardCharsets.UTF_8);
                 String[] parts = target.split(":");
-                String host = parts[0];
+                String host    = parts[0];
                 int port;
                 try { port = Integer.parseInt(parts[parts.length - 1]); }
                 catch (Exception e) { port = 443; }
@@ -457,7 +535,6 @@ public class ProxyModule extends ReactContextBaseJavaModule {
                         hostConns.put(connId, remote);
                         emitEvent("ProxyClientConnected", String.valueOf(connId));
 
-                        // Read from remote → send DATA frames back to DO
                         InputStream rIn = remote.getInputStream();
                         byte[] buf = new byte[PIPE_BUF];
                         int len;
@@ -468,7 +545,6 @@ public class ProxyModule extends ReactContextBaseJavaModule {
                             bytesDown.addAndGet(len);
                         }
 
-                        // Remote closed → send CLOSE frame
                         if (tunnelWs != null) {
                             tunnelWs.send(ByteString.of(buildFrame(connId, FT_CLOSE, new byte[0])));
                         }
@@ -509,11 +585,6 @@ public class ProxyModule extends ReactContextBaseJavaModule {
 
     // ── Tunnel mode: client-side incoming frame handler ───────────────────────
 
-    /**
-     * Called on client when a binary WS frame arrives from the DO.
-     * DATA frames are written back to the client app socket.
-     * CLOSE frames close the client app socket.
-     */
     private void handleClientFrame(byte[] raw) {
         if (raw.length < 5) return;
         int  connId    = ByteBuffer.wrap(raw, 0, 4).getInt();
@@ -557,10 +628,10 @@ public class ProxyModule extends ReactContextBaseJavaModule {
 
             if (firstLine.toUpperCase().startsWith("CONNECT ")) {
                 String[] parts = firstLine.split(" ");
-                String target = parts.length >= 2 ? parts[1] : null;
+                String target  = parts.length >= 2 ? parts[1] : null;
                 if (target == null) { sendError(cOut, 400, "Bad Request"); return; }
 
-                int colon = target.lastIndexOf(':');
+                int colon  = target.lastIndexOf(':');
                 String host = colon > 0 ? target.substring(0, colon) : target;
                 int port    = colon > 0 ? Integer.parseInt(target.substring(colon + 1)) : 443;
 
@@ -737,5 +808,16 @@ public class ProxyModule extends ReactContextBaseJavaModule {
                 reactCtx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class);
             if (emitter != null) emitter.emit(eventName, data);
         } catch (Exception ignored) {}
+    }
+
+    // ── Android SDK version reference for startForegroundService ─────────────
+    private static final int Build_VERSION_CODES_O = 26;
+    private static class Build {
+        static class VERSION {
+            static final int SDK_INT = android.os.Build.VERSION.SDK_INT;
+        }
+        static class VERSION_CODES {
+            static final int O = Build_VERSION_CODES_O;
+        }
     }
 }
