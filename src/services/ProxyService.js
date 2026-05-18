@@ -144,26 +144,34 @@ export async function startAsClient(code) {
     _tunnelMode = !!tunnelMode;
     await AsyncStorage.setItem('netshare_session_id', sessionId);
 
-    // 2. Start local proxy
-    try {
-      await ProxyModule.startProxy();
-    } catch (proxyErr) {
-      if (!proxyErr.message || !proxyErr.message.toLowerCase().includes('wifi')) {
-        throw proxyErr;
-      }
-      console.warn('[ProxyService] startProxy WiFi check bypassed for tunnel mode:', proxyErr.message);
-    }
-
     if (_tunnelMode) {
-      // 3a. Tunnel mode: open WS bridge to DO
+      // 2. Tunnel mode: skip startProxy entirely — the tunnel bridge
+      //    creates its own local listener on :8899. Starting the proxy
+      //    here would race with the bridge and trigger the WiFi-check
+      //    guard inside ProxyModule unnecessarily.
+
+      // 3. Open WS bridge to the Cloudflare DO
       const wsUrl = `${RELAY_WS_URL}/ws/client/${code.toUpperCase().trim()}`;
       await ProxyModule.startClientTunnel(wsUrl);
       _proxyInfo = { ip: '127.0.0.1', port: 8899, tunnelMode: true };
     } else {
-      // 3b. LAN mode: use host IP directly
+      // 2. LAN mode: start local proxy first, then verify reachability.
+      //    We must call startProxy here (not skipped) so the local HTTP
+      //    CONNECT proxy is actually running before we test the host.
+      await ProxyModule.startProxy();
+
+      // 3. Verify the host is actually reachable on the LAN.
+      //    _testProxy no longer short-circuits on private IPs — it does
+      //    a real connectivity check so we catch same-WiFi-only failures.
       const reachable = await _testProxy(ip, port);
       if (!reachable) {
-        console.warn(`[ProxyService] LAN probe failed for ${ip}:${port} — proceeding anyway`);
+        // Surface a real error instead of silently proceeding. The user is
+        // on a different network from the host — LAN mode cannot work.
+        throw new Error(
+          `Cannot reach host at ${ip}:${port}. ` +
+          'You are not on the same Wi-Fi network. ' +
+          'Ask the host to enable Global Tunnel mode and share a new code.'
+        );
       }
       _proxyInfo = { ip, port, tunnelMode: false };
     }
@@ -340,13 +348,12 @@ async function _keepAlive(sessionId) {
 }
 
 async function _testProxy(ip, port) {
-  if (
-    ip.startsWith('192.168.') ||
-    ip.startsWith('10.')      ||
-    ip.startsWith('172.')
-  ) {
-    return true;
-  }
+  // FIX (Bug 1): The old code returned true immediately for any private IP
+  // (192.168.x, 10.x, 172.x) without actually checking reachability.
+  // This caused LAN-mode sessions to silently "succeed" even when the
+  // client was 300km away and couldn't reach the host at all.
+  // Now we always do a real probe — private IPs are only reachable from the
+  // same LAN, so if the probe fails we surface the failure instead of hiding it.
 
   try {
     const controller = new AbortController();
@@ -361,7 +368,16 @@ async function _testProxy(ip, port) {
     const data = await res.json();
     return data.ok !== false;
   } catch (_) {
-    return true;
+    // Relay probe failed — fall back to a direct TCP-level check.
+    // This will only succeed if the client is actually on the same LAN.
+    try {
+      const r = await fetch(`http://${ip}:${port}`, {
+        signal: AbortSignal.timeout(4000),
+      });
+      return r.status < 600; // any response means we reached the host
+    } catch {
+      return false; // genuinely unreachable
+    }
   }
 }
 
