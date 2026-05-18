@@ -144,10 +144,12 @@ public class ProxyModule extends ReactContextBaseJavaModule {
         }
 
         try {
-            String wifiIp = getWifiIp();
-            if (wifiIp == null || wifiIp.equals("0.0.0.0")) {
-                promise.reject("NO_WIFI", "Not connected to WiFi.");
-                return;
+            // Get best available IP — WiFi preferred, falls back to mobile data IP
+            // or 127.0.0.1. We never reject just because WiFi is off; tunnel mode
+            // works over any internet connection.
+            String ip = getWifiIp();
+            if (ip == null || ip.equals("0.0.0.0")) {
+                ip = "127.0.0.1"; // tunnel mode uses localhost anyway
             }
 
             serverSocket = new ServerSocket();
@@ -160,10 +162,10 @@ public class ProxyModule extends ReactContextBaseJavaModule {
             executor = Executors.newCachedThreadPool();
             executor.execute(this::acceptLoop);
 
-            Log.i(TAG, "Proxy started on " + wifiIp + ":" + PROXY_PORT);
+            Log.i(TAG, "Proxy started on " + ip + ":" + PROXY_PORT);
 
             WritableMap result = new WritableNativeMap();
-            result.putString("ip",   wifiIp);
+            result.putString("ip",   ip);
             result.putInt("port",    PROXY_PORT);
             promise.resolve(result);
 
@@ -238,7 +240,7 @@ public class ProxyModule extends ReactContextBaseJavaModule {
                 Log.e(TAG, "[Host] Tunnel WS failure: " + t.getMessage());
                 tunnelRunning.set(false);
                 emitEvent("ProxyTunnelError", t.getMessage());
-                if (!promise.isSettled()) promise.reject("TUNNEL_ERROR", t.getMessage());
+                promise.reject("TUNNEL_ERROR", t.getMessage());
             }
 
             @Override
@@ -305,7 +307,7 @@ public class ProxyModule extends ReactContextBaseJavaModule {
                 Log.e(TAG, "[Client] Tunnel WS failure: " + t.getMessage());
                 tunnelRunning.set(false);
                 emitEvent("ProxyTunnelError", t.getMessage());
-                if (!promise.isSettled()) promise.reject("TUNNEL_ERROR", t.getMessage());
+                promise.reject("TUNNEL_ERROR", t.getMessage());
             }
 
             @Override
