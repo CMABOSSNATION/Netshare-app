@@ -311,24 +311,79 @@ public class NetShareVpnService extends VpnService {
             ProxyModule.emitEvent("ProxyClientConnected", String.valueOf(count));
             Log.d(TAG, "Proxy CONNECT OK: " + target + " (active: " + count + ")");
 
-            // Keep reading from proxy — responses go back through TUN
-            // The OS handles the actual data delivery to the requesting app
-            // because we wrote the response IP packets back correctly.
-            // Actually: since we're using a real socket connected to the proxy,
-            // the data flows:
-            //   App → TUN → (we intercept SYN) → proxy socket → ProxyModule → host
-            //   Host → ProxyModule → proxy socket → (proxy returns 200) → App
-            // The app's TCP stack sees the connection via the TUN SYN/ACK that
-            // the VPN builder generates automatically when we establish the interface.
+            // Bidirectional pipe: TUN ↔ proxy socket
+            // We need to forward raw IP packets from TUN to the proxy (upload)
+            // and forward proxy responses back to TUN (download) so the app
+            // actually receives data.
+            //
+            // Upload thread: TUN → proxy socket
+            // Download thread: proxy socket → TUN
+            final Socket finalSocket = proxySocket;
+            final InputStream proxyIn = in;
+            final OutputStream proxyOut = out;
 
-            // Drain the proxy response to keep connection alive
-            byte[] buf = new byte[PIPE_BUF];
-            int n;
-            while (running.get() && !proxySocket.isClosed()) {
-                n = in.read(buf);
-                if (n < 0) break;
-                bytesDown.addAndGet(n);
+            Thread download = new Thread(() -> {
+                byte[] buf = new byte[PIPE_BUF];
+                int n;
+                try {
+                    while (running.get() && !finalSocket.isClosed()) {
+                        n = proxyIn.read(buf);
+                        if (n < 0) break;
+                        synchronized (tunOut) {
+                            tunOut.write(buf, 0, n);
+                        }
+                        bytesDown.addAndGet(n);
+                    }
+                } catch (Exception e) {
+                    Log.d(TAG, "download pipe: " + e.getMessage());
+                } finally {
+                    try { finalSocket.close(); } catch (Exception ignored) {}
+                }
+            });
+            download.setDaemon(true);
+            download.start();
+
+            // Upload: read from TUN channel and forward to proxy
+            // We re-open TUN channel for this connection's upload path
+            java.nio.channels.FileChannel upChannel =
+                new java.io.FileInputStream(vpnInterface.getFileDescriptor()).getChannel();
+            ByteBuffer upBuf = ByteBuffer.allocate(VPN_MTU);
+            try {
+                while (running.get() && !finalSocket.isClosed()) {
+                    upBuf.clear();
+                    int len = upChannel.read(upBuf);
+                    if (len <= 0) {
+                        Thread.sleep(1);
+                        continue;
+                    }
+                    upBuf.flip();
+                    byte[] pkt = new byte[len];
+                    upBuf.get(pkt);
+                    // Only forward packets belonging to this connection
+                    if (len >= 20 && (pkt[9] & 0xFF) == 6) {
+                        int ipHdrLen = (pkt[0] & 0xF) * 4;
+                        if (len > ipHdrLen + 1) {
+                            int pSrc = ((pkt[ipHdrLen] & 0xFF) << 8) | (pkt[ipHdrLen + 1] & 0xFF);
+                            String[] keyParts = connKey.split(":");
+                            if (keyParts.length >= 1) {
+                                try {
+                                    int keySrc = Integer.parseInt(keyParts[0]);
+                                    if (pSrc == keySrc) {
+                                        proxyOut.write(pkt, 0, len);
+                                        proxyOut.flush();
+                                        bytesUp.addAndGet(len);
+                                    }
+                                } catch (NumberFormatException ignored) {}
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                Log.d(TAG, "upload pipe: " + e.getMessage());
+            } finally {
+                try { upChannel.close(); } catch (Exception ignored) {}
             }
+            download.join(5000);
 
         } catch (Exception e) {
             Log.d(TAG, "proxyConnect " + target + ": " + e.getMessage());

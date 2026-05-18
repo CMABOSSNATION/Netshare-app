@@ -296,6 +296,7 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
     // ── Tunnel mode handler (HOST receives from client via Cloudflare) ─────────
 
     private void handleViaTunnel(Socket clientSock) {
+        int connId = connIdCounter.getAndIncrement();
         try {
             InputStream  cIn  = clientSock.getInputStream();
             OutputStream cOut = clientSock.getOutputStream();
@@ -322,7 +323,7 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
 
             if (target == null) { closeSocket(clientSock); return; }
 
-            int connId = connIdCounter.getAndIncrement();
+            // Register BEFORE opening tunnel so FT_DATA responses can reach clientSock
             clientConns.put(connId, clientSock);
 
             tunnelWs.send(ByteString.of(buildFrame(connId, FT_OPEN,
@@ -345,11 +346,18 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
             if (tunnelWs != null) {
                 tunnelWs.send(ByteString.of(buildFrame(connId, FT_CLOSE, new byte[0])));
             }
+            // Do NOT close clientSock here — handleHostFrame FT_CLOSE closes it
+            // after the host flushes remaining response data back.
         } catch (Exception e) {
             Log.d(TAG, "handleViaTunnel: " + e.getMessage());
-        } finally {
+            clientConns.remove(connId);
             closeSocket(clientSock);
+            if (tunnelWs != null) {
+                try { tunnelWs.send(ByteString.of(buildFrame(connId, FT_CLOSE, new byte[0]))); }
+                catch (Exception ignored) {}
+            }
         }
+        // Intentionally no finally-closeSocket: FT_CLOSE handler closes clientSock.
     }
 
     // ── Host incoming frame handler ───────────────────────────────────────────
@@ -407,19 +415,39 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
             }
 
             case FT_DATA: {
+                // Host side: forward data to the remote internet target
                 Socket remote = hostConns.get(connId);
-                if (remote == null || remote.isClosed()) return;
-                try {
-                    remote.getOutputStream().write(payload);
-                    remote.getOutputStream().flush();
-                    bytesUp.addAndGet(payload.length);
-                } catch (Exception e) {
-                    Log.d(TAG, "[Host] DATA write err: " + e.getMessage());
+                if (remote != null && !remote.isClosed()) {
+                    try {
+                        remote.getOutputStream().write(payload);
+                        remote.getOutputStream().flush();
+                        bytesUp.addAndGet(payload.length);
+                    } catch (Exception e) {
+                        Log.d(TAG, "[Host] DATA write err: " + e.getMessage());
+                    }
+                    break;
+                }
+                // Client side: host is sending response data back — route to the
+                // waiting client socket so the app actually receives the response.
+                Socket clientSock = clientConns.get(connId);
+                if (clientSock != null && !clientSock.isClosed()) {
+                    try {
+                        clientSock.getOutputStream().write(payload);
+                        clientSock.getOutputStream().flush();
+                        bytesDown.addAndGet(payload.length);
+                    } catch (Exception e) {
+                        Log.d(TAG, "[Client] DATA write-back err: " + e.getMessage());
+                        clientConns.remove(connId);
+                        closeSocket(clientSock);
+                    }
                 }
                 break;
             }
 
             case FT_CLOSE: {
+                // Close both host and client sockets if present
+                Socket clientSock = clientConns.remove(connId);
+                if (clientSock != null) closeSocket(clientSock);
                 Socket remote = hostConns.remove(connId);
                 if (remote != null) closeSocket(remote);
                 break;
