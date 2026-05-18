@@ -79,7 +79,17 @@ export async function startAsHost(options = {}) {
 
   try {
     // 1. Start local HTTP CONNECT proxy on :8899
-    const proxyResult = await ProxyModule.startProxy();
+    // In tunnel mode, WiFi is not required — bypass WiFi check errors
+    let proxyResult;
+    try {
+      proxyResult = await ProxyModule.startProxy();
+    } catch (proxyErr) {
+      const msg = proxyErr.message || '';
+      if (!msg.toLowerCase().includes('wifi')) throw proxyErr;
+      // WiFi check failed in tunnel mode — use fallback IP
+      console.warn('[ProxyService] Host startProxy WiFi bypass:', msg);
+      proxyResult = { ip: '127.0.0.1', port: 8899 };
+    }
     const { ip, port } = proxyResult;
 
     _tunnelMode = options.tunnelMode !== undefined ? options.tunnelMode : true;
@@ -152,7 +162,17 @@ export async function startAsClient(code) {
       // forwarded to the DO, which forwards it to the host WS.
       // Responses come back the same way.
 
-      await ProxyModule.startProxy();                           // local :8899
+      // startProxy() may throw a WiFi check error on the client side —
+      // tunnel mode only needs mobile data/any internet, so we ignore it.
+      try {
+        await ProxyModule.startProxy();                         // local :8899
+      } catch (proxyErr) {
+        if (!proxyErr.message || !proxyErr.message.toLowerCase().includes('wifi')) {
+          throw proxyErr; // real error, re-throw
+        }
+        // WiFi check failed but we're in tunnel mode — safe to continue
+        console.warn('[ProxyService] startProxy WiFi check bypassed for tunnel mode:', proxyErr.message);
+      }
       const wsUrl = `${RELAY_WS_URL}/ws/client/${code.toUpperCase().trim()}`;
       await ProxyModule.startClientTunnel(wsUrl);              // bridge WS
 
