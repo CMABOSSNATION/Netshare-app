@@ -90,8 +90,8 @@ public class NetShareVpnService extends VpnService {
     private ExecutorService executor;
     private String wsUrl;
 
-    // Track active connections by srcPort to avoid duplicate SYN handling
-    private final java.util.concurrent.ConcurrentHashMap<Integer, Boolean> activeKeys
+    // Track active connections by "srcPort:dstIp:dstPort" to avoid duplicate SYN handling
+    private final java.util.concurrent.ConcurrentHashMap<String, Boolean> activeKeys
         = new java.util.concurrent.ConcurrentHashMap<>();
 
     // ── Service lifecycle ─────────────────────────────────────────────────────
