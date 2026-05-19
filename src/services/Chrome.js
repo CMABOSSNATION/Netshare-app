@@ -33,9 +33,9 @@ const { VpnModule } = NativeModules;
 const vpnEmitter = VpnModule ? new NativeEventEmitter(VpnModule) : null;
 
 export const RELAY_URL = process.env.RELAY_URL
-  || 'wss://netshare.cmaraphael90.workers.dev/relay';
+  || 'wss://nshare.cmaraphael90.workers.dev/relay';
 export const API_URL   = process.env.API_URL
-  || 'https://netshare.cmaraphael90.workers.dev';
+  || 'https://nshare.cmaraphael90.workers.dev';
 
 export const CHROME_PACKAGES = [
   'com.android.chrome',
