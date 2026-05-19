@@ -12,11 +12,6 @@ import android.util.Log;
 
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -63,8 +58,6 @@ public class NetShareVpnService extends VpnService {
     private static final String CHANNEL_ID = "netshare_vpn";
     private static final int    NOTIF_ID   = 1001;
     private static final int    VPN_MTU    = 1500;
-    private static final int    PROXY_PORT = 8899;
-    private static final int    PIPE_BUF   = 16 * 1024;
     private static final int    QUEUE_CAP  = 512;
 
     private static final String VPN_ADDRESS = "10.0.0.2";
@@ -98,6 +91,9 @@ public class NetShareVpnService extends VpnService {
 
     private final ConcurrentHashMap<String, BlockingQueue<byte[]>> connQueues
         = new ConcurrentHashMap<>();
+
+    // Monotonically-increasing connection IDs shared with the host relay
+    private final AtomicInteger nextConnId = new AtomicInteger(1);
 
     // ── Service lifecycle ─────────────────────────────────────────────────────
 
@@ -303,7 +299,7 @@ public class NetShareVpnService extends VpnService {
                 int    srcPort = ((buf[ipHdrLen]   &0xFF)<<8)|(buf[ipHdrLen+1]&0xFF);
                 int    dstPort = ((buf[ipHdrLen+2] &0xFF)<<8)|(buf[ipHdrLen+3]&0xFF);
 
-                if (dstIp.startsWith("127.") || dstPort == PROXY_PORT) continue;
+                if (dstIp.startsWith("127.")) continue;
 
                 int     flags = buf[ipHdrLen + 13] & 0xFF;
                 boolean syn   = (flags & 0x02) != 0;
@@ -320,7 +316,7 @@ public class NetShareVpnService extends VpnService {
                         connQueues.put(connKey, queue);
                         final String t = dstIp + ":" + dstPort;
                         final String k = connKey;
-                        executor.execute(() -> proxyConnect(t, k, queue));
+                        executor.execute(() -> relayConnect(t, k, queue));
                     }
                 } else if (fin || rst) {
                     BlockingQueue<byte[]> q = connQueues.remove(connKey);
@@ -345,97 +341,115 @@ public class NetShareVpnService extends VpnService {
         try { tunIn.close(); } catch (Exception ignored) {}
     }
 
-    // ── Per-connection proxy handler ──────────────────────────────────────────
+    // ── Per-connection relay handler ──────────────────────────────────────────
+    //
+    // FIX (the remaining bug): the old proxyConnect() opened a Socket to
+    // 127.0.0.1:8899 — that's the HOST's proxy port; it is never running on
+    // the client device, so every connection failed immediately with
+    // "connection refused" and 0 bytes ever flowed.
+    //
+    // The correct approach: send FT_OPEN / FT_DATA / FT_CLOSE frames directly
+    // over relayWs.  The host relay receives them, opens the real TCP
+    // connection, and sends FT_DATA frames back via onMessage() → handleRelayFrame().
 
-    private void proxyConnect(String target, String connKey, BlockingQueue<byte[]> queue) {
-        Socket proxySocket = null;
+    private static final byte FT_OPEN  = 0x01;
+    private static final byte FT_DATA  = 0x02;
+    private static final byte FT_CLOSE = 0x03;
+
+    /**
+     * Build a relay frame:  [ connId(4) | frameType(1) | payload ]
+     */
+    private static byte[] buildFrame(int connId, byte type, byte[] payload) {
+        int len = 5 + (payload != null ? payload.length : 0);
+        ByteBuffer bb = ByteBuffer.allocate(len);
+        bb.putInt(connId);
+        bb.put(type);
+        if (payload != null) bb.put(payload);
+        return bb.array();
+    }
+
+    /**
+     * Called from tunReadLoop for every new SYN packet.
+     *
+     * 1. Assigns a numeric connId (shared namespace with host relay).
+     * 2. Registers "relay:<connId>" in connQueues so handleRelayFrame() can
+     *    deliver inbound FT_DATA frames to the TUN writer thread below.
+     * 3. Sends FT_OPEN to the host.
+     * 4. Drains the per-connection queue and sends FT_DATA frames.
+     * 5. On exit sends FT_CLOSE.
+     *
+     * Inbound data path: relayWs.onMessage → handleRelayFrame → connQueues
+     *   → the TUN-writer thread inside this method.
+     */
+    private void relayConnect(String target, String connKey, BlockingQueue<byte[]> queue) {
+        int connId = nextConnId.getAndIncrement();
+        // "relay:<connId>" is the key handleRelayFrame uses
+        String relayKey = "relay:" + connId;
+
+        // Queue for host→TUN data; handleRelayFrame writes here
+        BlockingQueue<byte[]> inboundQueue = new LinkedBlockingQueue<>(QUEUE_CAP);
+        connQueues.put(relayKey, inboundQueue);
+
+        activeConns.incrementAndGet();
         try {
-            proxySocket = new Socket();
-            if (!protect(proxySocket)) Log.w(TAG, "protect() failed: " + target);
-
-            proxySocket.setTcpNoDelay(true);
-            proxySocket.setSoTimeout(120_000);
-            proxySocket.connect(new InetSocketAddress("127.0.0.1", PROXY_PORT), 5_000);
-
-            InputStream  proxyIn  = proxySocket.getInputStream();
-            OutputStream proxyOut = proxySocket.getOutputStream();
-
-            proxyOut.write(("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n")
-                .getBytes(StandardCharsets.US_ASCII));
-            proxyOut.flush();
-
-            String resp = readHttpResponse(proxyIn);
-            if (resp == null || !resp.contains("200")) {
-                Log.w(TAG, "CONNECT failed [" + target + "]: " + resp);
+            WebSocket ws = relayWs;
+            if (ws == null || !wsReady.get()) {
+                Log.w(TAG, "relayConnect: WS not ready, dropping " + target);
                 return;
             }
 
-            activeConns.incrementAndGet();
+            // 1. Send FT_OPEN with "host:port" as payload
+            byte[] openPayload = target.getBytes(StandardCharsets.UTF_8);
+            ws.send(ByteString.of(buildFrame(connId, FT_OPEN, openPayload)));
+            Log.d(TAG, "[relay] FT_OPEN " + connId + " → " + target);
 
-            final Socket       sock = proxySocket;
-            final AtomicBoolean done = new AtomicBoolean(false);
-
-            Thread download = new Thread(() -> {
-                byte[] buf = new byte[PIPE_BUF];
+            // 2. TUN-writer thread: host→TUN
+            AtomicBoolean done = new AtomicBoolean(false);
+            Thread tunWriter = new Thread(() -> {
                 try {
-                    int n;
-                    while (running.get() && !sock.isClosed()) {
-                        n = proxyIn.read(buf);
-                        if (n < 0) break;
+                    while (running.get() && !done.get()) {
+                        byte[] payload = inboundQueue.poll(300, TimeUnit.MILLISECONDS);
+                        if (payload == null) continue;
+                        if (payload.length == 0) break; // FT_CLOSE sentinel
                         synchronized (NetShareVpnService.this) {
-                            if (tunOut != null) { tunOut.write(buf, 0, n); tunOut.flush(); }
+                            if (tunOut != null) { tunOut.write(payload); tunOut.flush(); }
                         }
-                        bytesDown.addAndGet(n);
+                        bytesDown.addAndGet(payload.length);
                     }
                 } catch (Exception ignored) {
                 } finally {
                     done.set(true);
-                    try { sock.close(); } catch (Exception ignored2) {}
                 }
-            }, "ns-dl-" + target);
-            download.setDaemon(true);
-            download.start();
+            }, "ns-tun-w-" + connId);
+            tunWriter.setDaemon(true);
+            tunWriter.start();
 
+            // 3. Main thread: TUN→host (drain the per-connKey queue from tunReadLoop)
             try {
-                while (running.get() && !sock.isClosed() && !done.get()) {
+                while (running.get() && !done.get()) {
                     byte[] payload = queue.poll(200, TimeUnit.MILLISECONDS);
                     if (payload == null) continue;
-                    if (payload.length == 0) break;
-                    proxyOut.write(payload);
-                    proxyOut.flush();
+                    if (payload.length == 0) break; // FIN/RST sentinel
+                    ws.send(ByteString.of(buildFrame(connId, FT_DATA, payload)));
                     bytesUp.addAndGet(payload.length);
                 }
-            } catch (Exception ignored) {
             } finally {
-                try { sock.close(); } catch (Exception ignored) {}
+                done.set(true);
+                // 4. Send FT_CLOSE so the host tears down its socket
+                try { ws.send(ByteString.of(buildFrame(connId, FT_CLOSE, null))); }
+                catch (Exception ignored) {}
+                Log.d(TAG, "[relay] FT_CLOSE " + connId + " ← " + target);
             }
 
-            try { download.join(3_000); } catch (InterruptedException ignored) {}
+            try { tunWriter.join(2_000); } catch (InterruptedException ignored) {}
 
         } catch (Exception e) {
-            Log.d(TAG, "proxyConnect[" + target + "]: " + e.getMessage());
+            Log.d(TAG, "relayConnect[" + target + "]: " + e.getMessage());
         } finally {
+            connQueues.remove(relayKey);
             connQueues.remove(connKey);
             activeConns.decrementAndGet();
-            if (proxySocket != null && !proxySocket.isClosed())
-                try { proxySocket.close(); } catch (Exception ignored) {}
         }
-    }
-
-    private String readHttpResponse(InputStream in) throws IOException {
-        StringBuilder first = new StringBuilder();
-        StringBuilder all   = new StringBuilder();
-        int b; int nl = 0;
-        while ((b = in.read()) != -1) {
-            all.append((char) b);
-            if (b == '\n') {
-                nl++;
-                if (nl == 1) first.append(all);
-                if (all.toString().endsWith("\r\n\r\n") ||
-                    all.toString().endsWith("\n\n")) break;
-            }
-        }
-        return first.toString().trim();
     }
 
     private void startForegroundNotification() {
