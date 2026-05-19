@@ -291,9 +291,8 @@ public class NetShareVpnService extends VpnService {
                     }
                 }
 
-            } catch (InterruptedException e) {
-                break;
             } catch (Exception e) {
+                if (Thread.currentThread().isInterrupted()) break;
                 if (running.get()) Log.v(TAG, "tunRead: " + e.getMessage());
             }
         }
