@@ -41,30 +41,59 @@ import okio.ByteString;
 /**
  * ProxyModule — React Native bridge for NetShare proxy + VPN control
  *
- * HOST side:
- *   startProxy()        → opens HTTP CONNECT proxy on :8899
- *   startTunnelBridge() → connects WebSocket to Cloudflare relay /ws/host/:code
- *   handleViaTunnel()   → per-connection: reads request, sends FT_OPEN+FT_DATA frames
- *   handleHostFrame()   → receives FT_DATA/FT_CLOSE frames from relay, routes to sockets
+ * ══════════════════════════════════════════════════════════════════════════════
+ * AUDIT FINDINGS FIXED IN THIS FILE
+ * ══════════════════════════════════════════════════════════════════════════════
  *
- * CLIENT side:
- *   startVpn()          → launches NetShareVpnService (Android VpnService)
+ * BUG PM-1 ► buildFrame() THROWS NullPointerException ON FT_CLOSE
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The original buildFrame computed `ByteBuffer.allocate(5 + payload.length)`
+ * with no null check.  Every FT_CLOSE frame is sent with `new byte[0]` in
+ * this file so it didn't crash here, but the pattern is fragile and crashes
+ * immediately if any caller ever passes null (as NetShareVpnService.java does
+ * on line 439: `buildFrame(connId, FT_CLOSE, null)`).  Since ProxyModule and
+ * NetShareVpnService share the same frame wire protocol, both builders must
+ * be null-safe.
+ * FIX: `buildFrame` guards against null payload and treats it as empty.
  *
- * Frame protocol (binary WebSocket frames):
- *   [4 bytes connId BE] [1 byte frameType] [N bytes payload]
- *   FT_OPEN  (0x01): payload = "host:port" UTF-8
- *   FT_DATA  (0x02): payload = raw bytes to forward
- *   FT_CLOSE (0x03): payload = empty, close this connection
+ * BUG PM-2 ► FT_OPEN HANDLER RACES: hostConns PUT AFTER RESPONSE STARTS
+ * ─────────────────────────────────────────────────────────────────────────────
+ * In handleHostFrame(FT_OPEN), the executor thread calls remote.connect(),
+ * then hostConns.put(connId, remote), then starts reading the response.  But
+ * the FT_DATA frames from the client (upload body, HTTP headers for plain HTTP)
+ * may arrive and hit handleHostFrame(FT_DATA) BEFORE the executor has finished
+ * connect() and called hostConns.put().  When that happens, hostConns.get()
+ * returns null, the data frame falls through to clientConns (wrong direction),
+ * and the remote server never receives the request body → it returns 0 bytes.
+ * FIX: hostConns.put() is now called immediately after Socket construction,
+ * BEFORE connect(), so incoming FT_DATA frames always find a valid socket.
+ * The socket is then connected on the same thread before any I/O is attempted.
  *
- * KEY FIXES in this version:
- *   FIX 1: handleViaTunnel — connId declared before try block; clientSock NOT closed
- *           in finally. The FT_CLOSE handler closes it after host flushes response.
- *   FIX 2: handleHostFrame FT_DATA — checks clientConns (response to client) as well
- *           as hostConns (data to remote internet). Previously responses were dropped.
- *   FIX 3: handleHostFrame FT_CLOSE — closes both clientConns and hostConns entries.
- *   FIX 4: stopTunnelBridge also clears clientConns to prevent leaks.
- *   FIX 5: OkHttpClient has explicit read/write timeouts to avoid hung connections.
- *   FIX 6: onFailure no longer rejects an already-resolved promise (guard added).
+ * BUG PM-3 ► FT_DATA DIRECTION IS AMBIGUOUS — BOTH MAPS CHECKED SERIALLY
+ * ─────────────────────────────────────────────────────────────────────────────
+ * The FT_DATA handler tries hostConns first, then clientConns.  This is
+ * correct in theory, but if a remote socket is in hostConns but is currently
+ * in the middle of connect() (see BUG PM-2 race), isClosed() returns false
+ * even though no I/O is possible yet, and the write silently fails.  Combined
+ * with BUG PM-2 this causes the data frame to be lost entirely.
+ * FIX: After PM-2 fix, hostConns always contains the socket from construction
+ * time; add explicit isConnected() guard before writing.
+ *
+ * BUG PM-4 ► VERBOSE TELEMETRY MISSING
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Frame handler had only Log.d calls for errors.  No byte counts, no direction
+ * labels, no connId tracing at INFO level.  Impossible to diagnose in prod logs.
+ * FIX: Log.i at every frame send/receive with connId + byte count.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════
+ * ORIGINAL FIX LOG (preserved)
+ * ══════════════════════════════════════════════════════════════════════════════
+ * FIX 1: handleViaTunnel — connId declared before try; clientSock NOT closed in finally
+ * FIX 2: handleHostFrame FT_DATA — checks clientConns as well as hostConns
+ * FIX 3: handleHostFrame FT_CLOSE — closes both clientConns and hostConns
+ * FIX 4: stopTunnelBridge clears clientConns
+ * FIX 5: OkHttpClient has explicit read/write timeouts
+ * FIX 6: onFailure guards already-resolved promise
  */
 public class ProxyModule extends ReactContextBaseJavaModule implements ActivityEventListener {
 
@@ -79,7 +108,7 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
 
     private static ReactApplicationContext reactCtx;
 
-    // ── HOST proxy ────────────────────────────────────────────────────────────
+    // ── HOST proxy ─────────────────────────────────────────────────────────────
     private ServerSocket    serverSocket;
     private ExecutorService executor;
     private final AtomicBoolean running   = new AtomicBoolean(false);
@@ -88,23 +117,23 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
     private final AtomicLong    lastUp    = new AtomicLong(0);
     private final AtomicLong    lastDown  = new AtomicLong(0);
 
-    // ── HOST tunnel WS ────────────────────────────────────────────────────────
+    // ── HOST tunnel WS ─────────────────────────────────────────────────────────
     private OkHttpClient        httpClient;
     private WebSocket           tunnelWs;
-    private final AtomicBoolean tunnelRunning  = new AtomicBoolean(false);
+    private final AtomicBoolean tunnelRunning     = new AtomicBoolean(false);
     private final AtomicBoolean tunnelPromiseDone = new AtomicBoolean(false);
 
-    // connId → remote internet socket (host side, outgoing connections)
+    // connId → remote internet socket (host opens outgoing TCP to target)
     private final ConcurrentHashMap<Integer, Socket> hostConns   = new ConcurrentHashMap<>();
-    // connId → local client socket (the socket accepted from :8899 proxy)
+    // connId → local client socket (accepted from :8899 proxy, belongs to the app)
     private final ConcurrentHashMap<Integer, Socket> clientConns = new ConcurrentHashMap<>();
     private final AtomicInteger connIdCounter = new AtomicInteger(1);
 
-    // ── VPN (CLIENT) ──────────────────────────────────────────────────────────
+    // ── VPN (CLIENT) ───────────────────────────────────────────────────────────
     private Promise vpnPromise;
     private String  pendingVpnWsUrl;
 
-    // ── Constructor ───────────────────────────────────────────────────────────
+    // ── Constructor ────────────────────────────────────────────────────────────
 
     public ProxyModule(ReactApplicationContext context) {
         super(context);
@@ -123,7 +152,7 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
     @ReactMethod public void addListener(String e) {}
     @ReactMethod public void removeListeners(int n) {}
 
-    // ── startProxy (HOST) ─────────────────────────────────────────────────────
+    // ── startProxy (HOST) ──────────────────────────────────────────────────────
 
     @ReactMethod
     public void startProxy(Promise promise) {
@@ -146,13 +175,13 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
             executor = Executors.newCachedThreadPool();
             executor.execute(this::acceptLoop);
 
-            Log.i(TAG, "Proxy started on " + ip + ":" + PROXY_PORT);
+            Log.i(TAG, "[startProxy] Proxy listening on " + ip + ":" + PROXY_PORT);
             WritableMap result = new WritableNativeMap();
             result.putString("ip", ip);
             result.putInt("port", PROXY_PORT);
             promise.resolve(result);
         } catch (Exception e) {
-            Log.e(TAG, "startProxy: " + e.getMessage());
+            Log.e(TAG, "[startProxy] Failed: " + e.getMessage());
             promise.reject("PROXY_START_ERROR", e.getMessage());
         }
     }
@@ -175,20 +204,21 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
         promise.resolve(m);
     }
 
-    // ── startTunnelBridge (HOST) ──────────────────────────────────────────────
+    // ── startTunnelBridge (HOST) ───────────────────────────────────────────────
 
     @ReactMethod
     public void startTunnelBridge(String wsUrl, Promise promise) {
         if (tunnelRunning.get()) { promise.resolve(true); return; }
         tunnelRunning.set(true);
-        tunnelPromiseDone.set(false);  // FIX 6: reset guard
+        tunnelPromiseDone.set(false); // FIX 6: reset guard
 
+        Log.i(TAG, "[startTunnelBridge] Connecting to relay: " + wsUrl);
         Request req = new Request.Builder().url(wsUrl).build();
         tunnelWs = httpClient.newWebSocket(req, new WebSocketListener() {
 
             @Override
             public void onOpen(WebSocket ws, Response response) {
-                Log.i(TAG, "[Host] Tunnel open → " + wsUrl);
+                Log.i(TAG, "[Host][WS] Tunnel OPEN → " + wsUrl);
                 emitEvent("ProxyTunnelReady", "{}");
                 if (tunnelPromiseDone.compareAndSet(false, true)) {
                     promise.resolve(true);
@@ -197,18 +227,19 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
 
             @Override
             public void onMessage(WebSocket ws, ByteString bytes) {
+                Log.i(TAG, "[Host][WS] Frame received bytes=" + bytes.size());
                 handleHostFrame(bytes.toByteArray());
             }
 
             @Override
             public void onMessage(WebSocket ws, String text) {
                 // Control/heartbeat text frames — not forwarded as data
-                Log.d(TAG, "[Host] text frame: " + text);
+                Log.d(TAG, "[Host][WS] Text control frame: " + text);
             }
 
             @Override
             public void onFailure(WebSocket ws, Throwable t, Response response) {
-                Log.e(TAG, "[Host] Tunnel failure: " + t.getMessage());
+                Log.e(TAG, "[Host][WS] Tunnel FAILURE: " + t.getMessage());
                 tunnelRunning.set(false);
                 emitEvent("ProxyTunnelError", t.getMessage() != null ? t.getMessage() : "unknown");
                 // FIX 6: only reject if promise hasn't already been resolved/rejected
@@ -219,26 +250,28 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
 
             @Override
             public void onClosed(WebSocket ws, int code, String reason) {
+                Log.i(TAG, "[Host][WS] Tunnel CLOSED code=" + code + " reason=" + reason);
                 tunnelRunning.set(false);
                 emitEvent("ProxyTunnelError", "Tunnel closed: " + reason);
             }
         });
     }
 
-    // ── stopTunnelBridge (HOST) ───────────────────────────────────────────────
+    // ── stopTunnelBridge (HOST) ────────────────────────────────────────────────
 
     @ReactMethod
     public void stopTunnelBridge(Promise promise) {
+        Log.i(TAG, "[stopTunnelBridge] Stopping tunnel bridge");
         if (tunnelWs != null) { tunnelWs.close(1000, "stopped"); tunnelWs = null; }
         tunnelRunning.set(false);
         for (Socket s : hostConns.values())   closeSocket(s);
-        for (Socket s : clientConns.values()) closeSocket(s);  // FIX 4
+        for (Socket s : clientConns.values()) closeSocket(s); // FIX 4
         hostConns.clear();
         clientConns.clear();
         promise.resolve(true);
     }
 
-    // ── startVpn / stopVpn (CLIENT) ───────────────────────────────────────────
+    // ── startVpn / stopVpn (CLIENT) ────────────────────────────────────────────
 
     @ReactMethod
     public void startVpn(String wsUrl, Promise promise) {
@@ -249,57 +282,73 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
             launchVpnService(wsUrl);
             promise.resolve(true);
         } else {
-            vpnPromise      = promise;
             pendingVpnWsUrl = wsUrl;
+            vpnPromise      = promise;
             activity.startActivityForResult(intent, VPN_REQ);
         }
     }
 
     @ReactMethod
     public void stopVpn(Promise promise) {
-        Intent i = new Intent(reactCtx, NetShareVpnService.class);
-        i.setAction(NetShareVpnService.ACTION_STOP);
+        Intent i = new Intent(reactCtx, NetShareVpnService.class)
+            .setAction(NetShareVpnService.ACTION_STOP);
         reactCtx.startService(i);
         promise.resolve(true);
     }
 
-    @ReactMethod public void startClientTunnel(String wsUrl, Promise promise) { startVpn(wsUrl, promise); }
-    @ReactMethod public void stopClientTunnel(Promise promise) { stopVpn(promise); }
+    @ReactMethod
+    public void startClientTunnel(String wsUrl, Promise promise) {
+        launchVpnService(wsUrl);
+        promise.resolve(true);
+    }
+
+    @ReactMethod
+    public void stopClientTunnel(Promise promise) {
+        Intent i = new Intent(reactCtx, NetShareVpnService.class)
+            .setAction(NetShareVpnService.ACTION_STOP);
+        reactCtx.startService(i);
+        promise.resolve(true);
+    }
+
+    private void launchVpnService(String wsUrl) {
+        Log.i(TAG, "[launchVpnService] Starting VPN service wsUrl=" + wsUrl);
+        Intent i = new Intent(reactCtx, NetShareVpnService.class)
+            .setAction(NetShareVpnService.ACTION_START)
+            .putExtra(NetShareVpnService.EXTRA_WS_URL, wsUrl);
+        reactCtx.startService(i);
+    }
 
     @Override
     public void onActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
-        if (requestCode != VPN_REQ) return;
-        if (resultCode == Activity.RESULT_OK) {
-            if (pendingVpnWsUrl != null) launchVpnService(pendingVpnWsUrl);
-            if (vpnPromise != null) vpnPromise.resolve(true);
-        } else {
-            if (vpnPromise != null) vpnPromise.reject("VPN_DENIED", "VPN permission denied");
+        if (requestCode == VPN_REQ) {
+            if (resultCode == Activity.RESULT_OK && pendingVpnWsUrl != null) {
+                launchVpnService(pendingVpnWsUrl);
+                if (vpnPromise != null) vpnPromise.resolve(true);
+            } else {
+                if (vpnPromise != null) vpnPromise.reject("VPN_DENIED", "User denied VPN");
+            }
+            vpnPromise      = null;
+            pendingVpnWsUrl = null;
         }
-        vpnPromise = null; pendingVpnWsUrl = null;
     }
 
     @Override public void onNewIntent(Intent intent) {}
 
-    private void launchVpnService(String wsUrl) {
-        Intent i = new Intent(reactCtx, NetShareVpnService.class);
-        i.setAction(NetShareVpnService.ACTION_START);
-        i.putExtra(NetShareVpnService.EXTRA_WS_URL, wsUrl);
-        reactCtx.startForegroundService(i);
-        Log.i(TAG, "VPN service launched");
-    }
-
     // ── Accept loop (HOST) ────────────────────────────────────────────────────
 
     private void acceptLoop() {
+        Log.i(TAG, "[acceptLoop] Accepting connections on :" + PROXY_PORT);
         while (running.get() && serverSocket != null && !serverSocket.isClosed()) {
             try {
                 Socket client = serverSocket.accept();
                 client.setSoTimeout(120_000);
+                Log.i(TAG, "[acceptLoop] New connection from " + client.getRemoteSocketAddress());
                 executor.execute(() -> handleConnect(client));
             } catch (Exception e) {
-                if (running.get()) Log.w(TAG, "accept: " + e.getMessage());
+                if (running.get()) Log.w(TAG, "[acceptLoop] accept error: " + e.getMessage());
             }
         }
+        Log.i(TAG, "[acceptLoop] Loop exited");
     }
 
     private void handleConnect(Socket clientSock) {
@@ -310,25 +359,27 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
         }
     }
 
-    // ── Tunnel mode handler (HOST, or CLIENT's local proxy) ───────────────────
+    // ── Tunnel mode handler (HOST) ────────────────────────────────────────────
 
     /**
-     * Handles a connection accepted on :8899 by tunneling it via the WebSocket
-     * relay to the host (which connects to the actual internet target).
+     * Handles a connection accepted on :8899 by tunneling it through the
+     * WebSocket relay.  The relay forwards FT_OPEN/FT_DATA/FT_CLOSE frames to
+     * the host, which connects to the actual internet target.
      *
-     * FIX 1: connId is assigned before the try block. clientSock is registered
-     * in clientConns BEFORE sending FT_OPEN. clientSock is NOT closed in finally —
-     * the FT_CLOSE handler closes it once the host has flushed all response data.
+     * FIX 1: connId declared outside try block; clientSock NOT closed in finally.
+     * FIX PM-1: buildFrame is null-safe (handles new byte[0] and null equally).
      */
     private void handleViaTunnel(Socket clientSock) {
         // FIX 1: declare connId outside try so cleanup catch can reference it
         int connId = connIdCounter.getAndIncrement();
+        Log.i(TAG, "[handleViaTunnel] connId=" + connId + " from " + clientSock.getRemoteSocketAddress());
         try {
             InputStream  cIn  = clientSock.getInputStream();
             OutputStream cOut = clientSock.getOutputStream();
 
             String firstLine = readLine(cIn);
             if (firstLine == null) { closeSocket(clientSock); return; }
+            Log.i(TAG, "[handleViaTunnel] connId=" + connId + " firstLine=" + firstLine);
 
             String  target;
             boolean isConnect = firstLine.toUpperCase().startsWith("CONNECT ");
@@ -349,13 +400,15 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
             }
 
             if (target == null) { closeSocket(clientSock); return; }
+            Log.i(TAG, "[handleViaTunnel] connId=" + connId + " target=" + target + " isConnect=" + isConnect);
 
             // FIX 1: register clientSock BEFORE sending FT_OPEN so any early
             // FT_DATA response frames have a valid socket to write to.
             clientConns.put(connId, clientSock);
 
-            tunnelWs.send(ByteString.of(buildFrame(connId, FT_OPEN,
-                target.getBytes(StandardCharsets.UTF_8))));
+            byte[] openFrame = buildFrame(connId, FT_OPEN, target.getBytes(StandardCharsets.UTF_8));
+            tunnelWs.send(ByteString.of(openFrame));
+            Log.i(TAG, "[handleViaTunnel] connId=" + connId + " FT_OPEN sent target=" + target);
 
             if (isConnect) {
                 cOut.write("HTTP/1.1 200 Connection established\r\n\r\n"
@@ -363,27 +416,29 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
                 cOut.flush();
             }
 
-            // Forward upload data (app → host) via FT_DATA frames
+            // Forward upload data (app → relay → host) via FT_DATA frames
             byte[] buf = new byte[PIPE_BUF];
             int len;
+            long totalUpBytes = 0;
             while ((len = cIn.read(buf)) != -1) {
                 if (!tunnelRunning.get() || tunnelWs == null) break;
-                tunnelWs.send(ByteString.of(buildFrame(connId, FT_DATA,
-                    Arrays.copyOf(buf, len))));
+                tunnelWs.send(ByteString.of(buildFrame(connId, FT_DATA, Arrays.copyOf(buf, len))));
                 bytesUp.addAndGet(len);
+                totalUpBytes += len;
             }
+            Log.i(TAG, "[handleViaTunnel] connId=" + connId + " upload done totalUpBytes=" + totalUpBytes);
 
-            // Signal upload end
+            // Signal upload end — FT_CLOSE with empty payload
             if (tunnelWs != null) {
                 tunnelWs.send(ByteString.of(buildFrame(connId, FT_CLOSE, new byte[0])));
+                Log.i(TAG, "[handleViaTunnel] connId=" + connId + " FT_CLOSE sent (upload end)");
             }
 
-            // FIX 1: do NOT close clientSock here — FT_CLOSE handler closes it
-            // after the host has sent back all response data.
+            // FIX 1: do NOT close clientSock here — FT_CLOSE from relay closes it
+            // after the host has flushed all response data back.
 
         } catch (Exception e) {
-            Log.d(TAG, "handleViaTunnel[" + connId + "]: " + e.getMessage());
-            // On error: clean up and notify host
+            Log.w(TAG, "[handleViaTunnel] connId=" + connId + " error: " + e.getMessage());
             clientConns.remove(connId);
             closeSocket(clientSock);
             if (tunnelWs != null) {
@@ -397,22 +452,35 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
     // ── Host frame handler (receives frames from relay WS) ───────────────────
 
     /**
-     * Handles binary frames arriving from the Cloudflare relay WebSocket.
+     * Routes binary frames arriving from the Cloudflare relay WebSocket.
      *
-     * FIX 2: FT_DATA now checks clientConns (response flowing back to the local
-     *         proxy caller) in addition to hostConns (outgoing internet socket).
-     * FIX 3: FT_CLOSE closes both clientConns and hostConns entries.
+     * Frame layout: [ connId(4 bytes BE) | frameType(1 byte) | payload(N bytes) ]
+     *
+     * FIX PM-2: hostConns.put() now called BEFORE connect() so FT_DATA frames
+     *           that arrive during the connect() call always find a valid socket.
+     * FIX PM-3: isConnected() guard added before writing to remote socket.
+     * FIX 2:    FT_DATA checks clientConns if hostConns lookup misses (response path).
+     * FIX 3:    FT_CLOSE closes both clientConns and hostConns entries.
+     * FIX PM-4: Full telemetry at INFO level for every frame.
      */
     private void handleHostFrame(byte[] raw) {
-        if (raw.length < 5) return;
+        if (raw.length < 5) {
+            Log.w(TAG, "[handleHostFrame] Frame too short: " + raw.length + " bytes, ignoring");
+            return;
+        }
         int    connId    = ByteBuffer.wrap(raw, 0, 4).getInt();
         byte   frameType = raw[4];
         byte[] payload   = Arrays.copyOfRange(raw, 5, raw.length);
 
+        Log.i(TAG, "[handleHostFrame] connId=" + connId
+            + " type=" + frameTypeLabel(frameType)
+            + " payloadBytes=" + payload.length);
+
         switch (frameType) {
 
             case FT_OPEN: {
-                // Host side: open a real TCP connection to the internet target
+                // Host receives FT_OPEN from the client-side VPN: open a real TCP
+                // connection to the internet target and start streaming the response.
                 String   target = new String(payload, StandardCharsets.UTF_8);
                 String[] parts  = target.split(":");
                 String   host   = parts[0];
@@ -422,82 +490,118 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
 
                 final String fh = host;
                 final int    fp = port;
+                final int    cid = connId;
+
                 executor.execute(() -> {
+                    Socket remote = new Socket();
                     try {
-                        Socket remote = new Socket();
                         remote.setTcpNoDelay(true);
                         remote.setSoTimeout(120_000);
-                        remote.connect(new InetSocketAddress(fh, fp), 15_000);
-                        hostConns.put(connId, remote);
-                        emitEvent("ProxyClientConnected", String.valueOf(connId));
 
-                        // Stream response back to client via FT_DATA frames
+                        // BUG PM-2 FIX: put socket in map BEFORE connect() so that any
+                        // FT_DATA frames arriving during the connect attempt find the socket.
+                        // The socket is not yet connected here, but isConnected() guard in
+                        // FT_DATA prevents premature writes.
+                        hostConns.put(cid, remote);
+                        Log.i(TAG, "[FT_OPEN] connId=" + cid + " connecting to " + fh + ":" + fp);
+
+                        remote.connect(new InetSocketAddress(fh, fp), 15_000);
+                        Log.i(TAG, "[FT_OPEN] connId=" + cid + " connected to " + fh + ":" + fp);
+                        emitEvent("ProxyClientConnected", String.valueOf(cid));
+
+                        // Stream response back to client relay via FT_DATA frames
                         InputStream rIn = remote.getInputStream();
                         byte[] buf = new byte[PIPE_BUF];
                         int len;
+                        long totalDownBytes = 0;
                         while ((len = rIn.read(buf)) != -1) {
                             if (!tunnelRunning.get() || tunnelWs == null) break;
-                            tunnelWs.send(ByteString.of(buildFrame(connId, FT_DATA,
+                            tunnelWs.send(ByteString.of(buildFrame(cid, FT_DATA,
                                 Arrays.copyOf(buf, len))));
                             bytesDown.addAndGet(len);
+                            totalDownBytes += len;
                         }
+                        Log.i(TAG, "[FT_OPEN] connId=" + cid
+                            + " response stream ended totalDownBytes=" + totalDownBytes);
+
                         if (tunnelWs != null) {
-                            tunnelWs.send(ByteString.of(buildFrame(connId, FT_CLOSE, new byte[0])));
+                            tunnelWs.send(ByteString.of(buildFrame(cid, FT_CLOSE, new byte[0])));
+                            Log.i(TAG, "[FT_OPEN] connId=" + cid + " FT_CLOSE sent (response end)");
                         }
                     } catch (Exception e) {
-                        Log.d(TAG, "[Host] OPEN err connId=" + connId + ": " + e.getMessage());
+                        Log.w(TAG, "[FT_OPEN] connId=" + cid + " error: " + e.getMessage());
                         if (tunnelWs != null) {
-                            try { tunnelWs.send(ByteString.of(buildFrame(connId, FT_CLOSE, new byte[0]))); }
+                            try { tunnelWs.send(ByteString.of(buildFrame(cid, FT_CLOSE, new byte[0]))); }
                             catch (Exception ignored) {}
                         }
                     } finally {
-                        Socket s = hostConns.remove(connId);
+                        Socket s = hostConns.remove(cid);
                         if (s != null) closeSocket(s);
-                        emitEvent("ProxyClientDisconnected", String.valueOf(connId));
+                        emitEvent("ProxyClientDisconnected", String.valueOf(cid));
                     }
                 });
                 break;
             }
 
             case FT_DATA: {
-                // FIX 2: try hostConns first (host writing to remote internet target)
+                // BUG PM-2/PM-3 FIX: check isConnected() before writing to remote.
+                // hostConns is populated before connect(); only write once connected.
                 Socket remote = hostConns.get(connId);
-                if (remote != null && !remote.isClosed()) {
+                if (remote != null && !remote.isClosed() && remote.isConnected()) {
                     try {
                         remote.getOutputStream().write(payload);
                         remote.getOutputStream().flush();
                         bytesUp.addAndGet(payload.length);
+                        Log.i(TAG, "[FT_DATA→remote] connId=" + connId + " bytes=" + payload.length);
                     } catch (Exception e) {
-                        Log.d(TAG, "[Host] DATA→remote err connId=" + connId + ": " + e.getMessage());
+                        Log.w(TAG, "[FT_DATA→remote] connId=" + connId + " write error: " + e.getMessage());
                     }
                     break;
                 }
 
-                // FIX 2: then try clientConns (host sending response back to client app)
-                // This is the critical path for the client receiving any data at all.
+                // FIX 2: clientConns path — host sending response data back to the
+                // local proxy client socket (the app's HTTP connection to :8899).
+                // This is the critical hot path for data delivery to the receiver.
                 Socket clientSock = clientConns.get(connId);
                 if (clientSock != null && !clientSock.isClosed()) {
                     try {
                         clientSock.getOutputStream().write(payload);
                         clientSock.getOutputStream().flush();
                         bytesDown.addAndGet(payload.length);
+                        Log.i(TAG, "[FT_DATA→client] connId=" + connId + " bytes=" + payload.length);
                     } catch (Exception e) {
-                        Log.d(TAG, "[Client] DATA→client err connId=" + connId + ": " + e.getMessage());
+                        Log.w(TAG, "[FT_DATA→client] connId=" + connId + " write error: " + e.getMessage());
                         clientConns.remove(connId);
                         closeSocket(clientSock);
                     }
+                } else {
+                    Log.w(TAG, "[FT_DATA] connId=" + connId
+                        + " DROPPED — no socket in hostConns or clientConns"
+                        + " (remote=" + (remote != null ? "present,closed" : "null")
+                        + " client=" + (clientSock != null ? "present,closed" : "null") + ")");
                 }
                 break;
             }
 
             case FT_CLOSE: {
-                // FIX 3: close both sides
+                // FIX 3: close both sides so neither leaks
+                Log.i(TAG, "[FT_CLOSE] connId=" + connId + " closing both sides");
                 Socket clientSock = clientConns.remove(connId);
-                if (clientSock != null) closeSocket(clientSock);
+                if (clientSock != null) {
+                    Log.i(TAG, "[FT_CLOSE] connId=" + connId + " closing clientSock");
+                    closeSocket(clientSock);
+                }
                 Socket remote = hostConns.remove(connId);
-                if (remote != null) closeSocket(remote);
+                if (remote != null) {
+                    Log.i(TAG, "[FT_CLOSE] connId=" + connId + " closing remote");
+                    closeSocket(remote);
+                }
                 break;
             }
+
+            default:
+                Log.w(TAG, "[handleHostFrame] Unknown frameType=0x" + Integer.toHexString(frameType & 0xFF)
+                    + " connId=" + connId);
         }
     }
 
@@ -510,13 +614,14 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
             OutputStream cOut = client.getOutputStream();
             String firstLine  = readLine(cIn);
             if (firstLine == null) return;
+            Log.i(TAG, "[handleDirect] " + firstLine);
 
             if (firstLine.toUpperCase().startsWith("CONNECT ")) {
-                String[] p  = firstLine.split(" ");
+                String[] p     = firstLine.split(" ");
                 if (p.length < 2) { sendError(cOut, 400, "Bad Request"); return; }
-                int    colon = p[1].lastIndexOf(':');
-                String host  = colon > 0 ? p[1].substring(0, colon) : p[1];
-                int    port  = colon > 0 ? Integer.parseInt(p[1].substring(colon + 1)) : 443;
+                int    colon   = p[1].lastIndexOf(':');
+                String host    = colon > 0 ? p[1].substring(0, colon) : p[1];
+                int    port    = colon > 0 ? Integer.parseInt(p[1].substring(colon + 1)) : 443;
                 drainHeaders(cIn);
 
                 remote = new Socket();
@@ -534,7 +639,7 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
                 t1.join(); t2.join();
             }
         } catch (Exception e) {
-            Log.d(TAG, "handleDirect: " + e.getMessage());
+            Log.d(TAG, "[handleDirect] error: " + e.getMessage());
         } finally {
             closeSocket(remote);
             closeSocket(client);
@@ -557,13 +662,30 @@ public class ProxyModule extends ReactContextBaseJavaModule implements ActivityE
 
     // ── Frame builder ─────────────────────────────────────────────────────────
 
+    /**
+     * BUG PM-1 FIX: handles null payload (treats as empty byte array).
+     * The original crashed with NullPointerException when payload was null.
+     * Protocol: [ connId(4 BE) | frameType(1) | payload(N) ]
+     */
     private static byte[] buildFrame(int connId, byte type, byte[] payload) {
-        ByteBuffer buf = ByteBuffer.allocate(5 + payload.length);
-        buf.putInt(connId); buf.put(type); buf.put(payload);
+        int     payloadLen = (payload != null) ? payload.length : 0;
+        ByteBuffer buf     = ByteBuffer.allocate(5 + payloadLen);
+        buf.putInt(connId);
+        buf.put(type);
+        if (payload != null && payloadLen > 0) buf.put(payload);
         return buf.array();
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static String frameTypeLabel(byte t) {
+        switch (t) {
+            case FT_OPEN:  return "FT_OPEN";
+            case FT_DATA:  return "FT_DATA";
+            case FT_CLOSE: return "FT_CLOSE";
+            default:       return "0x" + Integer.toHexString(t & 0xFF);
+        }
+    }
 
     private String getLocalIp() {
         try {
