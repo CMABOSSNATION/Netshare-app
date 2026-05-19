@@ -8,9 +8,9 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- FIX: Required on Android 14+ for VPN foreground services -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-
-    <!-- VPN permission — required for NetShareVpnService -->
     <uses-permission android:name="android.permission.BIND_VPN_SERVICE" />
 
     <application
@@ -35,14 +35,26 @@
             </intent-filter>
         </activity>
 
+        <!-- NetShare Proxy Service (host side) -->
+        <service
+            android:name=".ProxyService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- NetShare VPN Service — captures all device traffic on client side -->
+        <!-- FIX: foregroundServiceType="specialUse" required on Android 14+ -->
         <service
             android:name=".NetShareVpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"
-            android:exported="false">
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>
+            <!-- FIX: required metadata for specialUse foreground service type -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="VPN tunnel for NetShare internet sharing" />
         </service>
 
     </application>
