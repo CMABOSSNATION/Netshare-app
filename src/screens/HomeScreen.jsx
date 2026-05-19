@@ -1,395 +1,410 @@
 /**
- * HomeScreen.jsx — NetShare Global Tunnel Mode (Remote Only)
+ * HomeScreen.jsx — NetShare
  *
- * HOST flow:
- *   1. Tap "Share My Internet"
- *   2. App starts proxy on :8899, opens WS tunnel to Cloudflare, gets a code
- *   3. Show session code — clients anywhere in the world can connect
+ * Updated to use per-app VPN services (TikTok.js, WhatsApp.js, etc.)
+ * instead of the old VpnService.js / TikTokOptimizer / WhatsAppOptimizer.
  *
- * CLIENT flow:
- *   1. Tap "Connect to Host"
- *   2. Enter 4-char session code
- *   3. App activates VPN → ALL traffic (WiFi + mobile data) routes via host
- *   4. No manual setup needed — it just works
- *
- * LAN / same-WiFi mode has been removed entirely.
- * Manual proxy setup guide has been removed entirely.
+ * The selected app service is chosen by the user via the app selector tabs.
+ * All services share the same interface (startAsHost, startAsClient, stop, on).
  */
 
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
-  View, Text, TouchableOpacity, TextInput, StyleSheet,
-  ScrollView, ActivityIndicator, Alert,
-  StatusBar, SafeAreaView, Clipboard,
+  View,
+  Text,
+  TouchableOpacity,
+  TextInput,
+  StyleSheet,
+  ScrollView,
+  ActivityIndicator,
+  Alert,
+  Platform,
+  StatusBar,
+  SafeAreaView,
 } from 'react-native';
 import { useStore } from '../store';
-import proxyService from '../services/ProxyService';
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── VPN service (handles all apps via per-package tunneling in Java) ────────
+import vpnService from '../services/TikTok';
 
-function formatBytes(b) {
-  if (!b || b < 1024)      return `${b || 0} B`;
-  if (b < 1048576)         return `${(b / 1024).toFixed(1)} KB`;
-  if (b < 1073741824)      return `${(b / 1048576).toFixed(1)} MB`;
-  return `${(b / 1073741824).toFixed(2)} GB`;
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+function formatBytes(bytes) {
+  if (!bytes || bytes < 1024)    return `${bytes || 0} B`;
+  if (bytes < 1048576)           return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1073741824)        return `${(bytes / 1048576).toFixed(1)} MB`;
+  return `${(bytes / 1073741824).toFixed(2)} GB`;
 }
 
 function formatDuration(ms) {
   if (!ms || ms < 0) return '0s';
-  const s   = Math.floor(ms / 1000);
-  const h   = Math.floor(s / 3600);
-  const m   = Math.floor((s % 3600) / 60);
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
   if (h > 0) return `${h}h ${m}m ${sec}s`;
   if (m > 0) return `${m}m ${sec}s`;
   return `${sec}s`;
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+// ─── Component ──────────────────────────────────────────────────────────────
 
 export default function HomeScreen() {
   const {
     role, status, sessionCode, connectedClients,
-    errorMessage, bytesUp, bytesDown,
-    setRole, setConnecting, setConnected, setError, setIdle,
-    tickBandwidth, addClient, removeClient, getSessionDurationMs,
+    errorMessage, bytesUp, bytesDown, networkType,
+    setRole, setNetworkType, setConnecting, setConnected,
+    setError, setIdle, addClient, removeClient,
+    getSessionDurationMs,
   } = useStore();
 
-  const [codeInput,   setCodeInput]   = useState('');
-  const [proxyInfo,   setProxyInfo]   = useState(null);
-  const [copied,      setCopied]      = useState(false);
-  const [tunnelReady, setTunnelReady] = useState(false);
-  const [vpnStatus,   setVpnStatus]   = useState('idle'); // 'idle'|'active'|'denied'|'error'|'revoked'
+  const [accessCodeInput, setAccessCodeInput] = useState('');
+  const [eventLog,        setEventLog]        = useState([]);
+  const [sessionTimer,    setSessionTimer]    = useState('0s');
+  const timerRef     = useRef(null);
+  const bandwidthRef = useRef(null);
+  const unsubsRef    = useRef([]);   // holds all active event unsub functions
 
-  const timerRef = useRef(null);
-  const unsubs   = useRef([]);
+  // ── Event log helper ────────────────────────────────────────────────
+  const log = useCallback((msg) => {
+    const ts = new Date().toLocaleTimeString();
+    setEventLog(prev => [`[${ts}] ${msg}`, ...prev].slice(0, 50));
+  }, []);
 
-  // ── Service event wiring ────────────────────────────────────────────────────
+  // ── Clear timers ────────────────────────────────────────────────────
+  const clearTimers = useCallback(() => {
+    clearInterval(timerRef.current);
+    clearInterval(bandwidthRef.current);
+    timerRef.current     = null;
+    bandwidthRef.current = null;
+  }, []);
 
-  useEffect(() => {
-    const u1 = proxyService.on('status', ({ status: s, message }) => {
-      if (s === 'connecting') setConnecting();
-      else if (s === 'connected') setConnected(proxyService.getSessionCode());
-      else if (s === 'error')    setError(message || 'Unknown error');
-      else if (s === 'idle')     setIdle();
-    });
+  // ── Start session timers ────────────────────────────────────────────
+  const startTimers = useCallback(() => {
+    clearTimers();
+    timerRef.current = setInterval(() => {
+      const ms = useStore.getState().getSessionDurationMs();
+      setSessionTimer(formatDuration(ms));
+    }, 1000);
+    bandwidthRef.current = setInterval(() => {
+      useStore.getState().tickBandwidth();
+    }, 1500);
+  }, [clearTimers]);
 
-    const u2 = proxyService.on('session', ({ code, ip, port }) => {
+  // ── Unsubscribe all listeners ────────────────────────────────────────
+  const clearListeners = useCallback(() => {
+    unsubsRef.current.forEach(fn => { try { fn?.(); } catch {} });
+    unsubsRef.current = [];
+  }, []);
+
+  // ── Attach listeners to the currently selected service ───────────────
+  const attachListeners = useCallback((svc) => {
+    clearListeners();
+    const unsubs = [];
+
+    unsubs.push(svc.on('vpnConnected', (data) => {
+      log(`VPN tunnel up (${data || 'ok'})`);
+    }));
+
+    unsubs.push(svc.on('sessionCreated', (code) => {
+      log(`Session ready: ${code}`);
       setConnected(code);
-      setProxyInfo({ ip, port });
-    });
+      startTimers();
+    }));
 
-    const u3 = proxyService.on('proxy', ({ ip, port }) => {
-      setProxyInfo({ ip, port });
-    });
+    unsubs.push(svc.on('joinSuccess', (code) => {
+      log(`Joined session: ${code}`);
+      setConnected(code);
+      startTimers();
+    }));
 
-    const u4 = proxyService.on('stats', ({ bytesUp: up, bytesDown: down }) => {
-      tickBandwidth({ up, down });
-    });
+    unsubs.push(svc.on('joinError', (reason) => {
+      log(`Join failed: ${reason}`);
+      clearTimers();
+      setError(reason || 'Invalid access code');
+      setTimeout(() => {
+        if (useStore.getState().status === 'error') setIdle();
+      }, 3000);
+    }));
 
-    const u5 = proxyService.on('tunnel', ({ status: ts }) => {
-      if (ts === 'ready')        setTunnelReady(true);
-      if (ts === 'disconnected') setTunnelReady(false);
-    });
+    unsubs.push(svc.on('vpnError', (msg) => {
+      log(`Error: ${msg}`);
+      clearTimers();
+      setError(msg || 'Connection failed');
+      setTimeout(() => {
+        if (useStore.getState().status === 'error') setIdle();
+      }, 4000);
+    }));
 
-    const u6 = proxyService.on('client', ({ event }) => {
-      if (event === 'connected')    addClient();
-      if (event === 'disconnected') removeClient();
-    });
+    unsubs.push(svc.on('vpnDisconnected', (reason) => {
+      log(`Disconnected: ${reason || 'connection closed'} — reconnecting...`);
+      clearTimers();
+      setConnecting();
+    }));
 
-    const u7 = proxyService.on('vpn', ({ status: vs }) => {
-      setVpnStatus(vs);
-      if (vs === 'denied') {
-        Alert.alert(
-          'VPN Permission Denied',
-          'Without VPN, your mobile data is NOT blocked. Other apps can still use your own data in the background.\n\nReconnect and allow VPN for full protection.',
-          [{ text: 'OK' }]
-        );
-      }
-      if (vs === 'revoked') {
-        Alert.alert(
-          'VPN Disconnected',
-          'The VPN was turned off. Your own data can now be used by background apps.',
-          [{ text: 'OK' }]
-        );
-      }
-    });
+    unsubs.push(svc.on('reconnectFailed', (msg) => {
+      log(`Reconnect failed: ${msg}`);
+      clearTimers();
+      setError(msg || 'Connection lost');
+      setTimeout(() => {
+        if (useStore.getState().status === 'error') setIdle();
+      }, 4000);
+    }));
 
-    unsubs.current = [u1, u2, u3, u4, u5, u6, u7];
-    return () => unsubs.current.forEach(u => u());
-  }, []);
+    unsubs.push(svc.on('clientConnected', (clientId) => {
+      log(`Client joined: ${clientId || 'unknown'}`);
+      addClient();
+    }));
 
-  // ── Duration ticker ─────────────────────────────────────────────────────────
+    unsubs.push(svc.on('clientDisconnected', () => {
+      log('Client left');
+      removeClient();
+    }));
 
+    unsubs.push(svc.on('hostLeft', (msg) => {
+      log(`Host ended session: ${msg}`);
+      clearTimers();
+      Alert.alert('Session Ended', 'The host ended the sharing session.', [
+        { text: 'OK', onPress: () => setIdle() },
+      ]);
+    }));
+
+    unsubsRef.current = unsubs;
+  }, [clearListeners, clearTimers, startTimers, log, setConnected, setConnecting, setError, setIdle, addClient, removeClient]);
+
+  // ── Attach listeners whenever selected app changes ───────────────────
   useEffect(() => {
-    if (status === 'connected') {
-      timerRef.current = setInterval(() => {}, 1000);
-    } else {
-      clearInterval(timerRef.current);
-    }
-    return () => clearInterval(timerRef.current);
-  }, [status]);
+    attachListeners(vpnService);
+    return () => clearListeners();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Actions ─────────────────────────────────────────────────────────────────
+  // ── Cleanup on unmount ───────────────────────────────────────────────
+  useEffect(() => {
+    return () => {
+      clearListeners();
+      clearTimers();
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const handleHostStart = useCallback(async () => {
-    setRole('host');
+  // ── Disconnect ──────────────────────────────────────────────────────
+  const handleDisconnect = useCallback(async () => {
+    log('Disconnecting...');
+    clearTimers();
     try {
-      await proxyService.startAsHost({ tunnelMode: true });
-    } catch (err) {
-      Alert.alert('Error', err.message);
+      await vpnService.stop();
+    } catch (e) {
+      log(`Stop error: ${e?.message}`);
     }
-  }, []);
+    setIdle();
+    log('Disconnected.');
+  }, [log, clearTimers, setIdle, vpnService]);
 
-  const handleClientConnect = useCallback(async () => {
-    const code = codeInput.trim().toUpperCase();
-    if (code.length < 4) {
-      Alert.alert('Enter session code', 'Ask the host for their 4-character code.');
+  // ── Start HOST ──────────────────────────────────────────────────────
+  const handleStartHost = async () => {
+    try {
+      setRole('host');
+      setConnecting();
+      log(`Starting host on ${networkType}...`);
+      await vpnService.startAsHost(networkType);
+    } catch (e) {
+      log(`Host start failed: ${e.message}`);
+      setError(e.message);
+      setTimeout(() => {
+        if (useStore.getState().status === 'error') setIdle();
+      }, 4000);
+    }
+  };
+
+  // ── Start CLIENT ────────────────────────────────────────────────────
+  const handleStartClient = async () => {
+    const code = accessCodeInput.trim().toUpperCase();
+    if (!code || code.replace('-', '').length < 8) {
+      Alert.alert('Invalid Code', 'Enter a valid 8-character access code (XXXX-XXXX).');
       return;
     }
-    setRole('client');
     try {
-      const info = await proxyService.startAsClient(code);
-      setProxyInfo(info);
-    } catch (err) {
-      Alert.alert('Connection failed', err.message);
+      setRole('client');
+      setConnecting();
+      log(`Joining with code ${code}...`);
+      await vpnService.startAsClient(code);
+    } catch (e) {
+      log(`Join failed: ${e.message}`);
+      setError(e.message);
+      setTimeout(() => {
+        if (useStore.getState().status === 'error') setIdle();
+      }, 4000);
     }
-  }, [codeInput]);
+  };
 
-  const handleStop = useCallback(async () => {
-    await proxyService.stop();
-    setProxyInfo(null);
-    setTunnelReady(false);
-    setVpnStatus('idle');
-    setCodeInput('');
-  }, []);
+  // ─── Render ──────────────────────────────────────────────────────────
 
-  const copyCode = useCallback(() => {
-    const code = proxyService.getSessionCode();
-    if (code) {
-      Clipboard.setString(code);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
-  }, []);
-
-  // ── Derived state ───────────────────────────────────────────────────────────
-
-  const isConnected  = status === 'connected';
+  const isIdle       = status === 'idle';
   const isConnecting = status === 'connecting';
-  const isHost       = role === 'host';
-  const isClient     = role === 'client';
-  const hostCode     = proxyService.getSessionCode();
-  const vpnBlocking  = vpnStatus === 'active';
-
-  // ── VPN status banner ───────────────────────────────────────────────────────
-
-  function renderVpnBanner() {
-    if (vpnStatus === 'idle') return null;
-    const configs = {
-      active:  { bg: '#14532d', text: '🔒 VPN active — all traffic via host' },
-      denied:  { bg: '#78350f', text: '⚠️ VPN denied — your data is NOT fully blocked' },
-      error:   { bg: '#7f1d1d', text: '⚠️ VPN error — your data may still be used' },
-      revoked: { bg: '#7f1d1d', text: '⚠️ VPN off — reconnect for full protection' },
-    };
-    const cfg = configs[vpnStatus] || configs.error;
-    return (
-      <View style={[s.vpnBanner, { backgroundColor: cfg.bg }]}>
-        <Text style={s.vpnBannerText}>{cfg.text}</Text>
-      </View>
-    );
-  }
-
-  // ── Main render ─────────────────────────────────────────────────────────────
+  const isConnected  = status === 'connected';
+  const isError      = status === 'error';
+  const isActive     = isConnecting || isConnected;
 
   return (
-    <SafeAreaView style={s.safe}>
-      <StatusBar barStyle="light-content" backgroundColor="#0f172a" />
+    <SafeAreaView style={s.safeArea}>
+      <StatusBar barStyle="light-content" backgroundColor="#0a0e1a" />
       <ScrollView contentContainerStyle={s.scroll} keyboardShouldPersistTaps="handled">
 
-        {/* Header */}
+        {/* ── Header ── */}
         <View style={s.header}>
-          <Text style={s.headerTitle}>NetShare</Text>
-          <Text style={s.headerSub}>🌐 Global Tunnel Mode</Text>
+          <Text style={s.title}>NETSHARE</Text>
+          <Text style={s.subtitle}>PREMIUM NETWORK SHARING</Text>
+          <View style={s.badge}>
+            <Text style={s.badgeText}>BUSINESS EDITION · v2.0</Text>
+          </View>
         </View>
 
-        {/* Status badge */}
-        {status !== 'idle' && (
-          <View style={[s.badge,
-            isConnecting && s.badgeConnecting,
-            isConnected  && s.badgeConnected,
-            status === 'error' && s.badgeError,
-          ]}>
-            {isConnecting && (
-              <ActivityIndicator color="#fff" size="small" style={{ marginRight: 8 }} />
-            )}
-            <Text style={s.badgeText}>
-              {isConnecting ? 'Connecting…'
-              : isConnected  ? (isHost ? '🟢 Sharing internet' : '🟢 Connected to host')
-              : `⚠ ${errorMessage || 'Error'}`}
-            </Text>
+        {/* ── Role tabs ── */}
+        <View style={s.tabs}>
+          <TouchableOpacity
+            style={[s.tab, role !== 'client' && s.tabActive]}
+            onPress={() => { if (!isActive) { setRole('host'); setIdle(); } }}
+            disabled={isActive}>
+            <Text style={[s.tabTitle, role !== 'client' && s.tabTitleActive]}>HOST</Text>
+            <Text style={[s.tabSub,   role !== 'client' && s.tabSubActive]}>Share &amp; Earn</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[s.tab, role === 'client' && s.tabActive]}
+            onPress={() => { if (!isActive) { setRole('client'); setIdle(); } }}
+            disabled={isActive}>
+            <Text style={[s.tabTitle, role === 'client' && s.tabTitleActive]}>CLIENT</Text>
+            <Text style={[s.tabSub,   role === 'client' && s.tabSubActive]}>Access Network</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* ── Network type selector (HOST only) ── */}
+        {role !== 'client' && (
+          <View style={s.netRow}>
+            {['WiFi', '4G LTE', '5G'].map((t) => (
+              <TouchableOpacity
+                key={t}
+                style={[s.netBtn, networkType === t && s.netBtnActive]}
+                onPress={() => { if (!isActive) setNetworkType(t); }}
+                disabled={isActive}>
+                <Text style={[s.netBtnText, networkType === t && s.netBtnTextActive]}>{t}</Text>
+              </TouchableOpacity>
+            ))}
           </View>
         )}
 
-        {/* ── Idle screen ── */}
-        {status === 'idle' && (
-          <>
-            {/* Host card */}
-            <TouchableOpacity style={s.roleCard} onPress={handleHostStart}>
-              <Text style={s.roleIcon}>📡</Text>
-              <View style={s.roleText}>
-                <Text style={s.roleTitle}>Share My Internet</Text>
-                <Text style={s.roleDesc}>
-                  Start a global tunnel. Anyone anywhere can use your internet with your session code.
-                </Text>
-              </View>
-            </TouchableOpacity>
+        {/* ── Status card ── */}
+        <View style={s.card}>
 
-            <View style={s.divider}><Text style={s.dividerText}>or</Text></View>
-
-            {/* Client box */}
-            <View style={s.clientBox}>
-              <Text style={s.sectionLabel}>Connect to a host</Text>
-              <TextInput
-                style={s.codeInput}
-                placeholder="Enter session code (e.g. HQRQ)"
-                placeholderTextColor="#64748b"
-                value={codeInput}
-                onChangeText={t => setCodeInput(t.toUpperCase())}
-                autoCapitalize="characters"
-                maxLength={8}
-              />
-              <TouchableOpacity style={s.connectBtn} onPress={handleClientConnect}>
-                <Text style={s.connectBtnText}>Connect</Text>
-              </TouchableOpacity>
-              <Text style={s.vpnNote}>
-                🔒 VPN activates automatically — all apps use host's internet, your data is blocked
-              </Text>
-            </View>
-          </>
-        )}
-
-        {/* ── Connecting screen ── */}
-        {isConnecting && (
-          <View style={s.center}>
-            <ActivityIndicator size="large" color="#38bdf8" />
-            <Text style={s.centerText}>
-              {isHost ? 'Starting tunnel…' : 'Connecting & activating VPN…'}
+          {/* Status row */}
+          <View style={s.statusRow}>
+            <View style={[
+              s.dot,
+              isConnected  && s.dotGreen,
+              isConnecting && s.dotYellow,
+              isError      && s.dotRed,
+              isIdle       && s.dotGrey,
+            ]} />
+            <Text style={s.statusText}>
+              {isIdle       ? 'IDLE'
+             : isConnecting ? 'CONNECTING...'
+             : isConnected  ? 'CONNECTED'
+             :                'ERROR'}
             </Text>
+          </View>
+
+          {/* Error message */}
+          {isError && !!errorMessage && (
+            <Text style={s.errorMsg}>{errorMessage}</Text>
+          )}
+
+          {/* Stats (connected) */}
+          {isConnected && (
+            <View style={s.statsRow}>
+              <View style={s.statItem}>
+                <Text style={s.statLabel}>⏱ Duration</Text>
+                <Text style={s.statValue}>{sessionTimer}</Text>
+              </View>
+              <View style={s.statItem}>
+                <Text style={s.statLabel}>↑ Upload</Text>
+                <Text style={s.statValue}>{formatBytes(bytesUp)}</Text>
+              </View>
+              <View style={s.statItem}>
+                <Text style={s.statLabel}>↓ Download</Text>
+                <Text style={s.statValue}>{formatBytes(bytesDown)}</Text>
+              </View>
+              {role !== 'client' && (
+                <View style={s.statItem}>
+                  <Text style={s.statLabel}>👥 Clients</Text>
+                  <Text style={s.statValue}>{connectedClients}</Text>
+                </View>
+              )}
+            </View>
+          )}
+
+          {/* Client: access code input */}
+          {role === 'client' && (isIdle || isError) && (
+            <TextInput
+              style={s.input}
+              placeholder="Enter access code (XXXX-XXXX)"
+              placeholderTextColor="#4a5568"
+              value={accessCodeInput}
+              onChangeText={setAccessCodeInput}
+              autoCapitalize="characters"
+              maxLength={9}
+            />
+          )}
+
+          {/* CONNECT button */}
+          {(isIdle || isError) && (
+            <TouchableOpacity
+              style={[s.btnConnect, isError && s.btnConnectDisabled]}
+              onPress={role === 'client' ? handleStartClient : handleStartHost}
+              disabled={isError}>
+              <Text style={s.btnConnectText}>
+                {role === 'client' ? 'JOIN NETWORK' : 'START HOSTING'}
+              </Text>
+            </TouchableOpacity>
+          )}
+
+          {/* CONNECTING spinner + cancel */}
+          {isConnecting && (
+            <View style={s.connectingBox}>
+              <ActivityIndicator color="#00e5ff" size="large" />
+              <Text style={s.connectingLabel}>CONNECTING...</Text>
+              <TouchableOpacity style={s.btnDisconnect} onPress={handleDisconnect}>
+                <Text style={s.btnDisconnectText}>CANCEL</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {/* DISCONNECT button */}
+          {isConnected && (
+            <TouchableOpacity style={s.btnDisconnect} onPress={handleDisconnect}>
+              <Text style={s.btnDisconnectText}>
+                {role === 'client' ? 'DISCONNECT' : 'STOP HOSTING'}
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
+
+        {/* ── Host info (host idle) ── */}
+        {role !== 'client' && isIdle && (
+          <View style={s.infoCard}>
+            <Text style={s.infoTitle}>HOST &amp; EARN</Text>
+            <Text style={s.infoItem}>• Share your WiFi / mobile data connection</Text>
+            <Text style={s.infoItem}>• Earn 50% of platform revenue from your uptime</Text>
+            <Text style={s.infoItem}>• Paid weekly by the platform owner</Text>
+            <Text style={s.infoItem}>• Clients auto-failover if your connection drops</Text>
           </View>
         )}
 
-        {/* ── Connected: HOST ── */}
-        {isConnected && isHost && (
-          <>
-            {/* Session code */}
-            <View style={s.codeBox}>
-              <Text style={s.codeLabel}>Session Code</Text>
-              <TouchableOpacity onPress={copyCode}>
-                <Text style={s.code}>{hostCode}</Text>
-                <Text style={s.codeSub}>{copied ? '✓ Copied!' : 'Tap to copy'}</Text>
-              </TouchableOpacity>
-            </View>
-
-            {/* Tunnel status */}
-            <View style={[s.tunnelStatus, tunnelReady ? s.tunnelOk : s.tunnelWaiting]}>
-              <Text style={s.tunnelStatusText}>
-                {tunnelReady
-                  ? '🟢 Cloudflare tunnel active — global range'
-                  : '⏳ Opening tunnel to Cloudflare…'}
-              </Text>
-            </View>
-
-            {/* Tunnel proxy info */}
-            {proxyInfo && (
-              <View style={s.infoBox}>
-                <Text style={s.infoLabel}>Tunnel Proxy</Text>
-                <Text style={s.infoValue}>
-                  Via Cloudflare DO →{'\n'}{proxyInfo.ip}:{proxyInfo.port}
-                </Text>
-                <Text style={s.infoDesc}>
-                  Clients anywhere can connect using the session code above. Traffic is relayed through Cloudflare.
-                </Text>
-              </View>
-            )}
-
-            {/* Stats */}
-            <View style={s.statsRow}>
-              <View style={s.stat}>
-                <Text style={s.statVal}>{formatBytes(bytesUp)}</Text>
-                <Text style={s.statLabel}>↑ Served</Text>
-              </View>
-              <View style={s.stat}>
-                <Text style={s.statVal}>{formatDuration(getSessionDurationMs())}</Text>
-                <Text style={s.statLabel}>Duration</Text>
-              </View>
-              <View style={s.stat}>
-                <Text style={s.statVal}>{connectedClients}</Text>
-                <Text style={s.statLabel}>Clients</Text>
-              </View>
-            </View>
-
-            <Text style={s.compatNote}>
-              ✅ Works with TikTok · WhatsApp · Facebook · Instagram ·
-              Spotify · YouTube · Google · Twitter
-            </Text>
-
-            <TouchableOpacity style={s.stopBtn} onPress={handleStop}>
-              <Text style={s.stopBtnText}>Stop Sharing</Text>
-            </TouchableOpacity>
-          </>
-        )}
-
-        {/* ── Connected: CLIENT ── */}
-        {isConnected && isClient && (
-          <>
-            {/* VPN banner — most important info for client */}
-            {renderVpnBanner()}
-
-            {/* Connection confirmed */}
-            <View style={s.connectedBox}>
-              <Text style={s.connectedTitle}>
-                {tunnelReady ? '🟢 Connected to host' : '⏳ Waiting for host tunnel…'}
-              </Text>
-              <Text style={s.connectedDesc}>
-                {vpnBlocking
-                  ? 'All your apps are now using the host\'s internet. Your own mobile data is blocked.'
-                  : 'Connected via tunnel. Enable VPN for full data blocking.'}
-              </Text>
-            </View>
-
-            {/* Tunnel status */}
-            <View style={[s.tunnelStatus, tunnelReady ? s.tunnelOk : s.tunnelWaiting]}>
-              <Text style={s.tunnelStatusText}>
-                {tunnelReady ? '🟢 Tunnel connected to host' : '⏳ Waiting for tunnel…'}
-              </Text>
-            </View>
-
-            {/* Stats */}
-            <View style={s.statsRow}>
-              <View style={s.stat}>
-                <Text style={s.statVal}>{formatBytes(bytesDown)}</Text>
-                <Text style={s.statLabel}>↓ Received</Text>
-              </View>
-              <View style={s.stat}>
-                <Text style={s.statVal}>{formatDuration(getSessionDurationMs())}</Text>
-                <Text style={s.statLabel}>Duration</Text>
-              </View>
-            </View>
-
-            <TouchableOpacity style={s.stopBtn} onPress={handleStop}>
-              <Text style={s.stopBtnText}>Disconnect</Text>
-            </TouchableOpacity>
-          </>
-        )}
-
-        {/* ── Error screen ── */}
-        {status === 'error' && (
-          <View style={s.center}>
-            <Text style={s.errorText}>{errorMessage}</Text>
-            <TouchableOpacity style={s.retryBtn} onPress={handleStop}>
-              <Text style={s.retryBtnText}>Try Again</Text>
-            </TouchableOpacity>
+        {/* ── Event log ── */}
+        {eventLog.length > 0 && (
+          <View style={s.logCard}>
+            <Text style={s.logTitle}>EVENT LOG</Text>
+            {eventLog.slice(0, 10).map((line, i) => (
+              <Text key={i} style={s.logLine}>{line}</Text>
+            ))}
           </View>
         )}
 
@@ -398,85 +413,88 @@ export default function HomeScreen() {
   );
 }
 
-// ── Styles ────────────────────────────────────────────────────────────────────
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
+const CYAN   = '#00e5ff';
+const GREEN  = '#00ff88';
+const RED    = '#ff4d6a';
+const YELLOW = '#ffd600';
+const BG     = '#0a0e1a';
+const CARD   = '#111827';
+const BORDER = '#1e2a3a';
 
 const s = StyleSheet.create({
-  safe:             { flex: 1, backgroundColor: '#0f172a' },
-  scroll:           { padding: 20, paddingBottom: 40 },
+  safeArea: { flex: 1, backgroundColor: BG },
+  scroll:   { padding: 16, paddingBottom: 40 },
 
-  header:           { alignItems: 'center', marginBottom: 28 },
-  headerTitle:      { fontSize: 32, fontWeight: '800', color: '#f1f5f9', letterSpacing: 1 },
-  headerSub:        { fontSize: 13, color: '#38bdf8', marginTop: 4 },
+  header:    { alignItems: 'center', marginBottom: 24, marginTop: 8 },
+  title:     { fontSize: 38, fontWeight: '900', color: CYAN, letterSpacing: 8 },
+  subtitle:  { color: '#4a6080', fontSize: 11, letterSpacing: 4, marginTop: 2 },
+  badge:     { borderWidth: 1, borderColor: '#2a3a5a', borderRadius: 4,
+               paddingHorizontal: 12, paddingVertical: 4, marginTop: 10 },
+  badgeText: { color: '#6080a0', fontSize: 11, letterSpacing: 2 },
 
-  badge:            { flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-                      borderRadius: 24, paddingVertical: 10, paddingHorizontal: 18, marginBottom: 20 },
-  badgeConnecting:  { backgroundColor: '#1e3a5f' },
-  badgeConnected:   { backgroundColor: '#14532d' },
-  badgeError:       { backgroundColor: '#7f1d1d' },
-  badgeText:        { color: '#f1f5f9', fontWeight: '600', fontSize: 14 },
 
-  sectionLabel:     { color: '#94a3b8', fontSize: 13, fontWeight: '600',
-                      textTransform: 'uppercase', letterSpacing: 1, marginBottom: 12 },
 
-  roleCard:         { flexDirection: 'row', backgroundColor: '#1e293b', borderRadius: 16,
-                      padding: 18, marginBottom: 12, alignItems: 'center' },
-  roleIcon:         { fontSize: 36, marginRight: 16 },
-  roleText:         { flex: 1 },
-  roleTitle:        { color: '#f1f5f9', fontSize: 17, fontWeight: '700', marginBottom: 4 },
-  roleDesc:         { color: '#64748b', fontSize: 13, lineHeight: 19 },
+  tabs:          { flexDirection: 'row', gap: 10, marginBottom: 12 },
+  tab:           { flex: 1, padding: 14, borderRadius: 10, borderWidth: 1,
+                   borderColor: BORDER, backgroundColor: CARD, alignItems: 'center' },
+  tabActive:     { borderColor: CYAN, backgroundColor: '#0d2030' },
+  tabTitle:      { color: '#4a6080', fontWeight: '700', fontSize: 15, letterSpacing: 2 },
+  tabTitleActive:{ color: CYAN },
+  tabSub:        { color: '#2a3a5a', fontSize: 11, marginTop: 2 },
+  tabSubActive:  { color: '#6090b0' },
 
-  divider:          { alignItems: 'center', marginVertical: 16 },
-  dividerText:      { color: '#334155', fontWeight: '600' },
+  netRow:           { flexDirection: 'row', gap: 8, marginBottom: 14 },
+  netBtn:           { flex: 1, paddingVertical: 10, borderRadius: 8, borderWidth: 1,
+                      borderColor: BORDER, backgroundColor: CARD, alignItems: 'center' },
+  netBtnActive:     { borderColor: GREEN, backgroundColor: '#0d2318' },
+  netBtnText:       { color: '#4a6080', fontWeight: '600', fontSize: 13 },
+  netBtnTextActive: { color: GREEN },
 
-  clientBox:        { backgroundColor: '#1e293b', borderRadius: 16, padding: 18, marginBottom: 12 },
-  codeInput:        { backgroundColor: '#0f172a', borderRadius: 10, padding: 14,
-                      color: '#f1f5f9', fontSize: 20, letterSpacing: 4, textAlign: 'center',
-                      marginBottom: 12, borderWidth: 1, borderColor: '#334155' },
-  connectBtn:       { backgroundColor: '#0ea5e9', borderRadius: 12, padding: 14, alignItems: 'center' },
-  connectBtnText:   { color: '#fff', fontWeight: '700', fontSize: 16 },
-  vpnNote:          { color: '#475569', fontSize: 11, textAlign: 'center', marginTop: 10 },
+  card:       { backgroundColor: CARD, borderRadius: 12, borderWidth: 1,
+                borderColor: BORDER, padding: 16, marginBottom: 14 },
+  statusRow:  { flexDirection: 'row', alignItems: 'center', marginBottom: 10 },
+  dot:        { width: 12, height: 12, borderRadius: 6, marginRight: 10 },
+  dotGreen:   { backgroundColor: GREEN },
+  dotYellow:  { backgroundColor: YELLOW },
+  dotRed:     { backgroundColor: RED },
+  dotGrey:    { backgroundColor: '#2a3a5a' },
+  statusText: { color: CYAN, fontWeight: '700', fontSize: 15, letterSpacing: 3 },
 
-  center:           { alignItems: 'center', paddingVertical: 30 },
-  centerText:       { color: '#94a3b8', marginTop: 12, fontSize: 15 },
-  errorText:        { color: '#fca5a5', textAlign: 'center', marginBottom: 16, fontSize: 14 },
-  retryBtn:         { backgroundColor: '#334155', borderRadius: 12, paddingVertical: 12, paddingHorizontal: 28 },
-  retryBtnText:     { color: '#f1f5f9', fontWeight: '700' },
+  errorMsg: { color: RED, fontSize: 13, marginBottom: 12, lineHeight: 18 },
 
-  codeBox:          { backgroundColor: '#1e293b', borderRadius: 16, padding: 20,
-                      alignItems: 'center', marginBottom: 16 },
-  codeLabel:        { color: '#64748b', fontSize: 12, fontWeight: '600',
-                      textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 },
-  code:             { fontSize: 44, fontWeight: '900', color: '#38bdf8', letterSpacing: 8 },
-  codeSub:          { color: '#475569', fontSize: 12, marginTop: 6 },
+  statsRow:  { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 14 },
+  statItem:  { flex: 1, minWidth: '45%', backgroundColor: '#0d1a2a', borderRadius: 8, padding: 10 },
+  statLabel: { color: '#4a6080', fontSize: 10, letterSpacing: 1, marginBottom: 3 },
+  statValue: { color: '#c0d8f0', fontSize: 15, fontWeight: '700' },
 
-  infoBox:          { backgroundColor: '#1e293b', borderRadius: 14, padding: 16, marginBottom: 16 },
-  infoLabel:        { color: '#64748b', fontSize: 12, fontWeight: '600',
-                      textTransform: 'uppercase', letterSpacing: 1, marginBottom: 4 },
-  infoValue:        { color: '#38bdf8', fontSize: 15, fontWeight: '700', fontFamily: 'monospace' },
-  infoDesc:         { color: '#64748b', fontSize: 12, marginTop: 8, lineHeight: 17 },
+  input: {
+    backgroundColor: '#0d1a2a', borderWidth: 1, borderColor: BORDER,
+    borderRadius: 8, color: '#c0d8f0', fontSize: 16,
+    paddingHorizontal: 14, paddingVertical: 12, marginBottom: 14,
+    letterSpacing: 2, textAlign: 'center',
+  },
 
-  statsRow:         { flexDirection: 'row', justifyContent: 'space-around',
-                      backgroundColor: '#1e293b', borderRadius: 14, padding: 16, marginBottom: 16 },
-  stat:             { alignItems: 'center' },
-  statVal:          { color: '#f1f5f9', fontSize: 20, fontWeight: '700' },
-  statLabel:        { color: '#64748b', fontSize: 11, marginTop: 2 },
+  btnConnect:         { backgroundColor: CYAN, borderRadius: 10, paddingVertical: 16, alignItems: 'center' },
+  btnConnectDisabled: { opacity: 0.4 },
+  btnConnectText:     { color: '#000', fontWeight: '900', fontSize: 15, letterSpacing: 3 },
 
-  compatNote:       { color: '#475569', fontSize: 12, textAlign: 'center',
-                      lineHeight: 18, marginBottom: 16 },
+  connectingBox:   { alignItems: 'center', paddingVertical: 8, gap: 10 },
+  connectingLabel: { color: YELLOW, fontWeight: '700', letterSpacing: 3, fontSize: 13 },
 
-  stopBtn:          { backgroundColor: '#7f1d1d', borderRadius: 14, padding: 16,
-                      alignItems: 'center', marginTop: 8 },
-  stopBtnText:      { color: '#fca5a5', fontWeight: '700', fontSize: 16 },
+  btnDisconnect:     { borderWidth: 1, borderColor: RED, borderRadius: 10,
+                       paddingVertical: 14, alignItems: 'center', marginTop: 4 },
+  btnDisconnectText: { color: RED, fontWeight: '700', fontSize: 14, letterSpacing: 2 },
 
-  tunnelStatus:     { borderRadius: 10, padding: 10, alignItems: 'center', marginBottom: 12 },
-  tunnelOk:         { backgroundColor: '#14532d' },
-  tunnelWaiting:    { backgroundColor: '#1e3a5f' },
-  tunnelStatusText: { color: '#f1f5f9', fontSize: 13, fontWeight: '600' },
+  infoCard:  { backgroundColor: CARD, borderRadius: 12, borderWidth: 1,
+               borderColor: BORDER, padding: 16, marginBottom: 14 },
+  infoTitle: { color: '#4a6080', fontSize: 10, letterSpacing: 3, marginBottom: 10 },
+  infoItem:  { color: '#6080a0', fontSize: 13, lineHeight: 22 },
 
-  vpnBanner:        { borderRadius: 10, padding: 12, alignItems: 'center', marginBottom: 14 },
-  vpnBannerText:    { color: '#f1f5f9', fontSize: 13, fontWeight: '600', textAlign: 'center' },
-
-  connectedBox:     { backgroundColor: '#1e293b', borderRadius: 14, padding: 18, marginBottom: 14 },
-  connectedTitle:   { color: '#f1f5f9', fontSize: 17, fontWeight: '700', marginBottom: 6 },
-  connectedDesc:    { color: '#64748b', fontSize: 13, lineHeight: 19 },
+  logCard:  { backgroundColor: CARD, borderRadius: 12, borderWidth: 1,
+              borderColor: BORDER, padding: 14 },
+  logTitle: { color: '#4a6080', fontSize: 10, letterSpacing: 3, marginBottom: 8 },
+  logLine:  { color: '#2a4060', fontSize: 11,
+              fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', lineHeight: 17 },
 });
