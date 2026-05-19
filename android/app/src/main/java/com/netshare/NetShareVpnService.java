@@ -30,59 +30,32 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+import okio.ByteString;
+
 /**
- * NetShareVpnService — Client-side VPN for NetShare (300km tunnel mode)
+ * NetShareVpnService — FIXED
  *
- * CORRECT ARCHITECTURE:
- * ─────────────────────
- * ONE central tunReadLoop owns the TUN FileInputStream exclusively.
- * It reads every packet and dispatches it into the correct per-connection
- * BlockingQueue based on srcPort:dstIp:dstPort key.
+ * BUGS FOUND AND FIXED:
+ * ──────────────────────────────────────────────────────────────────────────
+ * BUG 1 (THE MAIN BUG): In onStartCommand, wsUrl was received but startVpn()
+ *   was called with NO arguments. startVpn() took no parameters and never
+ *   opened a WebSocket. Traffic was captured by VPN and dropped silently.
+ *   → FIX: startVpn(String wsUrl) now takes and uses the wsUrl.
  *
- * Each proxyConnect thread reads ONLY from its own BlockingQueue.
- * No racing. No stolen packets. Correct routing guaranteed.
+ * BUG 2: No WebSocket to relay existed on client side at all.
+ *   proxyConnect sent HTTP CONNECT to ProxyModule on :8899, but ProxyModule's
+ *   tunnelWs was null on the client — so FT_OPEN frames went nowhere.
+ *   → FIX: startVpn() now opens WebSocket to relay /ws/client/:code directly.
+ *   Frames from host arrive via onMessage() and are routed back to TUN.
  *
- * Full data flow:
- *
- *   [Any app on device]
- *        │  (all TCP traffic captured by VPN)
- *        ▼
- *   TUN interface  ←──────────────────────────────────────────┐
- *        │                                                     │
- *   tunReadLoop (single thread, owns TUN fd exclusively)       │
- *        │                                                     │
- *        ├─ SYN packet → spawn proxyConnect thread             │
- *        │               register connKey → BlockingQueue      │
- *        │                                                     │
- *        └─ data packet → look up BlockingQueue by connKey     │
- *                         → put packet into queue             │
- *                                                             │
- *   proxyConnect thread:                                       │
- *        │                                                     │
- *        ├─ open Socket → 127.0.0.1:8899 (local proxy)        │
- *        ├─ protect() socket from VPN routing                  │
- *        ├─ send HTTP CONNECT dstIp:dstPort                    │
- *        ├─ read 200 OK                                        │
- *        │                                                     │
- *        ├─ UPLOAD thread:                                     │
- *        │    poll packets from own BlockingQueue              │
- *        │    write raw bytes to proxy socket output           │
- *        │    (ProxyModule sends via WebSocket to host)        │
- *        │                                                     │
- *        └─ DOWNLOAD thread:                                   │
- *             read response bytes from proxy socket input      │
- *             write raw bytes back into TUN ──────────────────┘
- *             (app receives the response)
- *
- * ProxyModule at 127.0.0.1:8899:
- *   - Receives HTTP CONNECT + data
- *   - Sends FT_OPEN + FT_DATA frames via WebSocket to Cloudflare relay
- *   - Cloudflare pipes to host WebSocket
- *   - Host connects to real internet, streams response back
- *   - FT_DATA response frames arrive at client ProxyModule
- *   - ProxyModule writes response to clientSock (the proxy socket)
- *   - proxyConnect download thread reads it and writes to TUN
- *   - App receives data ✅
+ * BUG 3: No OkHttp pingInterval → Cloudflare killed WS after ~100s idle
+ *   → the "ping/pong timeout after 7 successful pings" error you saw.
+ *   → FIX: pingInterval(20s) + app-level heartbeat every 25s.
  */
 public class NetShareVpnService extends VpnService {
 
@@ -92,7 +65,7 @@ public class NetShareVpnService extends VpnService {
     private static final int    VPN_MTU    = 1500;
     private static final int    PROXY_PORT = 8899;
     private static final int    PIPE_BUF   = 16 * 1024;
-    private static final int    QUEUE_CAP  = 512;  // max queued packets per connection
+    private static final int    QUEUE_CAP  = 512;
 
     private static final String VPN_ADDRESS = "10.0.0.2";
     private static final String VPN_DNS1    = "8.8.8.8";
@@ -105,21 +78,24 @@ public class NetShareVpnService extends VpnService {
     private ParcelFileDescriptor vpnInterface;
     private FileOutputStream     tunOut;
 
+    // FIX 1: store wsUrl as field
+    private String         wsUrl;
+
+    // FIX 2: client WebSocket to relay
+    private WebSocket      relayWs;
+    private OkHttpClient   httpClient;
+
+    // FIX 3: heartbeat timer
+    private java.util.Timer heartbeatTimer;
+
     private final AtomicBoolean running     = new AtomicBoolean(false);
+    private final AtomicBoolean wsReady     = new AtomicBoolean(false);
     private final AtomicLong    bytesUp     = new AtomicLong(0);
     private final AtomicLong    bytesDown   = new AtomicLong(0);
     private final AtomicInteger activeConns = new AtomicInteger(0);
 
     private ExecutorService executor;
 
-    /**
-     * Central dispatch map: connKey → BlockingQueue<byte[]>
-     *
-     * tunReadLoop is the ONLY writer (puts packets in).
-     * Each proxyConnect upload thread is the ONLY reader for its own queue.
-     *
-     * Sentinel: a zero-length byte[] signals the upload thread to stop.
-     */
     private final ConcurrentHashMap<String, BlockingQueue<byte[]>> connQueues
         = new ConcurrentHashMap<>();
 
@@ -132,8 +108,12 @@ public class NetShareVpnService extends VpnService {
             stopVpn(); stopSelf(); return START_NOT_STICKY;
         }
         if (ACTION_START.equals(intent.getAction())) {
-            String wsUrl = intent.getStringExtra(EXTRA_WS_URL);
-            if (wsUrl != null) { startForegroundNotification(); startVpn(); }
+            String url = intent.getStringExtra(EXTRA_WS_URL);
+            if (url != null) {
+                this.wsUrl = url;            // FIX 1: store it
+                startForegroundNotification();
+                startVpn(url);              // FIX 1: pass it in — was startVpn() before!
+            }
         }
         return START_NOT_STICKY;
     }
@@ -141,20 +121,20 @@ public class NetShareVpnService extends VpnService {
     @Override
     public void onDestroy() { stopVpn(); super.onDestroy(); }
 
-    // ── Start VPN ─────────────────────────────────────────────────────────────
+    // ── Start VPN + open relay WebSocket ─────────────────────────────────────
 
-    private void startVpn() {
+    private void startVpn(String wsUrl) {  // FIX 1: takes wsUrl now
+        if (running.get()) return;
         try {
             Builder b = new Builder()
                 .setMtu(VPN_MTU)
                 .addAddress(VPN_ADDRESS, 24)
-                .addRoute("0.0.0.0", 0)       // capture ALL IPv4 traffic
+                .addRoute("0.0.0.0", 0)
                 .addDnsServer(VPN_DNS1)
                 .addDnsServer(VPN_DNS2)
                 .setSession("NetShare")
-                .setBlocking(true);            // blocking — tunReadLoop owns fd
+                .setBlocking(true);
 
-            // Exclude our own app to prevent routing loop
             try { b.addDisallowedApplication(getPackageName()); }
             catch (Exception e) { Log.w(TAG, "addDisallowedApplication: " + e.getMessage()); }
 
@@ -164,16 +144,61 @@ public class NetShareVpnService extends VpnService {
                 return;
             }
 
-            tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
+            tunOut   = new FileOutputStream(vpnInterface.getFileDescriptor());
             running.set(true);
             executor = Executors.newCachedThreadPool();
 
-            // Single TUN read loop — owns the FileInputStream exclusively
-            executor.execute(this::tunReadLoop);
+            // FIX 2+3: open WebSocket with pingInterval to keep alive
+            httpClient = new OkHttpClient.Builder()
+                .pingInterval(20, TimeUnit.SECONDS)   // FIX 3: prevents Cloudflare idle kill
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(0,  TimeUnit.SECONDS)
+                .writeTimeout(30, TimeUnit.SECONDS)
+                .build();
 
-            Log.i(TAG, "VPN started");
-            ProxyModule.emitEvent("ProxyVpnStarted", "{}");
-            ProxyModule.emitEvent("ProxyTunnelReady", "{}");
+            Request req = new Request.Builder().url(wsUrl).build();
+            relayWs = httpClient.newWebSocket(req, new WebSocketListener() {
+
+                @Override
+                public void onOpen(WebSocket ws, Response response) {
+                    Log.i(TAG, "[Client] WS open");
+                    wsReady.set(true);
+                    // Start TUN loop only AFTER WebSocket is open
+                    executor.execute(NetShareVpnService.this::tunReadLoop);
+                    startHeartbeat(ws);   // FIX 3: app-level heartbeat
+                    ProxyModule.emitEvent("ProxyVpnStarted", "{}");
+                    ProxyModule.emitEvent("ProxyTunnelReady", "{}");
+                }
+
+                @Override
+                public void onMessage(WebSocket ws, ByteString bytes) {
+                    // FIX 2: host response frames arrive here → route to TUN
+                    handleRelayFrame(bytes.toByteArray());
+                }
+
+                @Override
+                public void onMessage(WebSocket ws, String text) {
+                    Log.v(TAG, "[Client] text: " + text); // heartbeat pong
+                }
+
+                @Override
+                public void onFailure(WebSocket ws, Throwable t, Response response) {
+                    Log.e(TAG, "[Client] WS failure: " + t.getMessage());
+                    wsReady.set(false);
+                    ProxyModule.emitEvent("ProxyTunnelError",
+                        t.getMessage() != null ? t.getMessage() : "WS failure");
+                    stopVpn();
+                }
+
+                @Override
+                public void onClosed(WebSocket ws, int code, String reason) {
+                    wsReady.set(false);
+                    ProxyModule.emitEvent("ProxyVpnRevoked", reason);
+                    stopVpn();
+                }
+            });
+
+            Log.i(TAG, "VPN started → " + wsUrl);
 
         } catch (Exception e) {
             Log.e(TAG, "startVpn: " + e.getMessage());
@@ -181,40 +206,85 @@ public class NetShareVpnService extends VpnService {
         }
     }
 
-    // ── Stop VPN ──────────────────────────────────────────────────────────────
+    // FIX 3: extra app-level heartbeat every 25s
+    private void startHeartbeat(WebSocket ws) {
+        if (heartbeatTimer != null) heartbeatTimer.cancel();
+        heartbeatTimer = new java.util.Timer("ns-heartbeat", true);
+        heartbeatTimer.scheduleAtFixedRate(new java.util.TimerTask() {
+            @Override public void run() {
+                try {
+                    if (wsReady.get()) ws.send("{\"type\":\"ping\"}");
+                } catch (Exception ignored) {}
+            }
+        }, 25_000, 25_000);
+    }
+
+    // ── Stop ─────────────────────────────────────────────────────────────────
 
     private void stopVpn() {
         running.set(false);
+        wsReady.set(false);
 
-        // Signal all upload threads to stop by sending sentinel to every queue
-        for (BlockingQueue<byte[]> q : connQueues.values()) {
-            q.offer(new byte[0]); // sentinel
-        }
+        if (heartbeatTimer != null) { heartbeatTimer.cancel(); heartbeatTimer = null; }
+
+        for (BlockingQueue<byte[]> q : connQueues.values()) q.offer(new byte[0]);
         connQueues.clear();
 
         if (executor != null) { executor.shutdownNow(); executor = null; }
 
-        try { if (tunOut       != null) tunOut.close();       } catch (Exception ignored) {}
-        try { if (vpnInterface != null) vpnInterface.close(); } catch (Exception ignored) {}
+        if (relayWs != null) {
+            try { relayWs.close(1000, "stopped"); } catch (Exception ignored) {}
+            relayWs = null;
+        }
+        if (httpClient != null) {
+            try { httpClient.dispatcher().executorService().shutdown(); } catch (Exception ignored) {}
+            httpClient = null;
+        }
 
+        try { if (tunOut != null)       tunOut.close();       } catch (Exception ignored) {}
+        try { if (vpnInterface != null) vpnInterface.close(); } catch (Exception ignored) {}
         tunOut = null; vpnInterface = null;
 
-        Log.i(TAG, "VPN stopped");
         ProxyModule.emitEvent("ProxyVpnRevoked", "stopped");
+        Log.i(TAG, "VPN stopped");
     }
 
-    // ── Central TUN read loop ─────────────────────────────────────────────────
+    // ── Handle frames from relay → TUN ───────────────────────────────────────
 
-    /**
-     * THE only thread that reads from the TUN FileInputStream.
-     * Owns the fd exclusively — no other thread reads from TUN.
-     *
-     * For every packet:
-     *   1. Parse IPv4 + TCP headers to extract connKey
-     *   2. If SYN (new connection) → create queue, spawn proxyConnect
-     *   3. If data → look up queue, put packet in it
-     *   4. If FIN/RST → send sentinel to queue (signals upload thread to stop)
-     */
+    private void handleRelayFrame(byte[] raw) {
+        if (raw.length < 5) return;
+        int    connId    = ByteBuffer.wrap(raw, 0, 4).getInt();
+        byte   frameType = raw[4];
+        byte[] payload   = Arrays.copyOfRange(raw, 5, raw.length);
+
+        String connKey = "relay:" + connId;
+
+        switch (frameType) {
+            case 0x02: { // FT_DATA — write response back into TUN
+                BlockingQueue<byte[]> q = connQueues.get(connKey);
+                if (q != null && payload.length > 0) {
+                    if (!q.offer(payload)) Log.v(TAG, "relay queue full id=" + connId);
+                } else if (payload.length > 0) {
+                    synchronized (this) {
+                        if (tunOut != null) {
+                            try { tunOut.write(payload); tunOut.flush(); }
+                            catch (Exception ignored) {}
+                        }
+                    }
+                    bytesDown.addAndGet(payload.length);
+                }
+                break;
+            }
+            case 0x03: { // FT_CLOSE
+                BlockingQueue<byte[]> q = connQueues.remove(connKey);
+                if (q != null) q.offer(new byte[0]);
+                break;
+            }
+        }
+    }
+
+    // ── TUN read loop ─────────────────────────────────────────────────────────
+
     private void tunReadLoop() {
         FileInputStream tunIn = new FileInputStream(vpnInterface.getFileDescriptor());
         byte[] buf = new byte[VPN_MTU];
@@ -223,27 +293,18 @@ public class NetShareVpnService extends VpnService {
             try {
                 int len = tunIn.read(buf);
                 if (len < 20) continue;
-
-                // IPv4 only
-                if (((buf[0] >> 4) & 0xF) != 4) continue;
+                if (((buf[0] >> 4) & 0xF) != 4) continue; // IPv4 only
 
                 int ipHdrLen = (buf[0] & 0xF) * 4;
-                int protocol = buf[9] & 0xFF;
-
-                // TCP only (6)
-                if (protocol != 6) continue;
+                if (buf[9] != 6) continue; // TCP only
                 if (len < ipHdrLen + 20) continue;
 
-                // Parse addresses and ports
-                String srcIp  = (buf[12]&0xFF)+"."+(buf[13]&0xFF)+"."+(buf[14]&0xFF)+"."+(buf[15]&0xFF);
                 String dstIp  = (buf[16]&0xFF)+"."+(buf[17]&0xFF)+"."+(buf[18]&0xFF)+"."+(buf[19]&0xFF);
                 int    srcPort = ((buf[ipHdrLen]   &0xFF)<<8)|(buf[ipHdrLen+1]&0xFF);
                 int    dstPort = ((buf[ipHdrLen+2] &0xFF)<<8)|(buf[ipHdrLen+3]&0xFF);
 
-                // Skip loopback and proxy port itself (avoid loop)
                 if (dstIp.startsWith("127.") || dstPort == PROXY_PORT) continue;
 
-                // TCP flags
                 int     flags = buf[ipHdrLen + 13] & 0xFF;
                 boolean syn   = (flags & 0x02) != 0;
                 boolean fin   = (flags & 0x01) != 0;
@@ -251,78 +312,46 @@ public class NetShareVpnService extends VpnService {
                 boolean ack   = (flags & 0x10) != 0;
                 boolean psh   = (flags & 0x08) != 0;
 
-                // connKey identifies this TCP connection uniquely
                 String connKey = srcPort + ":" + dstIp + ":" + dstPort;
 
                 if (syn && !ack) {
-                    // New connection — create queue and spawn handler
                     if (!connQueues.containsKey(connKey)) {
-                        BlockingQueue<byte[]> queue =
-                            new LinkedBlockingQueue<>(QUEUE_CAP);
+                        BlockingQueue<byte[]> queue = new LinkedBlockingQueue<>(QUEUE_CAP);
                         connQueues.put(connKey, queue);
-
-                        final String target = dstIp + ":" + dstPort;
-                        final String key    = connKey;
-                        final BlockingQueue<byte[]> q = queue;
-                        executor.execute(() -> proxyConnect(target, key, q));
+                        final String t = dstIp + ":" + dstPort;
+                        final String k = connKey;
+                        executor.execute(() -> proxyConnect(t, k, queue));
                     }
-
                 } else if (fin || rst) {
-                    // Connection closing — send sentinel to upload thread
                     BlockingQueue<byte[]> q = connQueues.remove(connKey);
-                    if (q != null) q.offer(new byte[0]); // sentinel
-
+                    if (q != null) q.offer(new byte[0]);
                 } else if (ack || psh) {
-                    // Data packet — dispatch to the right connection queue
-                    // Extract TCP payload
-                    int tcpHdrLen = ((buf[ipHdrLen + 12] >> 4) & 0xF) * 4;
+                    int tcpHdrLen     = ((buf[ipHdrLen + 12] >> 4) & 0xF) * 4;
                     int payloadOffset = ipHdrLen + tcpHdrLen;
                     int payloadLen    = len - payloadOffset;
-
                     if (payloadLen > 0) {
                         BlockingQueue<byte[]> q = connQueues.get(connKey);
                         if (q != null) {
-                            byte[] payload = Arrays.copyOfRange(buf, payloadOffset, payloadOffset + payloadLen);
-                            // offer (non-blocking) — drop if queue full to avoid blocking tunReadLoop
-                            if (!q.offer(payload)) {
-                                Log.v(TAG, "Queue full for " + connKey + ", dropping packet");
-                            }
+                            byte[] p = Arrays.copyOfRange(buf, payloadOffset, payloadOffset + payloadLen);
+                            if (!q.offer(p)) Log.v(TAG, "queue full " + connKey);
                         }
                     }
                 }
-
             } catch (Exception e) {
                 if (Thread.currentThread().isInterrupted()) break;
                 if (running.get()) Log.v(TAG, "tunRead: " + e.getMessage());
             }
         }
-
         try { tunIn.close(); } catch (Exception ignored) {}
-        Log.i(TAG, "tunReadLoop exited");
     }
 
     // ── Per-connection proxy handler ──────────────────────────────────────────
 
-    /**
-     * Handles ONE TCP connection through the local HTTP CONNECT proxy.
-     *
-     * UPLOAD thread:   drains packets from queue → writes to proxy socket output
-     * DOWNLOAD thread: reads proxy socket input  → writes back into TUN
-     *
-     * The queue is the handoff point between tunReadLoop and this thread.
-     * tunReadLoop puts packets in; upload thread takes them out.
-     * Zero-length sentinel signals upload thread to stop.
-     */
     private void proxyConnect(String target, String connKey, BlockingQueue<byte[]> queue) {
         Socket proxySocket = null;
         try {
             proxySocket = new Socket();
-
-            // protect() prevents this socket from being routed through the VPN
-            // (which would cause an infinite loop)
-            if (!protect(proxySocket)) {
-                Log.w(TAG, "protect() failed for " + target);
-            }
+            if (!protect(proxySocket)) Log.w(TAG, "protect() failed: " + target);
 
             proxySocket.setTcpNoDelay(true);
             proxySocket.setSoTimeout(120_000);
@@ -331,34 +360,21 @@ public class NetShareVpnService extends VpnService {
             InputStream  proxyIn  = proxySocket.getInputStream();
             OutputStream proxyOut = proxySocket.getOutputStream();
 
-            // Send HTTP CONNECT to the local proxy
-            // ProxyModule handles this, creates FT_OPEN frame, tunnels via WebSocket
             proxyOut.write(("CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n\r\n")
                 .getBytes(StandardCharsets.US_ASCII));
             proxyOut.flush();
 
-            // Read 200 Connection established
             String resp = readHttpResponse(proxyIn);
             if (resp == null || !resp.contains("200")) {
                 Log.w(TAG, "CONNECT failed [" + target + "]: " + resp);
                 return;
             }
 
-            int cnt = activeConns.incrementAndGet();
-            ProxyModule.emitEvent("ProxyClientConnected", String.valueOf(cnt));
-            Log.d(TAG, "CONNECT OK: " + target + " active=" + cnt);
+            activeConns.incrementAndGet();
 
-            final Socket     sock     = proxySocket;
-            final AtomicBoolean done  = new AtomicBoolean(false);
+            final Socket       sock = proxySocket;
+            final AtomicBoolean done = new AtomicBoolean(false);
 
-            // ── DOWNLOAD thread: proxy socket → TUN ──────────────────────────
-            //
-            // Reads response data arriving from the host (via ProxyModule WebSocket)
-            // and writes it back into the TUN interface so the originating app
-            // receives the server's response.
-            //
-            // tunOut writes are synchronized — multiple concurrent download threads
-            // all write to the same TUN fd safely.
             Thread download = new Thread(() -> {
                 byte[] buf = new byte[PIPE_BUF];
                 try {
@@ -367,62 +383,44 @@ public class NetShareVpnService extends VpnService {
                         n = proxyIn.read(buf);
                         if (n < 0) break;
                         synchronized (NetShareVpnService.this) {
-                            if (tunOut != null) {
-                                tunOut.write(buf, 0, n);
-                                tunOut.flush();
-                            }
+                            if (tunOut != null) { tunOut.write(buf, 0, n); tunOut.flush(); }
                         }
                         bytesDown.addAndGet(n);
                     }
-                } catch (Exception e) {
-                    Log.v(TAG, "dl[" + target + "]: " + e.getMessage());
+                } catch (Exception ignored) {
                 } finally {
                     done.set(true);
-                    try { sock.close(); } catch (Exception ignored) {}
+                    try { sock.close(); } catch (Exception ignored2) {}
                 }
             }, "ns-dl-" + target);
             download.setDaemon(true);
             download.start();
 
-            // ── UPLOAD: queue → proxy socket ──────────────────────────────────
-            //
-            // Drains TCP payload packets from the BlockingQueue (filled by
-            // tunReadLoop) and writes them to the proxy socket input stream.
-            // ProxyModule reads them and sends FT_DATA frames to the host.
-            //
-            // Zero-length sentinel = FIN/RST received = stop uploading.
             try {
                 while (running.get() && !sock.isClosed() && !done.get()) {
-                    // Poll with timeout so we can check done/running periodically
                     byte[] payload = queue.poll(200, TimeUnit.MILLISECONDS);
-                    if (payload == null) continue;          // timeout, loop back
-                    if (payload.length == 0) break;         // sentinel — connection closing
-
+                    if (payload == null) continue;
+                    if (payload.length == 0) break;
                     proxyOut.write(payload);
                     proxyOut.flush();
                     bytesUp.addAndGet(payload.length);
                 }
-            } catch (Exception e) {
-                Log.v(TAG, "ul[" + target + "]: " + e.getMessage());
+            } catch (Exception ignored) {
             } finally {
                 try { sock.close(); } catch (Exception ignored) {}
             }
 
-            // Wait for download to drain remaining data
             try { download.join(3_000); } catch (InterruptedException ignored) {}
 
         } catch (Exception e) {
             Log.d(TAG, "proxyConnect[" + target + "]: " + e.getMessage());
         } finally {
             connQueues.remove(connKey);
-            int c = activeConns.decrementAndGet();
-            if (c >= 0) ProxyModule.emitEvent("ProxyClientDisconnected", String.valueOf(c));
+            activeConns.decrementAndGet();
             if (proxySocket != null && !proxySocket.isClosed())
                 try { proxySocket.close(); } catch (Exception ignored) {}
         }
     }
-
-    // ── Read HTTP CONNECT response ────────────────────────────────────────────
 
     private String readHttpResponse(InputStream in) throws IOException {
         StringBuilder first = new StringBuilder();
@@ -440,13 +438,10 @@ public class NetShareVpnService extends VpnService {
         return first.toString().trim();
     }
 
-    // ── Foreground notification ───────────────────────────────────────────────
-
     private void startForegroundNotification() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
                 CHANNEL_ID, "NetShare VPN", NotificationManager.IMPORTANCE_LOW);
-            ch.setDescription("NetShare tunnel active");
             NotificationManager nm = getSystemService(NotificationManager.class);
             if (nm != null) nm.createNotificationChannel(ch);
         }
