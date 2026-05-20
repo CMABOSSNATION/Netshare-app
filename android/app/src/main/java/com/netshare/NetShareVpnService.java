@@ -764,11 +764,26 @@ public class NetShareVpnService extends VpnService {
                             Log.i(TAG, "[tunnel] Using built-in TUNNEL_APPS fallback (" + TUNNEL_APPS_FALLBACK.length + " packages)");
                         }
 
+                        // BUG-FIX: derive gateway IP from assignedTunIp
+                        // e.g. "10.8.0.3" → gateway = "10.8.0.1"
+                        // Android needs an explicit /32 host route to the gateway so
+                        // inbound response packets are correctly delivered back to app
+                        // sockets. Without this, apps load (DNS works) but show no
+                        // content — the TUN captures outbound traffic but responses
+                        // from tunOut.write() silently disappear before reaching apps.
+                        String gatewayIp = "10.8.0.1";
+                        try {
+                            String[] parts = assignedTunIp.split("\\.");
+                            if (parts.length == 4)
+                                gatewayIp = parts[0]+"."+parts[1]+"."+parts[2]+".1";
+                        } catch (Exception ignored) {}
+
                         Builder b2 = new Builder();
                         b2.setSession("NetShare")
                           .addAddress(assignedTunIp, 24)
                           .addRoute("0.0.0.0", 0)
                           .addRoute("::", 0)
+                          .addRoute(gatewayIp, 32)   // explicit gateway — fixes content delivery
                           .addDnsServer("1.1.1.1")
                           .addDnsServer("1.0.0.1")
                           .addDnsServer("8.8.8.8")
@@ -1154,7 +1169,14 @@ public class NetShareVpnService extends VpnService {
                 if (wsClient != null) {
                     bytesOut.addAndGet(len);
                     ByteBuffer pkt = buildIpTcpPacket(remoteIpBytes, clientIpBytes, remoteDstPort, clientSrcPort, buf, 0, len);
-                    wsSend(pkt);
+                    // BUG-FIX: wrap in TC frame so client's unwrapRelayFrame() can parse it.
+                    // Previously sent raw ByteBuffer — client received it and unwrapRelayFrame()
+                    // fell through to legacy mode but the IP packet had wrong routing context
+                    // so response never reached the app socket. Wrapping ensures correct delivery.
+                    byte[] raw = new byte[pkt.remaining()];
+                    pkt.get(raw);
+                    byte[] framed = wrapTcpFrame(raw, 0, raw.length);
+                    wsSend(ByteBuffer.wrap(framed));
                 }
             }
         } catch (Exception e) {
@@ -1194,7 +1216,13 @@ public class NetShareVpnService extends VpnService {
                         : dp.getPort();
                     ByteBuffer pkt = buildIpUdpPacket(remoteIpBytes, clientIpBytes,
                             dp.getPort(), replyPort, dp.getData(), 0, dp.getLength());
-                    wsSend(pkt);
+                    // BUG-FIX: wrap in TC frame — same reason as readTcpResponses above.
+                    // UDP responses (DNS, QUIC, STUN) were arriving at client unwrapped,
+                    // causing them to be treated as legacy raw packets with wrong IP context.
+                    byte[] raw = new byte[pkt.remaining()];
+                    pkt.get(raw);
+                    byte[] framed = wrapTcpFrame(raw, 0, raw.length);
+                    wsSend(ByteBuffer.wrap(framed));
                 }
             }
         } catch (Exception e) {
