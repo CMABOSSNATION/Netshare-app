@@ -21,8 +21,12 @@ import {
   Platform,
   StatusBar,
   SafeAreaView,
+  NativeModules,
+  NativeEventEmitter,
 } from 'react-native';
 import { useStore } from '../store';
+
+const { VpnModule } = NativeModules;
 
 // ── VPN services — one per app ───────────────────────────────────────────────
 import TikTokService   from '../services/TikTok';
@@ -71,12 +75,23 @@ export default function HomeScreen() {
   const [eventLog,        setEventLog]        = useState([]);
   const [sessionTimer,    setSessionTimer]    = useState('0s');
   const [selectedApp,     setSelectedApp]     = useState('TikTok');
+  const [debugLog,        setDebugLog]        = useState([]);
+  const [showDebug,       setShowDebug]       = useState(false);
   const timerRef     = useRef(null);
   const bandwidthRef = useRef(null);
-  const unsubsRef    = useRef([]);   // holds all active event unsub functions
+  const unsubsRef    = useRef([]);
 
   // Derive active service from selected app
   const vpnService = APP_SERVICES[selectedApp];
+
+  // ── Debug log via vpnDebug native events ────────────────────────────
+  useEffect(() => {
+    const emitter = new NativeEventEmitter(VpnModule);
+    const sub = emitter.addListener('vpnDebug', (line) => {
+      setDebugLog(prev => [line, ...prev].slice(0, 100));
+    });
+    return () => sub.remove();
+  }, []);
 
   // ── Event log helper ────────────────────────────────────────────────
   const log = useCallback((msg) => {
@@ -436,6 +451,28 @@ export default function HomeScreen() {
           </View>
         )}
 
+        {/* ── DEBUG LOG (tap to expand) ── */}
+        <View style={s.debugCard}>
+          <TouchableOpacity onPress={() => setShowDebug(v => !v)} style={s.debugHeader}>
+            <Text style={s.debugTitle}>🔍 DEBUG LOG {debugLog.length > 0 ? `(${debugLog.length})` : '(empty)'}</Text>
+            <Text style={s.debugToggle}>{showDebug ? '▲ hide' : '▼ show'}</Text>
+          </TouchableOpacity>
+          {showDebug && (
+            <ScrollView style={s.debugScroll} nestedScrollEnabled>
+              {debugLog.length === 0
+                ? <Text style={s.debugLine}>No events yet — connect to see logs</Text>
+                : debugLog.map((line, i) => (
+                    <Text key={i} style={[s.debugLine,
+                      line.includes('ERROR') || line.includes('fail') ? s.debugRed :
+                      line.includes('JOIN_SUCCESS') || line.includes('TUN rebuilt') ? s.debugGreen :
+                      null
+                    ]}>{line}</Text>
+                  ))
+              }
+            </ScrollView>
+          )}
+        </View>
+
       </ScrollView>
     </SafeAreaView>
   );
@@ -532,4 +569,16 @@ const s = StyleSheet.create({
   logTitle: { color: '#4a6080', fontSize: 10, letterSpacing: 3, marginBottom: 8 },
   logLine:  { color: '#2a4060', fontSize: 11,
               fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', lineHeight: 17 },
+
+  debugCard:   { backgroundColor: '#0a0e1a', borderRadius: 12, borderWidth: 1,
+                 borderColor: '#1a2a1a', padding: 12, marginBottom: 14 },
+  debugHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  debugTitle:  { color: '#3a6040', fontSize: 11, letterSpacing: 1, fontWeight: '700' },
+  debugToggle: { color: '#2a4030', fontSize: 11 },
+  debugScroll: { maxHeight: 220, marginTop: 8 },
+  debugLine:   { color: '#2a5030', fontSize: 10,
+                 fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
+                 lineHeight: 16 },
+  debugGreen:  { color: '#00c060' },
+  debugRed:    { color: '#c03040' },
 });
