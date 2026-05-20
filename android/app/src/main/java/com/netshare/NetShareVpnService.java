@@ -90,6 +90,20 @@ import java.util.concurrent.TimeUnit;
  */
 public class NetShareVpnService extends VpnService {
 
+    // ── In-app debug log (readable from JS via VpnModule.getDebugLog()) ──
+    private static final int DEBUG_LOG_MAX = 200;
+    private static final java.util.ArrayDeque<String> debugLog = new java.util.ArrayDeque<>();
+    public static synchronized void dbg(String msg) {
+        String line = android.text.format.DateFormat.format("HH:mm:ss", new java.util.Date()) + " " + msg;
+        Log.d(TAG, msg);
+        debugLog.addLast(line);
+        if (debugLog.size() > DEBUG_LOG_MAX) debugLog.removeFirst();
+        VpnModule.emitEvent("vpnDebug", line);
+    }
+    public static synchronized String getDebugLog() {
+        return String.join("\n", debugLog);
+    }
+
     private static final String TAG             = "NetShareVPN";
     private static final String CHANNEL_ID      = "netshare_vpn";
     private static final int    NOTIFICATION_ID = 1;
@@ -449,17 +463,49 @@ public class NetShareVpnService extends VpnService {
                 return;
             }
 
-            Builder builder = new Builder();
-            builder.setSession("NetShare")
-                   .addAddress("10.8.0.2", 24)
-                   .addRoute("10.8.0.0", 24)
-                   .setMtu(TUN_MTU);
+            // ── CLIENT: build a BLOCKING placeholder TUN ─────────────────
+            // CRITICAL BUG FIX: The old placeholder TUN only routed 10.8.0.0/24
+            // so apps (WhatsApp, TikTok) tried to connect through it immediately,
+            // got no route, gave up, and showed "no internet" before JOIN_SUCCESS
+            // ever arrived to rebuild the real TUN.
+            //
+            // New approach: build a full 0.0.0.0/0 TUN immediately with the same
+            // allowed-app list, but point DNS at a local sink (10.8.0.1) so DNS
+            // queries queue up rather than fail. When JOIN_SUCCESS arrives and the
+            // real TUN is established, apps retry and succeed.
+            // This means apps see "connected" immediately and wait for data,
+            // rather than seeing "no internet" and giving up.
+            Builder placeholder = new Builder();
+            placeholder.setSession("NetShare")
+                       .addAddress("10.8.0.2", 24)
+                       .addRoute("0.0.0.0", 0)
+                       .addRoute("::", 0)
+                       .addDnsServer("10.8.0.1")  // sink DNS — queues requests until real TUN ready
+                       .setMtu(TUN_MTU);
 
-            try { builder.addDisallowedApplication(getPackageName()); } catch (Exception e) {
-                Log.w(TAG, "addDisallowedApplication: " + e.getMessage());
+            try { placeholder.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
+
+            // Apply the same app filter that JOIN_SUCCESS will use, so the
+            // placeholder captures exactly the right apps from the start.
+            final String[] PLACEHOLDER_APPS = {
+                "com.zhiliaoapp.musically", "com.ss.android.ugc.trill",
+                "com.ss.android.ugc.trill.go", "com.bytedance.tiktok",
+                "com.whatsapp", "com.whatsapp.w4b", "com.whatsapp.beta",
+                "com.facebook.katana", "com.facebook.lite", "com.facebook.orca",
+                "com.instagram.android", "com.instagram.lite",
+                "com.google.android.youtube", "com.spotify.music", "com.spotify.lite",
+                "com.twitter.android", "com.X.android",
+                "com.google.android.gms", "com.google.android.gsf",
+                "com.google.android.webview",
+            };
+            // Override with JS-provided package list if available
+            final String[] placeholderApps = (appPackages != null && appPackages.length > 0)
+                ? appPackages : PLACEHOLDER_APPS;
+            for (String pkg : placeholderApps) {
+                try { placeholder.addAllowedApplication(pkg); } catch (Exception ignored) {}
             }
 
-            vpnInterface = builder.establish();
+            vpnInterface = placeholder.establish();
             if (vpnInterface == null) {
                 VpnModule.emitEvent("vpnError", "Failed to establish VPN interface");
                 return;
@@ -467,8 +513,27 @@ public class NetShareVpnService extends VpnService {
 
             tunOut    = new FileOutputStream(vpnInterface.getFileDescriptor());
             isRunning = true;
-            Log.i(TAG, "CLIENT TUN placeholder established — connecting to relay via QUIC/Cloudflare");
+            Log.i(TAG, "CLIENT placeholder TUN established — connecting to relay");
             connectToRelay();
+
+            // Watchdog: if JOIN_SUCCESS never arrives within 15s, emit error so
+            // the user sees a meaningful message instead of a silent hang.
+            executor.execute(() -> {
+                try {
+                    Thread.sleep(15_000);
+                    if (isRunning && tunOut != null) {
+                        // tunOut is replaced in JOIN_SUCCESS — if it's still the
+                        // placeholder FileOutputStream after 15s, JOIN never arrived.
+                        // Check by seeing if assignedTunIp is still the default.
+                        if ("10.8.0.2".equals(assignedTunIp)) {
+                            Log.e(TAG, "[watchdog] JOIN_SUCCESS not received after 15s");
+                            VpnModule.emitEvent("vpnError",
+                                "Could not join host session — check the access code and try again.");
+                            stopVpnTunnel();
+                        }
+                    }
+                } catch (InterruptedException ignored) {}
+            });
 
         } catch (Exception e) {
             Log.e(TAG, "startVpnTunnel: " + e.getMessage());
@@ -529,12 +594,14 @@ public class NetShareVpnService extends VpnService {
                     VpnModule.emitEvent("vpnConnected", "host");
                     String msgType = (sessionCode != null && !sessionCode.isEmpty())
                         ? "HOST_RECONNECT" : "HOST_REGISTER";
+                    dbg("WS open as HOST → sending " + msgType);
                     wsSend(j3("type", msgType, "hostId", hostId, "netType", netType));
                     // PATCH 3: start keep-alive heartbeat so the relay never times out
                     // a host that is alive but temporarily frozen by Android Doze.
                     startHostKeepAlive(webSocket);
                 } else {
                     VpnModule.emitEvent("vpnConnected", sessionCode);
+                    dbg("WS open as CLIENT → sending CLIENT_JOIN");
                     // FIX-TW-1: include deviceId in CLIENT_JOIN
                     // Previously this always sent "" — the relay rejected with
                     // "Device ID missing" and TikTok/WhatsApp never joined.
@@ -703,6 +770,7 @@ public class NetShareVpnService extends VpnService {
                     if (assignedIp != null && !assignedIp.isEmpty()) {
                         assignedTunIp = assignedIp;
                     }
+                    dbg("JOIN_SUCCESS tunIp=" + assignedTunIp + " rebuilding TUN");
                     Log.i(TAG, "JOIN_SUCCESS: tunIp=" + assignedTunIp + " — rebuilding TUN");
                     try {
                         if (tunOut       != null) { try { tunOut.close();       } catch (Exception ignored) {} tunOut       = null; }
@@ -809,6 +877,7 @@ public class NetShareVpnService extends VpnService {
                         vpnInterface = b2.establish();
                         if (vpnInterface != null) {
                             tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
+                            dbg("TUN rebuilt OK — " + allowedCount + " apps tunnelled, gateway=" + gatewayIp);
                             startPacketReadLoop();
                         } else {
                             Log.e(TAG, "JOIN_SUCCESS: failed to rebuild TUN");
@@ -883,8 +952,8 @@ public class NetShareVpnService extends VpnService {
             InetAddress dst   = InetAddress.getByAddress(new byte[]{pkt[16], pkt[17], pkt[18], pkt[19]});
             String      srcIp = InetAddress.getByAddress(new byte[]{pkt[12], pkt[13], pkt[14], pkt[15]}).getHostAddress();
 
-            if      (proto == 6)  handleTcpForward(pkt, ihl, srcIp, dst, tunIpBytes());
-            else if (proto == 17) handleUdpForward(pkt, ihl, srcIp, dst, tunIpBytes());
+            if      (proto == 6)  { dbg("→ TCP to " + dst.getHostAddress() + ":" + u16(pkt, ihl+2)); handleTcpForward(pkt, ihl, srcIp, dst, tunIpBytes()); }
+            else if (proto == 17) { dbg("→ UDP to " + dst.getHostAddress() + ":" + u16(pkt, ihl+2)); handleUdpForward(pkt, ihl, srcIp, dst, tunIpBytes()); }
             else if (proto == 1) {
                 if (pkt.length < ihl + ICMP_HEADER_LEN) return;
                 if ((pkt[ihl] & 0xFF) == 8 && (pkt[ihl+1] & 0xFF) == 0) {

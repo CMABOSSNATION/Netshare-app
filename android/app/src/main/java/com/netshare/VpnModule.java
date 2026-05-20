@@ -213,6 +213,20 @@ public class VpnModule extends ReactContextBaseJavaModule implements ActivityEve
         }
     }
 
+    // ── Read debug log from running service ───────────────────────────────
+    // Returns the last 200 log lines emitted by NetShareVpnService.dbg().
+    // Called from HomeScreen.jsx debug panel via VpnModule.getDebugLog().
+
+    @ReactMethod
+    public void getDebugLog(Promise promise) {
+        try {
+            String log = NetShareVpnService.getDebugLog();
+            promise.resolve(log != null ? log : "");
+        } catch (Exception e) {
+            promise.resolve("Error reading log: " + e.getMessage());
+        }
+    }
+
     // ── Emit event to JS ──────────────────────────────────────────────────
     // FIX 2: null-guard on the emitter.
 
