@@ -665,29 +665,14 @@ public class NetShareVpnService extends VpnService {
                         }
 
                         if (!served) {
-                            // PATCH 2: wrap outbound IP packet in TCP relay frame
-                            // so the Cloudflare DO knows the exact payload length.
-                            int ver4 = (frame[0] & 0xF0) >> 4;
-                            int proto4 = (ver4 == 4 && len >= 20) ? (frame[9] & 0xFF) : -1;
-                            if (proto4 == 17 && len >= 28) {
-                                // UDP packet: wrap as UD frame with routing header
-                                int ihl4    = (frame[0] & 0x0F) * 4;
-                                byte[] dstIp4 = new byte[]{frame[16], frame[17], frame[18], frame[19]};
-                                int dstPort4  = ((frame[ihl4+2] & 0xFF) << 8) | (frame[ihl4+3] & 0xFF);
-                                int srcPort4  = ((frame[ihl4]   & 0xFF) << 8) | (frame[ihl4+1] & 0xFF);
-                                int pOff4 = ihl4 + 8;
-                                int pLen4 = len - pOff4;
-                                if (pLen4 > 0) {
-                                    byte[] udpFrame = wrapUdpFrame(dstIp4, dstPort4, srcPort4, frame, pOff4, pLen4);
-                                    wsSend(ByteBuffer.wrap(udpFrame));
-                                } else {
-                                    wsSend(ByteBuffer.wrap(frame));
-                                }
-                            } else {
-                                // TCP/ICMP/other: wrap as TC frame
-                                byte[] tcpFrame = wrapTcpFrame(frame, 0, len);
-                                wsSend(ByteBuffer.wrap(tcpFrame));
-                            }
+                            // Wrap full IP packet in TC frame so the relay broker
+                            // passes it through intact and HOST can call
+                            // forwardPacketToInternet() with complete IP headers.
+                            // NOTE: UD frame wrapping is NOT used on the broker path
+                            // because broker relays raw bytes — HOST needs the full
+                            // IP+UDP/TCP headers to route the packet to the internet.
+                            byte[] tcpFrame = wrapTcpFrame(frame, 0, len);
+                            wsSend(ByteBuffer.wrap(tcpFrame));
                         }
                     }
                 }
