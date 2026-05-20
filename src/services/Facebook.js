@@ -66,6 +66,14 @@ export const FACEBOOK_PORTS = {
   123:   10_000,
 };
 
+// Serialised once — reused on every startVpn() and reconnect call.
+// Must be passed as args 8 and 9 to VpnModule.startVpn() so Java applies
+// the correct package filter and port timeouts instead of the generic fallback.
+const PACKAGES_JSON = JSON.stringify(FACEBOOK_PACKAGES);
+const PORTS_JSON    = JSON.stringify(
+  Object.fromEntries(Object.entries(FACEBOOK_PORTS).map(([k, v]) => [String(k), v]))
+);
+
 const LOCAL_EVENTS        = new Set(['hostFailover']);
 const MAX_RECONNECT_TRIES = 8;
 const RECONNECT_BASE_MS   = 1_000;
@@ -147,7 +155,10 @@ class FacebookVpnService {
     this.hostId = await this.getHostId();
     this.role = 'host'; this.netType = netType;
     this._stopping = false; this.reconnectTries = 0;
-    await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, netType, '');
+    await VpnModule.startVpn(
+      RELAY_URL, '', 'host', this.hostId, netType, '',
+      PACKAGES_JSON, PORTS_JSON
+    );
   }
 
   async startAsClient(accessCode) {
@@ -159,14 +170,40 @@ class FacebookVpnService {
     const deviceId = await this.getDeviceId();
     this.role = 'client'; this.accessCode = accessCode.toUpperCase();
     this.currentCode = null; this._stopping = false; this.reconnectTries = 0;
-    await VpnModule.startVpn(RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId);
+    await VpnModule.startVpn(
+      RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId,
+      PACKAGES_JSON, PORTS_JSON
+    );
   }
 
   _scheduleReconnect() {
     if (this._stopping) return;
-    if (this.reconnectTries >= MAX_RECONNECT_TRIES) { this._fireLocalEvent('reconnectFailed', 'Max reconnect attempts reached'); return; }
+    if (this.reconnectTries >= MAX_RECONNECT_TRIES) {
+      this._fireLocalEvent('reconnectFailed', 'Max reconnect attempts reached');
+      return;
+    }
     const delay = RECONNECT_BASE_MS * Math.pow(2, this.reconnectTries);
     this.reconnectTries++;
+    this.reconnectTimer = setTimeout(async () => {
+      try {
+        if (this._stopping) return;
+        const deviceId = await this.getDeviceId();
+        if (this.role === 'host') {
+          await VpnModule.startVpn(
+            RELAY_URL, '', 'host', this.hostId, this.netType, '',
+            PACKAGES_JSON, PORTS_JSON
+          );
+        } else if (this.role === 'client' && this.accessCode) {
+          await VpnModule.startVpn(
+            RELAY_URL, this.accessCode, 'client', '', '', deviceId,
+            PACKAGES_JSON, PORTS_JSON
+          );
+        }
+      } catch (e) {
+        console.warn(`[${APP_NAME}Service] Reconnect failed:`, e?.message);
+        this._scheduleReconnect();
+      }
+    }, delay);
   }
 
   _handleFailover(code) { this.currentCode = code; this._failoverBackoffMs = 200; this._fireLocalEvent('hostFailover', code); }

@@ -206,11 +206,21 @@ class WhatsAppVpnService {
     this.reconnectTimer = setTimeout(async () => {
       try {
         if (this._stopping) return;
-        const deviceId = await this.getDeviceId();
+        const deviceId    = await this.getDeviceId();
+        const packagesJson = JSON.stringify(WHATSAPP_PACKAGES);
+        const portMapJson  = JSON.stringify(
+          Object.fromEntries(Object.entries(WHATSAPP_PORTS).map(([k, v]) => [String(k), v]))
+        );
         if (this.role === 'host') {
-          await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, this.netType, '');
+          await VpnModule.startVpn(
+            RELAY_URL, '', 'host', this.hostId, this.netType, '',
+            packagesJson, portMapJson
+          );
         } else if (this.role === 'client' && this.accessCode) {
-          await VpnModule.startVpn(RELAY_URL, this.accessCode, 'client', '', '', deviceId);
+          await VpnModule.startVpn(
+            RELAY_URL, this.accessCode, 'client', '', '', deviceId,
+            packagesJson, portMapJson
+          );
         }
       } catch (e) {
         console.warn(`[${APP_NAME}Service] Reconnect failed:`, e?.message);
