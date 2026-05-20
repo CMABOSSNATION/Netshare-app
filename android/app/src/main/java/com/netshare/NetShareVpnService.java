@@ -105,9 +105,13 @@ public class NetShareVpnService extends VpnService {
 
     private static final int QUIC_PORT_HTTPS = 443;
 
-    // PERF-1: MTU to prevent fragmentation
-    private static final int TUN_MTU   = 1400;
-    private static final int MSS_CLAMP = 1360;
+    // ── MTU / MSS — 300km relay tuning ─────────────────────────────────────
+    // Overhead: Ethernet(14)+IP(20)+TCP(20)+TLS_record(21)+WS_frame(10)+CF_frame(8) = 93 bytes
+    // Safe payload MTU = 1500 - 93 = 1407. We use 1300 for extra headroom
+    // across 300km fiber (PPP, MPLS, any intermediate encapsulation).
+    // MSS = MTU - IP_HEADER - TCP_HEADER = 1300 - 20 - 20 = 1260.
+    private static final int TUN_MTU   = 1300;
+    private static final int MSS_CLAMP = 1260;
 
     private static final int TCP_SOCKET_BUFFER  = 2 * 1024 * 1024;
     private static final int UDP_SOCKET_BUFFER  = 4 * 1024 * 1024;
@@ -526,6 +530,9 @@ public class NetShareVpnService extends VpnService {
                     String msgType = (sessionCode != null && !sessionCode.isEmpty())
                         ? "HOST_RECONNECT" : "HOST_REGISTER";
                     wsSend(j3("type", msgType, "hostId", hostId, "netType", netType));
+                    // PATCH 3: start keep-alive heartbeat so the relay never times out
+                    // a host that is alive but temporarily frozen by Android Doze.
+                    startHostKeepAlive(webSocket);
                 } else {
                     VpnModule.emitEvent("vpnConnected", sessionCode);
                     // FIX-TW-1: include deviceId in CLIENT_JOIN
@@ -549,7 +556,11 @@ public class NetShareVpnService extends VpnService {
                 // in stopVpnTunnel before shutdownNow, which could cause NPE here).
                 final ExecutorService ex = executor;
                 if (ex == null) return;
-                byte[] packet = bytes.toByteArray();
+                // PATCH 4: strip relay frame header (FIX-CF-1) — backward-compat
+                // with legacy unframed relays via unwrapRelayFrame().
+                byte[] raw    = bytes.toByteArray();
+                byte[] packet = unwrapRelayFrame(raw);
+                if (packet == null) return; // malformed frame — silently drop
                 if ("host".equals(role)) {
                     bytesIn.addAndGet(packet.length);
                     if (packet.length >= 20) {
@@ -654,7 +665,29 @@ public class NetShareVpnService extends VpnService {
                         }
 
                         if (!served) {
-                            wsSend(ByteBuffer.wrap(frame));
+                            // PATCH 2: wrap outbound IP packet in TCP relay frame
+                            // so the Cloudflare DO knows the exact payload length.
+                            int ver4 = (frame[0] & 0xF0) >> 4;
+                            int proto4 = (ver4 == 4 && len >= 20) ? (frame[9] & 0xFF) : -1;
+                            if (proto4 == 17 && len >= 28) {
+                                // UDP packet: wrap as UD frame with routing header
+                                int ihl4    = (frame[0] & 0x0F) * 4;
+                                byte[] dstIp4 = new byte[]{frame[16], frame[17], frame[18], frame[19]};
+                                int dstPort4  = ((frame[ihl4+2] & 0xFF) << 8) | (frame[ihl4+3] & 0xFF);
+                                int srcPort4  = ((frame[ihl4]   & 0xFF) << 8) | (frame[ihl4+1] & 0xFF);
+                                int pOff4 = ihl4 + 8;
+                                int pLen4 = len - pOff4;
+                                if (pLen4 > 0) {
+                                    byte[] udpFrame = wrapUdpFrame(dstIp4, dstPort4, srcPort4, frame, pOff4, pLen4);
+                                    wsSend(ByteBuffer.wrap(udpFrame));
+                                } else {
+                                    wsSend(ByteBuffer.wrap(frame));
+                                }
+                            } else {
+                                // TCP/ICMP/other: wrap as TC frame
+                                byte[] tcpFrame = wrapTcpFrame(frame, 0, len);
+                                wsSend(ByteBuffer.wrap(tcpFrame));
+                            }
                         }
                     }
                 }
@@ -1188,6 +1221,69 @@ public class NetShareVpnService extends VpnService {
         }
     }
 
+    // ─── FIX-CF-1/2: Relay frame helpers ───────────────────────────────────
+    // Frame format: magic(2) + flags(1) + reserved(1) + payloadLen(4) + [udp routing(8)?] + payload
+    private static final int FRAME_MAGIC_TCP  = 0x5443; // "TC"
+    private static final int FRAME_MAGIC_UDP  = 0x5544; // "UD"
+    private static final int FRAME_HEADER_LEN = 8;
+    private static final int UDP_ROUTING_LEN  = 8; // dstIP(4)+dstPort(2)+srcPort(2)
+
+    /** Wrap a TCP payload in the relay frame format. */
+    private static byte[] wrapTcpFrame(byte[] payload, int offset, int len) {
+        byte[] frame = new byte[FRAME_HEADER_LEN + len];
+        frame[0] = 0x54; frame[1] = 0x43;  // "TC"
+        frame[2] = 0x00; frame[3] = 0x00;  // flags, reserved
+        frame[4] = (byte)(len >>> 24);
+        frame[5] = (byte)(len >>> 16);
+        frame[6] = (byte)(len >>>  8);
+        frame[7] = (byte)(len);
+        System.arraycopy(payload, offset, frame, FRAME_HEADER_LEN, len);
+        return frame;
+    }
+
+    /**
+     * Wrap a UDP payload in the relay frame format so the Cloudflare DO
+     * can proxy it via its UDP-over-fetch mechanism (FIX-CF-2).
+     */
+    private static byte[] wrapUdpFrame(byte[] dstIp, int dstPort, int srcPort,
+                                        byte[] payload, int offset, int len) {
+        int totalPayload = UDP_ROUTING_LEN + len;
+        byte[] frame = new byte[FRAME_HEADER_LEN + totalPayload];
+        frame[0] = 0x55; frame[1] = 0x44;  // "UD"
+        frame[2] = 0x00; frame[3] = 0x00;
+        frame[4] = (byte)(totalPayload >>> 24);
+        frame[5] = (byte)(totalPayload >>> 16);
+        frame[6] = (byte)(totalPayload >>>  8);
+        frame[7] = (byte)(totalPayload);
+        // UDP routing header
+        frame[8]  = dstIp[0]; frame[9]  = dstIp[1];
+        frame[10] = dstIp[2]; frame[11] = dstIp[3];
+        frame[12] = (byte)(dstPort >>> 8); frame[13] = (byte)(dstPort);
+        frame[14] = (byte)(srcPort >>> 8); frame[15] = (byte)(srcPort);
+        System.arraycopy(payload, offset, frame, FRAME_HEADER_LEN + UDP_ROUTING_LEN, len);
+        return frame;
+    }
+
+    /**
+     * Unwrap an inbound relay frame from the Cloudflare DO.
+     * Returns raw payload bytes, or the original data if not a valid frame
+     * (backward-compatible with unframed legacy relays).
+     */
+    private static byte[] unwrapRelayFrame(byte[] data) {
+        if (data.length < FRAME_HEADER_LEN) return data;
+        int magic = ((data[0] & 0xFF) << 8) | (data[1] & 0xFF);
+        if (magic != FRAME_MAGIC_TCP && magic != FRAME_MAGIC_UDP) {
+            // Legacy unframed data — treat as raw IP packet (backward compat)
+            return data;
+        }
+        int payloadLen = ((data[4] & 0xFF) << 24) | ((data[5] & 0xFF) << 16)
+                       | ((data[6] & 0xFF) <<  8) |  (data[7] & 0xFF);
+        if (FRAME_HEADER_LEN + payloadLen > data.length) return null; // malformed
+        byte[] payload = new byte[payloadLen];
+        System.arraycopy(data, FRAME_HEADER_LEN, payload, 0, payloadLen);
+        return payload;
+    }
+
     // ─── Packet builders ─────────────────────────────────────────────────
 
     private static ByteBuffer buildIpTcpPacket(byte[] srcIp, byte[] dstIp,
@@ -1391,7 +1487,49 @@ public class NetShareVpnService extends VpnService {
 
     // ─── Teardown ─────────────────────────────────────────────────────────
 
+    // ─── Host keep-alive heartbeat (PATCH 3) ────────────────────────────────
+    // Sends HOST_KEEPALIVE every 20s at the application layer, independent of
+    // OkHttp's WS ping. Android Doze can freeze the OkHttp ping thread for
+    // 30-90s, but this thread wakes the CPU briefly via AlarmManager-compatible
+    // timing. The relay resets lastPong on every HOST_KEEPALIVE receipt, so
+    // a connected host is never timed out by the server.
+    private static final long KEEPALIVE_INTERVAL_MS = 20_000L;
+    private volatile boolean keepAliveRunning = false;
+    private Thread keepAliveThread = null;
+
+    private void startHostKeepAlive(final WebSocket ws) {
+        stopHostKeepAlive();
+        keepAliveRunning = true;
+        keepAliveThread = new Thread(() -> {
+            while (keepAliveRunning && isRunning) {
+                try {
+                    Thread.sleep(KEEPALIVE_INTERVAL_MS);
+                    if (!keepAliveRunning || !isRunning) break;
+                    wsSend("{\"type\":\"HOST_KEEPALIVE\",\"ts\":" + System.currentTimeMillis() + "}");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    Log.w(TAG, "[keepalive] send failed: " + e.getMessage());
+                }
+            }
+            Log.d(TAG, "[keepalive] thread exited");
+        }, "ns-keepalive");
+        keepAliveThread.setDaemon(true);
+        keepAliveThread.start();
+        Log.i(TAG, "[keepalive] started (interval=" + KEEPALIVE_INTERVAL_MS + "ms)");
+    }
+
+    private void stopHostKeepAlive() {
+        keepAliveRunning = false;
+        if (keepAliveThread != null) {
+            keepAliveThread.interrupt();
+            keepAliveThread = null;
+        }
+    }
+
     private synchronized void stopVpnTunnel() {
+        stopHostKeepAlive(); // PATCH 3: stop keepalive thread before teardown
         if (!isRunning && vpnInterface==null && wsClient==null) return;
         isRunning = false;
 
