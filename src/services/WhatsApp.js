@@ -60,17 +60,23 @@ export const WHATSAPP_PACKAGES = [
 // 5228: FCM push — idle for hours between messages; needs 900s so the connection
 //       isn't torn down between messages on quiet chats.
 export const WHATSAPP_PORTS = {
-  443:  600_000,  // HTTPS / QUIC
-  80:   600_000,  // HTTP fallback
-  5222: 600_000,  // XMPP messaging
-  5223: 600_000,  // XMPP over TLS
-  3478: 600_000,  // STUN / TURN
-  3479: 600_000,  // TURN alternate
-  5349: 600_000,  // TURN over TLS
-  5228: 900_000,  // FCM push (long idle)
-  53:   5_000,    // DNS
-  853:  5_000,    // DNS-over-TLS
-  123:  10_000,   // NTP
+  443:   600_000,  // HTTPS / QUIC
+  80:    600_000,  // HTTP fallback
+  5222:  600_000,  // XMPP messaging
+  5223:  600_000,  // XMPP over TLS
+  3478:  600_000,  // STUN / TURN
+  3479:  600_000,  // TURN alternate
+  5349:  600_000,  // TURN over TLS
+  5228:  900_000,  // FCM push (long idle)
+  // FIX-WA-STUN: Google STUN ports for WhatsApp video calls.
+  // Previously listed in the comment but missing from the object — so
+  // socketTimeoutForPort() fell back to the 300s default instead of 600s,
+  // causing STUN/ICE binding to time out mid-call on slower connections.
+  19302: 600_000, 19303: 600_000, 19304: 600_000, 19305: 600_000,
+  19306: 600_000, 19307: 600_000, 19308: 600_000, 19309: 600_000,
+  53:    5_000,    // DNS
+  853:   5_000,    // DNS-over-TLS
+  123:   10_000,   // NTP
 };
 
 const LOCAL_EVENTS        = new Set(['hostFailover']);
