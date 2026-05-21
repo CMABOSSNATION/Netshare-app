@@ -872,12 +872,29 @@ public class NetShareVpnService extends VpnService {
                                 Log.v(TAG, "[tunnel] Not installed (skip): " + pkg);
                             }
                         }
-                        Log.i(TAG, "[tunnel] " + allowedCount + " apps routed through shared internet");
+                        // FIX: 0 matched apps = Android blocks ALL traffic. Fall back to all-apps mode.
+                        if (allowedCount == 0) {
+                            Log.w(TAG, "[tunnel] 0 apps matched — falling back to ALL-APPS mode");
+                            b2 = new Builder();
+                            b2.setSession("NetShare")
+                              .addAddress(assignedTunIp, 24)
+                              .addRoute("0.0.0.0", 0)
+                              .addRoute("::", 0)
+                              .addRoute(gatewayIp, 32)
+                              .addDnsServer("1.1.1.1")
+                              .addDnsServer("1.0.0.1")
+                              .addDnsServer("8.8.8.8")
+                              .addDnsServer("8.8.4.4")
+                              .setMtu(TUN_MTU);
+                            try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
+                            allowedCount = -1;
+                        }
+                        Log.i(TAG, "[tunnel] " + (allowedCount == -1 ? "ALL" : allowedCount) + " apps routed through shared internet");
 
                         vpnInterface = b2.establish();
                         if (vpnInterface != null) {
                             tunOut = new FileOutputStream(vpnInterface.getFileDescriptor());
-                            dbg("TUN rebuilt OK — " + allowedCount + " apps tunnelled, gateway=" + gatewayIp);
+                            dbg("TUN rebuilt OK — " + (allowedCount == -1 ? "ALL" : allowedCount) + " apps tunnelled, gateway=" + gatewayIp);
                             startPacketReadLoop();
                         } else {
                             Log.e(TAG, "JOIN_SUCCESS: failed to rebuild TUN");
