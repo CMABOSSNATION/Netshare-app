@@ -479,8 +479,7 @@ public class NetShareVpnService extends VpnService {
             placeholder.setSession("NetShare")
                        .addAddress("10.8.0.2", 24)
                        .addRoute("0.0.0.0", 0)
-                       .addRoute("::", 0)
-                       .addDnsServer("10.8.0.1")  // sink DNS — queues requests until real TUN ready
+                                              .addDnsServer("10.8.0.1")  // sink DNS — queues requests until real TUN ready
                        .setMtu(TUN_MTU);
 
             try { placeholder.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
@@ -850,15 +849,12 @@ public class NetShareVpnService extends VpnService {
                         b2.setSession("NetShare")
                           .addAddress(assignedTunIp, 24)
                           .addRoute("0.0.0.0", 0)
-                          .addRoute("::", 0)
-                          .addRoute(gatewayIp, 32)   // explicit gateway — fixes content delivery
+                                                    .addRoute(gatewayIp, 32)   // explicit gateway — fixes content delivery
                           .addDnsServer("1.1.1.1")
                           .addDnsServer("1.0.0.1")
                           .addDnsServer("8.8.8.8")
                           .addDnsServer("8.8.4.4")
-                          .addDnsServer("2606:4700:4700::1111")
-                          .addDnsServer("2001:4860:4860::8888")
-                          .setMtu(TUN_MTU);
+                                                                              .setMtu(TUN_MTU);
 
                         try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
 
@@ -879,8 +875,7 @@ public class NetShareVpnService extends VpnService {
                             b2.setSession("NetShare")
                               .addAddress(assignedTunIp, 24)
                               .addRoute("0.0.0.0", 0)
-                              .addRoute("::", 0)
-                              .addRoute(gatewayIp, 32)
+                                                            .addRoute(gatewayIp, 32)
                               .addDnsServer("1.1.1.1")
                               .addDnsServer("1.0.0.1")
                               .addDnsServer("8.8.8.8")
@@ -944,6 +939,12 @@ public class NetShareVpnService extends VpnService {
             int version = (pkt[0] >> 4) & 0xF;
 
             if (version == 6) {
+                // IPv6 not supported — host mobile network may not have IPv6.
+                // Silently drop; client TUN no longer advertises "::" route so
+                // this path is only hit for stale packets during reconnect.
+                return;
+                //noinspection UnreachableCode — kept for reference only
+                if (false) {
                 if (pkt.length < 40) return;
                 int proto6 = pkt[6] & 0xFF;
                 int pOff6  = 40;
@@ -957,6 +958,7 @@ public class NetShareVpnService extends VpnService {
                 else if (proto6 == 58 && pkt.length >= pOff6 + 8) {
                     if ((pkt[pOff6] & 0xFF) == 128) synthesiseIcmpv6EchoReply(pkt, pOff6, src6, dst6);
                 }
+                } // end if(false)
                 return;
             }
 
