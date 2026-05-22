@@ -938,29 +938,7 @@ public class NetShareVpnService extends VpnService {
         try {
             int version = (pkt[0] >> 4) & 0xF;
 
-            if (version == 6) {
-                // IPv6 not supported — host mobile network may not have IPv6.
-                // Silently drop; client TUN no longer advertises "::" route so
-                // this path is only hit for stale packets during reconnect.
-                return;
-                //noinspection UnreachableCode — kept for reference only
-                if (false) {
-                if (pkt.length < 40) return;
-                int proto6 = pkt[6] & 0xFF;
-                int pOff6  = 40;
-                byte[] src6 = new byte[16]; System.arraycopy(pkt, 8,  src6, 0, 16);
-                byte[] dst6 = new byte[16]; System.arraycopy(pkt, 24, dst6, 0, 16);
-                InetAddress dst6Addr = InetAddress.getByAddress(dst6);
-                String src6Ip = InetAddress.getByAddress(src6).getHostAddress();
-
-                if      (proto6 == 6  && pkt.length >= pOff6 + 14) handleTcpForward(pkt, pOff6, src6Ip, dst6Addr, tunIpBytes());
-                else if (proto6 == 17 && pkt.length >= pOff6 + 8)  handleUdpForward(pkt, pOff6, src6Ip, dst6Addr, tunIpBytes());
-                else if (proto6 == 58 && pkt.length >= pOff6 + 8) {
-                    if ((pkt[pOff6] & 0xFF) == 128) synthesiseIcmpv6EchoReply(pkt, pOff6, src6, dst6);
-                }
-                } // end if(false)
-                return;
-            }
+            if (version == 6) { return; }
 
             if (version != 4) return;
 
