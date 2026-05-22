@@ -1422,9 +1422,19 @@ public class NetShareVpnService extends VpnService {
 
     // ─── Packet builders ─────────────────────────────────────────────────
 
+    // ── FIX-NET-6: IPv4/IPv6 dual-stack packet builders ──────────────────
+    // buildIpTcpPacket / buildIpUdpPacket previously only built IPv4 packets
+    // (hardcoded IP4_VERSION_IHL, 4-byte address copy). Now that IPv6 TCP/UDP
+    // is forwarded via handleTcpForward/handleUdpForward with tunIpBytes6()
+    // (16-byte addresses), the response path must build correct IPv6 packets.
+    // The builder detects address length: 4 bytes → IPv4, 16 bytes → IPv6.
+
     private static ByteBuffer buildIpTcpPacket(byte[] srcIp, byte[] dstIp,
                                                 int srcPort, int dstPort,
                                                 byte[] payload, int pOff, int pLen) {
+        if (srcIp.length == 16 || dstIp.length == 16) {
+            return buildIp6TcpPacket(srcIp, dstIp, srcPort, dstPort, payload, pOff, pLen);
+        }
         int total = IP4_HEADER_LEN + TCP_HEADER_LEN + pLen;
         byte[] b  = new byte[total];
         b[0]=IP4_VERSION_IHL; b[2]=(byte)(total>>8); b[3]=(byte)(total);
@@ -1436,10 +1446,6 @@ public class NetShareVpnService extends VpnService {
         b[t]=(byte)(srcPort>>8); b[t+1]=(byte)(srcPort);
         b[t+2]=(byte)(dstPort>>8); b[t+3]=(byte)(dstPort);
         b[t+12]=(byte)(TCP_HEADER_LEN<<2);
-        // WhatsApp FIX: use PSH+ACK only when there is payload data.
-        // Pure ACK (0x10) for zero-length segments (keepalives, window updates).
-        // Previously always 0x18 (PSH+ACK) — this confused WhatsApp XMPP which
-        // uses ACK-only keepalive frames to hold the long-lived session open.
         b[t+13] = (pLen > 0) ? (byte)0x18 : (byte)0x10;
         b[t+14]=(byte)0xFF; b[t+15]=(byte)0xFF;
         System.arraycopy(payload, pOff, b, IP4_HEADER_LEN + TCP_HEADER_LEN, pLen);
@@ -1452,6 +1458,9 @@ public class NetShareVpnService extends VpnService {
     private static ByteBuffer buildIpUdpPacket(byte[] srcIp, byte[] dstIp,
                                                 int srcPort, int dstPort,
                                                 byte[] payload, int pOff, int pLen) {
+        if (srcIp.length == 16 || dstIp.length == 16) {
+            return buildIp6UdpPacket(srcIp, dstIp, srcPort, dstPort, payload, pOff, pLen);
+        }
         int total = IP4_HEADER_LEN + UDP_HEADER_LEN + pLen;
         byte[] b  = new byte[total];
         b[0]=IP4_VERSION_IHL; b[2]=(byte)(total>>8); b[3]=(byte)(total);
@@ -1465,6 +1474,66 @@ public class NetShareVpnService extends VpnService {
         b[u+4]=(byte)(udpLen>>8); b[u+5]=(byte)(udpLen);
         System.arraycopy(payload, pOff, b, IP4_HEADER_LEN + UDP_HEADER_LEN, pLen);
         return ByteBuffer.wrap(b);
+    }
+
+    // IPv6 fixed header: version(4b)+TC(8b)+flow(20b)+payloadLen(16b)+nextHdr(8b)+hopLimit(8b)+src(128b)+dst(128b) = 40 bytes
+    private static final int IP6_HEADER_LEN = 40;
+
+    private static ByteBuffer buildIp6TcpPacket(byte[] srcIp, byte[] dstIp,
+                                                  int srcPort, int dstPort,
+                                                  byte[] payload, int pOff, int pLen) {
+        int tcpLen = TCP_HEADER_LEN + pLen;
+        int total  = IP6_HEADER_LEN + tcpLen;
+        byte[] b   = new byte[total];
+        b[0] = 0x60; // version=6, TC=0, flow=0
+        b[4] = (byte)(tcpLen >> 8); b[5] = (byte)(tcpLen);
+        b[6] = PROTO_TCP; b[7] = 64; // next header = TCP, hop limit
+        System.arraycopy(srcIp, 0, b, 8,  16);
+        System.arraycopy(dstIp, 0, b, 24, 16);
+        int t = IP6_HEADER_LEN;
+        b[t]=(byte)(srcPort>>8); b[t+1]=(byte)(srcPort);
+        b[t+2]=(byte)(dstPort>>8); b[t+3]=(byte)(dstPort);
+        b[t+12]=(byte)(TCP_HEADER_LEN<<2);
+        b[t+13] = (pLen > 0) ? (byte)0x18 : (byte)0x10;
+        b[t+14]=(byte)0xFF; b[t+15]=(byte)0xFF;
+        System.arraycopy(payload, pOff, b, IP6_HEADER_LEN + TCP_HEADER_LEN, pLen);
+        int csum = tcpUdpChecksumV6(srcIp, dstIp, PROTO_TCP, b, IP6_HEADER_LEN, tcpLen);
+        b[t+16]=(byte)(csum>>8); b[t+17]=(byte)(csum);
+        return ByteBuffer.wrap(b);
+    }
+
+    private static ByteBuffer buildIp6UdpPacket(byte[] srcIp, byte[] dstIp,
+                                                  int srcPort, int dstPort,
+                                                  byte[] payload, int pOff, int pLen) {
+        int udpLen = UDP_HEADER_LEN + pLen;
+        int total  = IP6_HEADER_LEN + udpLen;
+        byte[] b   = new byte[total];
+        b[0] = 0x60;
+        b[4] = (byte)(udpLen >> 8); b[5] = (byte)(udpLen);
+        b[6] = PROTO_UDP; b[7] = 64;
+        System.arraycopy(srcIp, 0, b, 8,  16);
+        System.arraycopy(dstIp, 0, b, 24, 16);
+        int u = IP6_HEADER_LEN;
+        b[u]=(byte)(srcPort>>8); b[u+1]=(byte)(srcPort);
+        b[u+2]=(byte)(dstPort>>8); b[u+3]=(byte)(dstPort);
+        b[u+4]=(byte)(udpLen>>8); b[u+5]=(byte)(udpLen);
+        System.arraycopy(payload, pOff, b, IP6_HEADER_LEN + UDP_HEADER_LEN, pLen);
+        int csum = tcpUdpChecksumV6(srcIp, dstIp, PROTO_UDP, b, IP6_HEADER_LEN, udpLen);
+        b[u+6]=(byte)(csum>>8); b[u+7]=(byte)(csum);
+        return ByteBuffer.wrap(b);
+    }
+
+    // IPv6 pseudo-header checksum (RFC 2460)
+    private static int tcpUdpChecksumV6(byte[] srcIp6, byte[] dstIp6, byte proto,
+                                         byte[] segment, int segOff, int segLen) {
+        byte[] scratch = new byte[40 + segLen + (segLen % 2)];
+        System.arraycopy(srcIp6, 0, scratch, 0,  16);
+        System.arraycopy(dstIp6, 0, scratch, 16, 16);
+        scratch[32]=(byte)(segLen>>24); scratch[33]=(byte)(segLen>>16);
+        scratch[34]=(byte)(segLen>>8);  scratch[35]=(byte)(segLen);
+        scratch[39] = proto;
+        System.arraycopy(segment, segOff, scratch, 40, segLen);
+        return checksum(scratch, 0, scratch.length);
     }
 
     // ─── Checksum helpers ────────────────────────────────────────────────
