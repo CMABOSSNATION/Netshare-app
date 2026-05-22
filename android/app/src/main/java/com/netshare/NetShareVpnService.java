@@ -872,7 +872,7 @@ public class NetShareVpnService extends VpnService {
                                 Log.v(TAG, "[tunnel] Not installed (skip): " + pkg);
                             }
                         }
-                        // FIX: 0 matched apps = Android blocks ALL traffic. Fall back to all-apps mode.
+                        // FIX: if 0 apps matched, fall back to ALL-APPS mode
                         if (allowedCount == 0) {
                             Log.w(TAG, "[tunnel] 0 apps matched — falling back to ALL-APPS mode");
                             b2 = new Builder();
@@ -983,6 +983,7 @@ public class NetShareVpnService extends VpnService {
             }
         } catch (Exception e) {
             Log.w(TAG, "forwardPacket: " + e.getMessage());
+            dbg("FWD ERR: " + e.getMessage());
         }
     }
 
@@ -1030,6 +1031,7 @@ public class NetShareVpnService extends VpnService {
                     sock.setKeepAlive(true);
                 } catch (Exception e) {
                     Log.w(TAG, "TCP connect [" + key + "]: " + e.getMessage());
+                    dbg("TCP FAIL " + dst.getHostAddress() + ":" + dstPort + " → " + e.getMessage());
                     try { sock.close(); } catch (Exception ignored) {}
                     sendTcpRstToClient(clientIpBytes, dst.getAddress(), dstPort, srcPort);
                     return;
@@ -1049,6 +1051,7 @@ public class NetShareVpnService extends VpnService {
                         out.flush();
                     } catch (Exception e) {
                         Log.w(TAG, "TCP send [" + key + "]: " + e.getMessage());
+                        dbg("TCP SEND FAIL " + key + " → " + e.getMessage());
                         tcpConnections.remove(key);
                         try { sock.close(); } catch (Exception ignored) {}
                     }
