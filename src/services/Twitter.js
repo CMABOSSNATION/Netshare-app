@@ -56,6 +56,8 @@ export const TWITTER_PORTS = {
 const LOCAL_EVENTS        = new Set(['hostFailover']);
 const MAX_RECONNECT_TRIES = 8;
 const RECONNECT_BASE_MS   = 1_000;
+const PACKAGES_JSON = JSON.stringify(TWITTER_PACKAGES);
+const PORTS_JSON    = JSON.stringify(TWITTER_PORTS);
 const APP_NAME            = 'Twitter';
 
 class TwitterVpnService {
@@ -104,7 +106,8 @@ class TwitterVpnService {
   async startAsHost(netType = 'WiFi') {
     const granted = await this.prepare(); if (!granted) throw new Error('VPN permission denied by user');
     this.hostId = await this.getHostId(); this.role = 'host'; this.netType = netType; this._stopping = false; this.reconnectTries = 0;
-    await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, netType, '');
+    await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, netType, '',
+      PACKAGES_JSON, PORTS_JSON);
   }
 
   async startAsClient(accessCode) {
@@ -113,7 +116,8 @@ class TwitterVpnService {
     const granted = await this.prepare(); if (!granted) throw new Error('VPN permission denied by user');
     const deviceId = await this.getDeviceId();
     this.role = 'client'; this.accessCode = accessCode.toUpperCase(); this.currentCode = null; this._stopping = false; this.reconnectTries = 0;
-    await VpnModule.startVpn(RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId);
+    await VpnModule.startVpn(RELAY_URL, accessCode.toUpperCase(), 'client', '', '', deviceId,
+      PACKAGES_JSON, PORTS_JSON);
   }
 
   _scheduleReconnect() {
@@ -125,8 +129,10 @@ class TwitterVpnService {
       try {
         if (this._stopping) return;
         const deviceId = await this.getDeviceId();
-        if (this.role === 'host') await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, this.netType, '');
-        else if (this.role === 'client' && this.accessCode) await VpnModule.startVpn(RELAY_URL, this.accessCode, 'client', '', '', deviceId);
+        if (this.role === 'host') await VpnModule.startVpn(RELAY_URL, '', 'host', this.hostId, this.netType, '',
+            PACKAGES_JSON, PORTS_JSON);
+        else if (this.role === 'client' && this.accessCode) await VpnModule.startVpn(RELAY_URL, this.accessCode, 'client', '', '', deviceId,
+            PACKAGES_JSON, PORTS_JSON);
       } catch (e) { console.warn(`[${APP_NAME}Service] Reconnect failed:`, e?.message); this._scheduleReconnect(); }
     }, delay);
   }
