@@ -479,7 +479,12 @@ public class NetShareVpnService extends VpnService {
             placeholder.setSession("NetShare")
                        .addAddress("10.8.0.2", 24)
                        .addRoute("0.0.0.0", 0)
-                                              .addDnsServer("10.8.0.1")  // sink DNS — queues requests until real TUN ready
+                       // FIX-NET-4: capture IPv6 traffic immediately so dual-stack
+                       // apps (WhatsApp, Facebook, Instagram) don't bypass the VPN
+                       // while waiting for JOIN_SUCCESS.
+                       .addAddress("fd00:1::", 48)
+                       .addRoute("::", 0)
+                       .addDnsServer("10.8.0.1")  // sink DNS — queues requests until real TUN ready
                        .setMtu(TUN_MTU);
 
             try { placeholder.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
@@ -849,12 +854,21 @@ public class NetShareVpnService extends VpnService {
                         b2.setSession("NetShare")
                           .addAddress(assignedTunIp, 24)
                           .addRoute("0.0.0.0", 0)
-                                                    .addRoute(gatewayIp, 32)   // explicit gateway — fixes content delivery
+                          .addRoute(gatewayIp, 32)   // explicit gateway — fixes content delivery
+                          // FIX-NET-4: IPv6 support — modern apps (Facebook, Instagram,
+                          // WhatsApp) use dual-stack and hit IPv6 first via AAAA records.
+                          // Without these routes, IPv6 traffic bypasses the VPN and apps
+                          // get ENETUNREACH errors when the relay tries to open IPv6 sockets.
+                          // fd00:1::X is the client's link-local IPv6 VPN address.
+                          .addAddress("fd00:1::2", 48)
+                          .addRoute("::", 0)
+                          .addDnsServer("2606:4700:4700::1111")  // Cloudflare IPv6 DNS
+                          .addDnsServer("2001:4860:4860::8888")  // Google IPv6 DNS
                           .addDnsServer("1.1.1.1")
                           .addDnsServer("1.0.0.1")
                           .addDnsServer("8.8.8.8")
                           .addDnsServer("8.8.4.4")
-                                                                              .setMtu(TUN_MTU);
+                          .setMtu(TUN_MTU);
 
                         try { b2.addDisallowedApplication(getPackageName()); } catch (Exception ignored) {}
 
@@ -875,7 +889,12 @@ public class NetShareVpnService extends VpnService {
                             b2.setSession("NetShare")
                               .addAddress(assignedTunIp, 24)
                               .addRoute("0.0.0.0", 0)
-                                                            .addRoute(gatewayIp, 32)
+                              .addRoute(gatewayIp, 32)
+                              // FIX-NET-4: IPv6 in fallback TUN too
+                              .addAddress("fd00:1::2", 48)
+                              .addRoute("::", 0)
+                              .addDnsServer("2606:4700:4700::1111")
+                              .addDnsServer("2001:4860:4860::8888")
                               .addDnsServer("1.1.1.1")
                               .addDnsServer("1.0.0.1")
                               .addDnsServer("8.8.8.8")
@@ -938,7 +957,42 @@ public class NetShareVpnService extends VpnService {
         try {
             int version = (pkt[0] >> 4) & 0xF;
 
-            if (version == 6) { return; }
+            // FIX-NET-5: Handle IPv6 packets instead of silently dropping them.
+            // Modern apps (Facebook, Instagram, WhatsApp, TikTok) use dual-stack
+            // and prefer IPv6 when the TUN provides IPv6 routes. Without this fix
+            // all IPv6 TCP/UDP connections fail with ENETUNREACH, forcing a full
+            // reconnect timeout before the IPv4 fallback is attempted — causing
+            // the "connected but no internet" symptom shown in the debug logs.
+            if (version == 6) {
+                if (pkt.length < 40) return;
+                int proto6 = pkt[6] & 0xFF;
+                // IPv6 fixed header is 40 bytes; payload starts at offset 40.
+                // Source addr: bytes 8-23, Dest addr: bytes 24-39.
+                byte[] src6Bytes = new byte[16];
+                byte[] dst6Bytes = new byte[16];
+                System.arraycopy(pkt, 8,  src6Bytes, 0, 16);
+                System.arraycopy(pkt, 24, dst6Bytes, 0, 16);
+                InetAddress dst6 = InetAddress.getByAddress(dst6Bytes);
+                String srcIp6 = InetAddress.getByAddress(src6Bytes).getHostAddress();
+
+                if (proto6 == 6) {
+                    // IPv6 TCP — forward using IPv6 socket (protect() works for IPv6 too)
+                    handleTcpForward(pkt, 40, srcIp6, dst6, tunIpBytes6());
+                } else if (proto6 == 17) {
+                    // IPv6 UDP
+                    handleUdpForward(pkt, 40, srcIp6, dst6, tunIpBytes6());
+                } else if (proto6 == 58) {
+                    // ICMPv6 echo request
+                    if (pkt.length >= 40 + ICMP_HEADER_LEN &&
+                        (pkt[40] & 0xFF) == 128 && (pkt[41] & 0xFF) == 0) {
+                        final byte[] ps = src6Bytes.clone();
+                        final byte[] pd = dst6Bytes.clone();
+                        final byte[] pc = pkt.clone();
+                        icmpExecutor.execute(() -> synthesiseIcmpv6EchoReply(pc, 40, pd, ps));
+                    }
+                }
+                return;
+            }
 
             if (version != 4) return;
 
@@ -1686,6 +1740,14 @@ public class NetShareVpnService extends VpnService {
     private byte[] tunIpBytes() {
         try { return InetAddress.getByName(assignedTunIp).getAddress(); }
         catch (Exception e) { return new byte[]{10,8,0,2}; }
+    }
+    /** Returns the IPv6 VPN client address bytes (fd00:1::2). */
+    private byte[] tunIpBytes6() {
+        try { return InetAddress.getByName("fd00:1::2").getAddress(); }
+        catch (Exception e) {
+            // fd00:1::2 as bytes
+            return new byte[]{(byte)0xfd,0x00,0x00,0x01,0,0,0,0, 0,0,0,0,0,0,0,0x02};
+        }
     }
     private static String orEmpty(String s) { return s!=null?s:""; }
     private static String jsonGet(String json, String key) {
